@@ -2,11 +2,13 @@
 
 Uso:
   python main.py                                  # webcam local (indice 0)
-  python main.py --check                          # valida a camera e sai
+  python main.py --check                          # valida a fonte e sai
+  python main.py --list-cameras                   # lista webcams que abrem
   python main.py --markers                        # folha-modelo impressa
   python main.py --neural modelo.onnx             # detector neural primario
   python main.py --hand-model modelo.task         # mascara de mao no canvas
   python main.py --source 1                       # outra webcam local
+  python main.py --source /dev/video2             # porta V4L2 especifica
   python main.py --source http://192.168.0.10:8080/video   # camera via rede
 
 A fonte via rede (MJPEG/RTSP) e o caminho recomendado no WSL. O WSL nao
@@ -19,7 +21,6 @@ g = ligar ou desligar a captura automatica de frames, q/Esc = sair.
 """
 
 import argparse
-import glob
 import os
 import sys
 import time
@@ -29,6 +30,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from . import capture as capture_module
 from . import hand as hand_module
 from . import ink as ink_module
 from . import neural as neural_module
@@ -177,174 +179,107 @@ class _SheetTracker:
 
 
 def parse_source(value):
-    """'0'/'1' viram indice de webcam local; qualquer outra coisa e URL/arquivo."""
-    if value is None:
-        return 0
-    if isinstance(value, int):
-        return value
-    text = str(value).strip()
-    return int(text) if text.isdigit() else text
+    """Delega para draw/capture.py, mantendo o mesmo comportamento."""
+    return capture_module.parse_source(value)
 
 
 def is_wsl():
-    """Detecta WSL pelo nome do kernel em /proc (ex.: '...-microsoft-standard-WSL2')."""
-    try:
-        return "microsoft" in Path("/proc/sys/kernel/osrelease").read_text().lower()
-    except OSError:
-        return False
+    """Detecta WSL pelo nome do kernel em /proc."""
+    return capture_module.is_wsl()
 
 
-def _configure_local_capture(capture):
-    # MJPG comprimido e 720p: o formato cru padrao (YUYV em 1080p)
-    # estoura a banda do USB virtual do usbip no WSL e a entrega de
-    # quadros trava com timeout de select() no V4L2.
-    capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-    capture.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+def _configure_local_capture(capture, width=None, height=None, fps=None):
+    """MJPG 720p por padrao; ver draw/capture.apply_local_settings."""
+    capture_module.apply_local_settings(
+        capture, width=width, height=height, fps=fps
+    )
 
 
 def _local_open_hint(source):
-    """Diagnostico por porta: nomeia a primeira condicao que impede a abertura."""
-    node = f"/dev/video{source}"
-    if not sys.platform.startswith("linux"):
-        return (
-            "Nenhuma webcam local respondeu nesse indice. "
-            "Confira se a webcam esta conectada e livre."
-        )
-    if not os.path.exists(node):
-        hint = f"A camera nao esta conectada a este sistema: {node} nao existe. "
-        if is_wsl():
-            hint += (
-                "Anexe a camera ao WSL com: bash scripts/setup_camera_wsl.sh. "
-                "A alternativa e uma camera via rede: python main.py "
-                "--source http://<ip-da-camera>:8080/video."
-            )
-        else:
-            hint += "Confira se a webcam esta conectada a este computador."
-        return hint
-    if not os.access(node, os.R_OK | os.W_OK):
-        return (
-            f"{node} existe, mas este processo nao tem permissao de "
-            "leitura e escrita nele. A porta que falhou e a permissao. "
-            "Correcao definitiva: sudo usermod -aG video $USER "
-            "(vale nas proximas sessoes). "
-            'Correcao nesta sessao: sg video -c "python3 main.py".'
-        )
-    return (
-        f"{node} existe e este processo tem permissao nele, mas a "
-        "abertura falhou. Outro programa provavelmente esta usando a "
-        "camera. Feche esse programa e tente de novo."
-    )
+    """Diagnostico por porta, o mesmo criterio do --check."""
+    return capture_module.diagnose_local(source)[1]
 
 
-def _open_capture(source):
-    capture = cv2.VideoCapture(source)
-    if capture.isOpened():
-        if isinstance(source, int):
-            _configure_local_capture(capture)
-        return capture
-    hint = f"Nao consegui abrir a fonte de video: {source!r}. "
-    if isinstance(source, int):
-        hint += _local_open_hint(source)
-    else:
-        hint += (
-            "Confira se a URL esta certa, se a camera esta transmitindo e "
-            "se este computador alcanca o endereco dela na rede."
-        )
-    raise RuntimeError(hint)
+def _open_capture(source, **kwargs):
+    """Abre via draw/capture.py, com backends, timeout e erro especifico."""
+    return capture_module.open_capture(source, **kwargs)
 
 
 def _video_nodes():
-    return sorted(
-        path
-        for path in glob.glob("/dev/video*")
-        if path[len("/dev/video"):].isdigit()
-    )
+    return capture_module.video_nodes()
 
 
-def run_check(source=0):
-    """Validacao da camera local, porta por porta. Retorna 0 ou 1."""
-    print(f"PASS: OpenCV disponivel. Versao {cv2.__version__}.")
-
-    nodes = _video_nodes()
-    if not nodes:
-        print("FAIL: nenhum /dev/video* existe neste sistema.")
-        if is_wsl():
-            print(
-                "  Correcao: anexe a camera com "
-                "bash scripts/setup_camera_wsl.sh. A alternativa e uma "
-                "camera via rede com --source."
-            )
-        else:
-            print("  Correcao: conecte uma webcam a este computador.")
-        return 1
-    print(f"PASS: dispositivos de video encontrados: {', '.join(nodes)}.")
-
-    all_ok = True
-    node = nodes[0]
-
-    access = os.access(node, os.R_OK | os.W_OK)
-    group_note = ""
-    try:
-        import grp
-
-        gid = os.stat(node).st_gid
+def _read_first_frame(capture, timeout_s):
+    """Tenta obter um frame até o prazo; capture.read() pode bloquear."""
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    while True:
         try:
-            group_name = grp.getgrgid(gid).gr_name
-        except KeyError:
-            group_name = str(gid)
-        in_group = gid in os.getgroups()
-        group_note = (
-            f" Grupo dono de {node}: {group_name}. "
-            f"Este processo esta nesse grupo: {'sim' if in_group else 'nao'}."
-        )
-    except Exception:
-        group_note = ""
-    if access:
-        print(f"PASS: este processo le e escreve em {node}.{group_note}")
-    else:
-        print(
-            f"FAIL: este processo nao tem permissao de leitura e "
-            f"escrita em {node}.{group_note}"
-        )
-        print(
-            "  Correcao definitiva: sudo usermod -aG video $USER "
-            "(vale nas proximas sessoes)."
-        )
-        print('  Correcao nesta sessao: sg video -c "python3 main.py".')
-        all_ok = False
+            ok, frame = capture.read()
+        except Exception as error:
+            return None, error
+        if time.monotonic() > deadline:
+            return None, TimeoutError("nenhum frame recebido dentro do prazo")
+        if ok and frame is not None:
+            return frame, None
 
-    index = int(node[len("/dev/video"):])
-    capture = cv2.VideoCapture(index)
-    if not capture.isOpened():
-        print(
-            f"FAIL: nao consegui abrir {node}. Outro programa "
-            "provavelmente esta usando a camera."
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None, TimeoutError("nenhum frame recebido dentro do prazo")
+        time.sleep(min(0.05, remaining))
+
+
+def run_check(source=0, open_timeout_ms=3000, first_frame_timeout_s=5.0):
+    """Valida a fonte informada, lê um frame e sempre libera a captura."""
+    parsed = parse_source(source)
+    print(f"PASS: OpenCV disponivel. Versao {cv2.__version__}.")
+    print(f"Testando fonte: {parsed!r}.")
+
+    capture = None
+    try:
+        read_timeout_ms = max(1, int(first_frame_timeout_s * 1000))
+        capture = _open_capture(
+            parsed,
+            open_timeout_ms=open_timeout_ms,
+            read_timeout_ms=read_timeout_ms,
         )
+        if not capture.isOpened():
+            print(f"FAIL: a fonte {parsed!r} nao abriu.")
+            return 1
+
+        print(f"PASS: fonte {parsed!r} aberta.")
+        frame, read_error = _read_first_frame(capture, first_frame_timeout_s)
+        if read_error is not None:
+            if isinstance(read_error, TimeoutError):
+                print(
+                    f"FAIL: a fonte {parsed!r} abriu, mas nao entregou "
+                    f"um frame antes do prazo de {first_frame_timeout_s:g} "
+                    "segundos. O backend pode ultrapassar o prazo se "
+                    "capture.read() bloquear."
+                )
+            else:
+                print(f"FAIL: erro ao ler frame da fonte {parsed!r}: {read_error}")
+            return 1
+
+        height, width = frame.shape[:2]
+        try:
+            fps = float(capture.get(cv2.CAP_PROP_FPS))
+        except Exception:
+            fps = 0.0
+        fps_text = f"{fps:g} FPS" if fps > 0 else "FPS indisponivel"
+        print(f"PASS: primeiro frame recebido: {width}x{height}, {fps_text}.")
+        return 0
+    except capture_module.CaptureError as error:
+        print(f"FAIL: {error}")
         return 1
-    _configure_local_capture(capture)
-    frame = None
-    deadline = time.time() + 3.0
-    while time.time() < deadline:
-        ok, candidate = capture.read()
-        if ok and candidate is not None:
-            frame = candidate
-            break
-        time.sleep(0.1)
-    capture.release()
-    if frame is not None:
-        print(
-            f"PASS: quadro lido de {node}. "
-            f"Formato (altura, largura, canais): {frame.shape}."
-        )
-    else:
-        print(
-            f"FAIL: {node} abriu, mas nenhum quadro chegou em 3 "
-            "segundos. A camera pode estar ocupada ou travada."
-        )
-        all_ok = False
-
-    return 0 if all_ok else 1
+    except Exception as error:
+        print(f"FAIL: erro ao testar a fonte {parsed!r}: {error}")
+        return 1
+    finally:
+        if capture is not None:
+            try:
+                capture.release()
+            except Exception:
+                pass
 
 
 def _fit(image, max_h=700):
@@ -359,6 +294,12 @@ def run(
     source=0,
     save_dir="captures",
     markers_mode=False,
+    width=None,
+    height=None,
+    fps=None,
+    backend=None,
+    reconnect_attempts=3,
+    open_timeout_ms=3000,
     neural_model=None,
     hand_model=None,
 ):
@@ -388,7 +329,14 @@ def run(
                 return corners, verdict
         return paper_module.detect_sheet_with_confidence(frame)
 
-    capture = _open_capture(parse_source(source))
+    parsed = parse_source(source)
+    capture = capture_module.ReconnectingCapture(
+        parsed, attempts=reconnect_attempts, width=width, height=height,
+        fps=fps, backend=backend, open_timeout_ms=open_timeout_ms,
+    ).attach(_open_capture(
+        parsed, width=width, height=height, fps=fps, backend=backend,
+        open_timeout_ms=open_timeout_ms,
+    ))
     save_path = Path(save_dir)
     if markers_mode:
         print("Draw v0 rodando. Mostre a folha-modelo para a camera.")
@@ -438,9 +386,14 @@ def run(
         if not ok:
             falhas_seguidas += 1
             if falhas_seguidas >= 15:
+                if capture.try_reconnect():
+                    print("Camera reconectada, continuando.")
+                    falhas_seguidas = 0
+                    continue
                 print(
-                    "A camera abriu, mas parou de entregar quadros. "
-                    "Feche outros programas usando a camera e tente de novo."
+                    "A camera abriu, mas parou de entregar quadros e "
+                    "nao voltou apos a reconexao. Feche outros programas "
+                    "usando a camera, reconecte-a e tente de novo."
                 )
                 break
             continue
@@ -616,13 +569,47 @@ def main():
     parser.add_argument(
         "--check",
         action="store_true",
-        help="valida a camera local porta por porta e sai, sem abrir janela",
+        help="valida a fonte escolhida com --source e sai, sem abrir janela",
+    )
+    parser.add_argument(
+        "--list-cameras",
+        action="store_true",
+        help="lista as webcams locais que abrem e sai, sem abrir janela",
+    )
+    parser.add_argument(
+        "--width", type=int, default=None,
+        help="largura pedida para webcam local (padrao: 1280)",
+    )
+    parser.add_argument(
+        "--height", type=int, default=None,
+        help="altura pedida para webcam local (padrao: 720)",
+    )
+    parser.add_argument(
+        "--fps", type=float, default=None,
+        help="FPS pedido para webcam local (padrao: o da camera)",
+    )
+    parser.add_argument(
+        "--backend", default=None,
+        help="backend OpenCV: any, v4l2, msmf, dshow, ffmpeg, "
+        "avfoundation, gstreamer (padrao: o do SO, para webcam local)",
+    )
+    parser.add_argument(
+        "--reconnect-attempts", type=int, default=3,
+        help="tentativas de reabrir a camera quando os quadros param",
+    )
+    parser.add_argument(
+        "--open-timeout-ms", type=int, default=3000,
+        help="timeout de abertura da fonte, em milissegundos",
     )
     parser.add_argument("--save-dir", default="captures")
     args = parser.parse_args()
+    if args.list_cameras:
+        results = capture_module.list_cameras()
+        print(capture_module.format_camera_list(results))
+        sys.exit(0 if any(item["opened"] for item in results) else 1)
     if args.check:
         parsed = parse_source(args.source)
-        sys.exit(run_check(parsed if isinstance(parsed, int) else 0))
+        sys.exit(run_check(parsed, open_timeout_ms=args.open_timeout_ms))
     neural_model = None
     if args.neural is not None:
         if args.markers:
@@ -641,10 +628,20 @@ def main():
             args.hand_model or os.environ.get("DRAW_HAND_MODEL") or ""
         )
     try:
+        backend = capture_module.backend_from_name(args.backend)
+    except ValueError as error:
+        parser.error(str(error))
+    try:
         run(
             source=args.source,
             save_dir=args.save_dir,
             markers_mode=args.markers,
+            width=args.width,
+            height=args.height,
+            fps=args.fps,
+            backend=backend,
+            reconnect_attempts=args.reconnect_attempts,
+            open_timeout_ms=args.open_timeout_ms,
             neural_model=neural_model,
             hand_model=hand_model,
         )
