@@ -4,6 +4,11 @@ Esta integração adiciona uma API de exportação em escala física e uma
 classificação geométrica experimental. Ela não altera os atalhos nem o
 comportamento do app.
 
+O app ainda não chama essas APIs. Para uma integração opcional posterior,
+consulte [INTEGRATION_WITH_APP.md](INTEGRATION_WITH_APP.md), que explica
+como selecionar a máscara correta por modo e preservar a semântica do canvas
+acumulado.
+
 ## Exportar traços para SVG e DXF
 
 `draw.export` recebe a lista produzida por `draw.strokes.extract_strokes`.
