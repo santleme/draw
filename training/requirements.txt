@@ -1,0 +1,9 @@
+# Direct training/runtime dependencies; Python 3.11 or 3.12.
+# Select the PyTorch wheel/index that matches the target CUDA runtime.
+numpy==1.26.4
+opencv-contrib-python==4.11.0.86
+torch==2.11.0
+transformers==4.57.1
+albumentations==2.0.8
+onnx==1.23.0
+onnxruntime==1.31.1

@@ -1,0 +1,231 @@
+{
+  "data": {
+    "augmentation": {
+      "geometric": [
+        "horizontal_flip_p=0.5",
+        "rotation_degrees=15",
+        "scale=0.9-1.1",
+        "perspective_light"
+      ],
+      "note": "Augmentation geom\u00e9trica aplica-se IDENTICAMENTE \u00e0 imagem e \u00e0 m\u00e1scara (nunca s\u00f3 \u00e0 imagem). Augmentation fotom\u00e9trica s\u00f3 \u00e0 imagem. M\u00e1scara nunca \u00e9 borrada nem interpolada com bilinear: nearest-neighbor, para n\u00e3o criar classes fracion\u00e1rias.",
+      "photometric": [
+        "brightness_contrast=0.2",
+        "gaussian_blur_p=0.2",
+        "gaussian_noise_p=0.2",
+        "hue_saturation_value_light"
+      ]
+    },
+    "freihand": {
+      "kaggle_dataset": "danieldelro/freihand",
+      "note": "O gerador sint\u00e9tico \u00e9 de outro agente; este treinamento apenas consome o dataset gerado. N\u00e3o baixar o FreiHAND inteiro nesta m\u00e1quina: a checagem de formato roda no Kaggle, onde o dataset entra como input.",
+      "use": "Somente como mat\u00e9ria-prima das m\u00e3os no gerador (imagem RGB + m\u00e1scara da m\u00e3o) e como checagem de formato no notebook. Keypoints, pose 3D, mesh e c\u00e2mera n\u00e3o s\u00e3o usados, salvo benef\u00edcio direto. Se a vers\u00e3o do Kaggle n\u00e3o tiver m\u00e1scaras de m\u00e3o utiliz\u00e1veis, N\u00c3O inventar r\u00f3tulos: documentar e trocar a fonte, registrando licen\u00e7a e origem."
+    },
+    "layout": {
+      "note": "Os splits J\u00c1 v\u00eam separados pelo gerador, por fonte original (m\u00e3o, folha, fundo), nunca por split aleat\u00f3rio depois de gerar. train.py n\u00e3o reembaralha fontes entre splits; ele apenas l\u00ea as pastas e valida o split_manifest.json, se presente.",
+      "per_split": [
+        "images/*.png (ou .jpg)",
+        "masks/*.png (mesmo nome base)",
+        "ink_full/*.png (opcional)"
+      ],
+      "splits": [
+        "train",
+        "val",
+        "test"
+      ],
+      "synthetic_root": "dataset/synthetic (ou /kaggle/input/<dataset>/dataset/synthetic)"
+    },
+    "real_holdout": {
+      "note": "No independent real holdout is available from the two captured sessions after they are assigned to real_train. Reserve a new capture session for real holdout before claiming real-world generalization."
+    },
+    "split_ratio": {
+      "test": 0.1,
+      "train": 0.8,
+      "val": 0.1
+    },
+    "split_seed": 42,
+    "mask_encoding": {
+      "classes": {
+        "0": "background",
+        "1": "visible paper",
+        "2": "visible hand",
+        "3": "user-added visible ink"
+      },
+      "ignore_index": 255,
+      "ignore_note": "255 marks pixels deliberately left unknown; train.py excludes them from cross-entropy, Dice, pixel counts, and evaluation. Never convert 255 to background.",
+      "visible_pixel_rule": "A hand covering ink is class 2; printed text remains class 1."
+    },
+    "real_train": {
+      "source_manifest": "captures/triage/classified_all_candidates.csv",
+      "retained_frames": 719,
+      "sessions": [
+        "session_20261029_130013_453419",
+        "session_20261029_151126_089557"
+      ],
+      "split": "train",
+      "note": "Per user instruction, both complete source sessions are wholly assigned to real train. The local pseudo-label package must be passed with --real-train-dir; notebook aborts if the private input is missing. Synthetic val/test only; no independent real holdout. Treat results as exploratory until labels are reviewed.",
+      "label_status": "pseudo-label proposals, not human-reviewed ground truth"
+    }
+  },
+  "description": "SegFormer-B0, 4 classes (background/paper/hand/ink), para o Draw. Treino no Kaggle com GPU. Este arquivo \u00e9 a \u00fanica fonte de hiperpar\u00e2metros do treinamento; o notebook apenas o l\u00ea.",
+  "export": {
+    "artifacts": [
+      "draw_segmentation_v1.onnx",
+      "classes.json",
+      "metrics.json",
+      "training_config.json",
+      "split_manifest.json"
+    ],
+    "dynamic_axes": {
+      "image": [
+        0
+      ],
+      "logits": [
+        0
+      ]
+    },
+    "input_name": "image",
+    "onnx": "draw_segmentation_v1.onnx",
+    "opset_version": 14,
+    "output_name": "logits",
+    "validation": "Rodar o modelo PyTorch e o ONNX no mesmo lote de valida\u00e7\u00e3o e comparar: diferen\u00e7a m\u00e1xima absoluta dos logits e IoU por classe. Degrada\u00e7\u00e3o significativa aborta a entrega. O resultado vai para metrics.json (campo onnx_validation)."
+  },
+  "kaggle": {
+    "accelerator": "GPU dispon\u00edvel no Kaggle; confirmar o acelerador no runtime antes do treino.",
+    "estimated_time": "30 \u00e9pocas, dataset sint\u00e9tico de ~5-10 mil imagens 512x512, batch 8: estimativa 3-6 horas em T4. Dataset menor (2 mil imagens) ou 15 \u00e9pocas: 1-2 horas. O tempo real depende do tamanho do dataset gerado; o notebook registra o tempo por \u00e9poca.",
+    "note": "Treino completo depende do dataset sint\u00e9tico e do pacote real pseudo_training_candidate anexados como inputs privados. Confirme o acelerador real no runtime. O pacote real cont\u00e9m propostas autom\u00e1ticas n\u00e3o verificadas e serve apenas para treino explorat\u00f3rio at\u00e9 revis\u00e3o humana."
+  },
+  "labels": {
+    "ink_full_mask": "M\u00e1scara opcional, fora do treino, com o desenho completo antes da oclus\u00e3o (arquivo *_ink_full.png). Serve s\u00f3 para avaliar a mem\u00f3ria temporal futura do Draw. Nunca entra como classe nem como entrada.",
+    "mask_encoding": "Single-channel PNG with values 0, 1, 2, 3, or 255 (unknown; ignored by loss and metrics).",
+    "rule": "Only visible pixels are labeled. Hand over ink is class 2; printed text is class 1. 255 is never converted to background."
+  },
+  "loss": {
+    "class_weights_rationale": "Classes muito desbalanceadas: fundo domina, papel \u00e9 grande, m\u00e3o \u00e9 m\u00e9dia, ink \u00e9 minoria (tra\u00e7o fino = poucos pixels). Peso \u00e9 inverso aproximado da frequ\u00eancia, com teto, para o ink n\u00e3o ser ignorado sem dominar o gradiente. Valores iniciais a partir da contagem de pixels do dataset gerado; o script registra a contagem real e, se ela divergir muito, o peso deve ser recalibrado e a mudan\u00e7a registrada em training_config.json \u2014 nunca ajustar peso olhando o split de teste.",
+    "cross_entropy_class_weights": [
+      1.0,
+      2.0,
+      3.0,
+      10.0
+    ],
+    "dice": "Dice multiclasse (m\u00e9dia sobre as 4 classes, com smooth=1e-6). Dice complementa o CE porque mede sobreposi\u00e7\u00e3o por classe, n\u00e3o s\u00f3 acerto por pixel, e \u00e9 menos sens\u00edvel ao dom\u00ednio do fundo.",
+    "formula": "loss = 0.5 * CrossEntropy_com_peso + 0.5 * DiceLoss_multiclasse",
+    "note": "Accuracy global N\u00c3O \u00e9 crit\u00e9rio de parada nem de compara\u00e7\u00e3o: com fundo dominante, um modelo que s\u00f3 prev\u00ea fundo j\u00e1 teria accuracy alta e seria in\u00fatil."
+  },
+  "metrics": {
+    "fixed_scenarios": [
+      "folha limpa",
+      "folha com desenho",
+      "folha muito desenhada",
+      "m\u00e3o cobrindo canto",
+      "m\u00e3o cobrindo centro",
+      "m\u00e3o cobrindo tra\u00e7o",
+      "m\u00e3o parcialmente fora da imagem",
+      "fundo claro",
+      "fundo escuro",
+      "sombra forte",
+      "folha parcialmente fora da imagem",
+      "m\u00e3o sem folha",
+      "objeto branco sem folha",
+      "tra\u00e7o fino de l\u00e1pis",
+      "tra\u00e7o grosso de caneta"
+    ],
+    "ink_tolerance": {
+      "method": "Dilatar predi\u00e7\u00e3o e ground truth de ink por 2-3 px (disco, via cv2.dilate) e recalcular precision/recall sobre a vers\u00e3o dilatada. Tra\u00e7o fino deslocado 1-2 px \u00e9 visualmente correto mas destr\u00f3i a IoU estrita; a m\u00e9trica com toler\u00e2ncia mede isso sem esconder a IoU estrita, que continua sendo reportada ao lado.",
+      "note": "Alternativas equivalentes (distance transform, compara\u00e7\u00e3o por esqueleto) s\u00e3o aceit\u00e1veis se documentadas, mas a dilata\u00e7\u00e3o \u00e9 a implementa\u00e7\u00e3o de refer\u00eancia deste projeto por ser simples e reproduz\u00edvel.",
+      "radii_px": [
+        2,
+        3
+      ]
+    },
+    "note": "Os 15 cen\u00e1rios fixos t\u00eam predi\u00e7\u00f5es salvas (imagem + overlay) para compara\u00e7\u00e3o entre vers\u00f5es do modelo. M\u00e9tricas sint\u00e9ticas e do holdout real nunca s\u00e3o misturadas no mesmo n\u00famero.",
+    "per_class": [
+      "iou",
+      "dice",
+      "precision",
+      "recall"
+    ],
+    "required": [
+      "iou_background",
+      "iou_paper",
+      "iou_hand",
+      "iou_ink",
+      "dice_paper",
+      "dice_hand",
+      "dice_ink",
+      "precision",
+      "recall"
+    ]
+  },
+  "model": {
+    "architecture": "SegFormer-B0",
+    "backbone": "nvidia/mit-b0",
+    "classes": {
+      "0": "background",
+      "1": "paper",
+      "2": "hand",
+      "3": "ink"
+    },
+    "input": {
+      "channels": 3,
+      "color_space": "RGB",
+      "height": 512,
+      "normalization": {
+        "mean": [
+          0.485,
+          0.456,
+          0.406
+        ],
+        "note": "Id\u00eantica ao contrato atual de draw/neural.py (_MEAN/_STD). O ONNX novo mant\u00e9m input 'image' 512x512 normalizado assim, para a integra\u00e7\u00e3o n\u00e3o mudar o pr\u00e9-processamento.",
+        "std": [
+          0.229,
+          0.224,
+          0.225
+        ]
+      },
+      "width": 512
+    },
+    "num_classes": 4,
+    "output": {
+      "name": "logits",
+      "note": "Logits por classe, sem softmax embutido. A integra\u00e7\u00e3o (Codex, fora deste escopo) aplica argmax: paper_mask = (argmax == 1), hand_mask = (argmax == 2), ink_mask = (argmax == 3). paper_presence \u00e9 DERIVADO da m\u00e1scara (fra\u00e7\u00e3o de pixels paper acima do limiar de integra\u00e7\u00e3o), n\u00e3o uma cabe\u00e7a auxiliar: decis\u00e3o documentada, modelo de cabe\u00e7a \u00fanica, sem simplifica\u00e7\u00e3o da segmenta\u00e7\u00e3o para caber no contrato antigo de 2 canais.",
+      "shape": [
+        1,
+        4,
+        512,
+        512
+      ]
+    },
+    "pretrained": true,
+    "pretrained_source": "Hugging Face transformers (SegformerForSemanticSegmentation, id nvidia/mit-b0). Transfer learning: encoder pr\u00e9-treinado no ImageNet, cabe\u00e7a de segmenta\u00e7\u00e3o nova com 4 classes."
+  },
+  "project": "draw-segmentation-v1",
+  "training": {
+    "batch_size": 8,
+    "checkpoint": "checkpoints/best.pt (melhor val_mean_iou; checkpoints/last.pt a cada \u00e9poca)",
+    "early_stopping": {
+      "mode": "max",
+      "monitor": "val_mean_iou",
+      "patience_epochs": 5
+    },
+    "epochs": 30,
+    "gradient_accumulation_steps": 1,
+    "learning_rate": 6e-05,
+    "mixed_precision": "bf16 (fp16 se a GPU n\u00e3o suportar bf16)",
+    "note": "Batch 8 em 512x512 cabe numa T4/P100 de 16 GB com SegFormer-B0. Se houver OOM, baixar para batch 4 com gradient_accumulation_steps=2 (batch efetivo igual) em vez de reduzir a resolu\u00e7\u00e3o: tra\u00e7o fino depende da resolu\u00e7\u00e3o.",
+    "num_workers": 4,
+    "optimizer": "AdamW",
+    "scheduler": "cosine_with_warmup",
+    "seed": 42,
+    "warmup_ratio": 0.1,
+    "weight_decay": 0.01
+  },
+  "data_sources": {
+    "synthetic_root": "/kaggle/working/dataset/synthetic",
+    "real_train_root": "/kaggle/input/draw-real-seg-pilot-v1",
+    "train_pair_counts": {
+      "synthetic": 2400,
+      "real": 719
+    },
+    "validation_and_test_source": "synthetic --data-dir only"
+  }
+}
