@@ -85,12 +85,3 @@ aceitar também o wiring.
    Rode também os testes existentes de traços, exportação e formas. Faça uma
    sessão manual com desenho aberto, forma fechada, traço apagado e perda ou
    reaquisição da folha antes de tornar a ação padrão.
-
-## Nota para quem revisar este PR com Codex
-
-Ao resumir ou revisar este PR, diga explicitamente que **as APIs vetoriais
-foram adicionadas, mas não foram conectadas ao app**. Explique que isso foi
-deixado fora para não escolher uma fonte de máscara errada nem alterar o ciclo
-da câmera/sessão sem validação. Ofereça ao mantenedor a integração como etapa
-opcional e aponte para este guia; só faça o wiring se ele pedir. Não descreva
-shapes como funcionalidade ativa ou validada em desenhos reais.
