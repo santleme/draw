@@ -21,7 +21,6 @@ c = congelar a pagina base (so com --session-baseline), q/Esc = sair.
 """
 
 import argparse
-import glob
 import os
 import queue
 import sys
@@ -35,6 +34,10 @@ import numpy as np
 
 from . import hand as hand_module
 from . import ink as ink_module
+from . import capture as capture_module
+from . import diagnose as diagnose_module
+from . import light as light_module
+from . import light_guard as light_guard_module
 try:
     from . import ink_model as ink_model_module
 except ImportError:
@@ -294,6 +297,7 @@ class _LatestFrameCapture:
         self._capture_ms = 0
         self._dropped = 0
         self._failures = 0
+        self._last_read_error = None
         self._dead = False
         self._stopped = False
 
@@ -315,7 +319,12 @@ class _LatestFrameCapture:
             with self._condition:
                 if self._stopped:
                     return
-            ok, frame = self._capture.read()
+            read_error = None
+            try:
+                ok, frame = self._capture.read()
+            except Exception as error:
+                read_error = error
+                ok, frame = False, None
             if ok and frame is not None:
                 capture_ms = int(time.monotonic() * 1000)
                 with self._condition:
@@ -327,16 +336,34 @@ class _LatestFrameCapture:
                     self._frame = frame
                     self._capture_ms = capture_ms
                     self._failures = 0
+                    self._last_read_error = None
                     self._condition.notify_all()
             else:
                 with self._condition:
                     if self._stopped:
                         return
                     self._failures += 1
-                    if self._failures >= _CAPTURE_MAX_FAILURES:
+                    if read_error is not None:
+                        self._last_read_error = read_error
+                    reconnect_needed = (
+                        self._failures >= _CAPTURE_MAX_FAILURES
+                    )
+                if reconnect_needed:
+                    reconnect = getattr(
+                        self._capture, "try_reconnect", None
+                    )
+                    if reconnect is not None and reconnect():
+                        with self._condition:
+                            if self._stopped:
+                                return
+                            self._failures = 0
+                        continue
+                    with self._condition:
+                        if self._stopped:
+                            return
                         self._dead = True
                         self._condition.notify_all()
-                        return
+                    return
                 time.sleep(_READ_RETRY_SECONDS)
 
     def wait_next(self, after_seq, timeout=None):
@@ -372,6 +399,12 @@ class _LatestFrameCapture:
     def failures(self):
         with self._condition:
             return self._failures
+
+    @property
+    def last_error(self):
+        with self._condition:
+            read_error = self._last_read_error
+        return read_error or getattr(self._capture, "last_error", None)
 
     def stop(self):
         """Para a thread e libera a captura.
@@ -427,174 +460,99 @@ class _PngWriter:
 
 
 def parse_source(value):
-    """'0'/'1' viram indice de webcam local; qualquer outra coisa e URL/arquivo."""
-    if value is None:
-        return 0
-    if isinstance(value, int):
-        return value
-    text = str(value).strip()
-    return int(text) if text.isdigit() else text
+    """Delega para draw/capture.py, mantendo a CLI compatível."""
+    return capture_module.parse_source(value)
 
 
 def is_wsl():
-    """Detecta WSL pelo nome do kernel em /proc (ex.: '...-microsoft-standard-WSL2')."""
-    try:
-        return "microsoft" in Path("/proc/sys/kernel/osrelease").read_text().lower()
-    except OSError:
-        return False
+    return capture_module.is_wsl()
 
 
-def _configure_local_capture(capture):
-    # MJPG comprimido e 720p: o formato cru padrao (YUYV em 1080p)
-    # estoura a banda do USB virtual do usbip no WSL e a entrega de
-    # quadros trava com timeout de select() no V4L2.
-    capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-    capture.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+def _configure_local_capture(capture, width=None, height=None, fps=None):
+    capture_module.apply_local_settings(
+        capture, width=width, height=height, fps=fps
+    )
 
 
 def _local_open_hint(source):
-    """Diagnostico por porta: nomeia a primeira condicao que impede a abertura."""
-    node = f"/dev/video{source}"
-    if not sys.platform.startswith("linux"):
-        return (
-            "Nenhuma webcam local respondeu nesse indice. "
-            "Confira se a webcam esta conectada e livre."
-        )
-    if not os.path.exists(node):
-        hint = f"A camera nao esta conectada a este sistema: {node} nao existe. "
-        if is_wsl():
-            hint += (
-                "Anexe a camera ao WSL com: bash scripts/setup_camera_wsl.sh. "
-                "A alternativa e uma camera via rede: python main.py "
-                "--source http://<ip-da-camera>:8080/video."
-            )
-        else:
-            hint += "Confira se a webcam esta conectada a este computador."
-        return hint
-    if not os.access(node, os.R_OK | os.W_OK):
-        return (
-            f"{node} existe, mas este processo nao tem permissao de "
-            "leitura e escrita nele. A porta que falhou e a permissao. "
-            "Correcao definitiva: sudo usermod -aG video $USER "
-            "(vale nas proximas sessoes). "
-            'Correcao nesta sessao: sg video -c "python3 main.py".'
-        )
-    return (
-        f"{node} existe e este processo tem permissao nele, mas a "
-        "abertura falhou. Outro programa provavelmente esta usando a "
-        "camera. Feche esse programa e tente de novo."
-    )
+    return capture_module.diagnose_local(source)[1]
 
 
-def _open_capture(source):
-    capture = cv2.VideoCapture(source)
-    if capture.isOpened():
-        if isinstance(source, int):
-            _configure_local_capture(capture)
-        return capture
-    hint = f"Nao consegui abrir a fonte de video: {source!r}. "
-    if isinstance(source, int):
-        hint += _local_open_hint(source)
-    else:
-        hint += (
-            "Confira se a URL esta certa, se a camera esta transmitindo e "
-            "se este computador alcanca o endereco dela na rede."
-        )
-    raise RuntimeError(hint)
+def _open_capture(source, **kwargs):
+    return capture_module.open_capture(source, **kwargs)
 
 
 def _video_nodes():
-    return sorted(
-        path
-        for path in glob.glob("/dev/video*")
-        if path[len("/dev/video"):].isdigit()
-    )
+    return capture_module.video_nodes()
 
 
-def run_check(source=0):
-    """Validacao da camera local, porta por porta. Retorna 0 ou 1."""
-    print(f"PASS: OpenCV disponivel. Versao {cv2.__version__}.")
-
-    nodes = _video_nodes()
-    if not nodes:
-        print("FAIL: nenhum /dev/video* existe neste sistema.")
-        if is_wsl():
-            print(
-                "  Correcao: anexe a camera com "
-                "bash scripts/setup_camera_wsl.sh. A alternativa e uma "
-                "camera via rede com --source."
-            )
-        else:
-            print("  Correcao: conecte uma webcam a este computador.")
-        return 1
-    print(f"PASS: dispositivos de video encontrados: {', '.join(nodes)}.")
-
-    all_ok = True
-    node = nodes[0]
-
-    access = os.access(node, os.R_OK | os.W_OK)
-    group_note = ""
-    try:
-        import grp
-
-        gid = os.stat(node).st_gid
+def _read_first_frame(capture, timeout_s):
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    while True:
         try:
-            group_name = grp.getgrgid(gid).gr_name
-        except KeyError:
-            group_name = str(gid)
-        in_group = gid in os.getgroups()
-        group_note = (
-            f" Grupo dono de {node}: {group_name}. "
-            f"Este processo esta nesse grupo: {'sim' if in_group else 'nao'}."
-        )
-    except Exception:
-        group_note = ""
-    if access:
-        print(f"PASS: este processo le e escreve em {node}.{group_note}")
-    else:
-        print(
-            f"FAIL: este processo nao tem permissao de leitura e "
-            f"escrita em {node}.{group_note}"
-        )
-        print(
-            "  Correcao definitiva: sudo usermod -aG video $USER "
-            "(vale nas proximas sessoes)."
-        )
-        print('  Correcao nesta sessao: sg video -c "python3 main.py".')
-        all_ok = False
+            ok, frame = capture.read()
+        except Exception as error:
+            return None, error
+        if ok and frame is not None:
+            return frame, None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None, TimeoutError("nenhum frame recebido dentro do prazo")
+        time.sleep(min(0.05, remaining))
 
-    index = int(node[len("/dev/video"):])
-    capture = cv2.VideoCapture(index)
-    if not capture.isOpened():
-        print(
-            f"FAIL: nao consegui abrir {node}. Outro programa "
-            "provavelmente esta usando a camera."
+
+def run_check(source=0, open_timeout_ms=3000, first_frame_timeout_s=5.0):
+    """Valida a fonte informada, lê um frame e sempre libera a captura."""
+    parsed = parse_source(source)
+    print(f"PASS: OpenCV disponivel. Versao {cv2.__version__}.")
+    print(f"Testando fonte: {parsed!r}.")
+    capture = None
+    try:
+        read_timeout_ms = max(1, int(first_frame_timeout_s * 1000))
+        capture = _open_capture(
+            parsed,
+            open_timeout_ms=open_timeout_ms,
+            read_timeout_ms=read_timeout_ms,
         )
+        if not capture.isOpened():
+            print(f"FAIL: a fonte {parsed!r} nao abriu.")
+            return 1
+        print(f"PASS: fonte {parsed!r} aberta.")
+        frame, read_error = _read_first_frame(capture, first_frame_timeout_s)
+        if read_error is not None:
+            if isinstance(read_error, TimeoutError):
+                print(
+                    f"FAIL: a fonte {parsed!r} abriu, mas nao entregou "
+                    f"um frame antes do prazo de {first_frame_timeout_s:g} "
+                    "segundos. O backend pode ultrapassar o prazo se "
+                    "capture.read() bloquear."
+                )
+            else:
+                print(f"FAIL: erro ao ler frame da fonte {parsed!r}: {read_error}")
+            return 1
+        height_px, width_px = frame.shape[:2]
+        try:
+            fps_value = float(capture.get(cv2.CAP_PROP_FPS))
+        except Exception:
+            fps_value = 0.0
+        fps_text = f"{fps_value:g} FPS" if fps_value > 0 else "FPS indisponivel"
+        print(
+            f"PASS: primeiro frame recebido: {width_px}x{height_px}, "
+            f"{fps_text}."
+        )
+        return 0
+    except capture_module.CaptureError as error:
+        print(f"FAIL: {error}")
         return 1
-    _configure_local_capture(capture)
-    frame = None
-    deadline = time.time() + 3.0
-    while time.time() < deadline:
-        ok, candidate = capture.read()
-        if ok and candidate is not None:
-            frame = candidate
-            break
-        time.sleep(0.1)
-    capture.release()
-    if frame is not None:
-        print(
-            f"PASS: quadro lido de {node}. "
-            f"Formato (altura, largura, canais): {frame.shape}."
-        )
-    else:
-        print(
-            f"FAIL: {node} abriu, mas nenhum quadro chegou em 3 "
-            "segundos. A camera pode estar ocupada ou travada."
-        )
-        all_ok = False
-
-    return 0 if all_ok else 1
+    except Exception as error:
+        print(f"FAIL: erro ao testar a fonte {parsed!r}: {error}")
+        return 1
+    finally:
+        if capture is not None:
+            try:
+                capture.release()
+            except Exception:
+                pass
 
 
 def _fit(image, max_h=700):
@@ -697,7 +655,7 @@ def _dead_source_view(last_view):
     return view
 
 
-def _detect_sheet_combined(frame, neural_detector):
+def _detect_sheet_combined(frame, neural_detector, classic_detect=None):
     """Detecção do modo sem marcadores: neural primário, clássico reserva.
 
     Sem detector neural, é o clássico puro, o comportamento de sempre.
@@ -723,6 +681,8 @@ def _detect_sheet_combined(frame, neural_detector):
     sem esse canal, cada ajuste recusado vira contagem de perda e a
     folha cai durante os episódios de oclusão).
     """
+    if classic_detect is None:
+        classic_detect = paper_module.detect_sheet_with_confidence
     if neural_detector is not None:
         corners, verdict = neural_detector.detect_sheet_with_confidence(frame)
         if corners is not None:
@@ -730,11 +690,45 @@ def _detect_sheet_combined(frame, neural_detector):
         logit = neural_detector.last_presence_logit
         if logit is not None and logit <= neural_module.PRESENCE_VETO_LOGIT:
             return None, None
-        corners, verdict = paper_module.detect_sheet_with_confidence(frame)
+        corners, verdict = classic_detect(frame)
         if corners is None and logit is not None and logit > 0:
             return None, "paper"
         return corners, verdict
-    return paper_module.detect_sheet_with_confidence(frame)
+    return classic_detect(frame)
+
+
+def detect_sheet_with_light_guard(frame, light_normalize="off"):
+    """Usa luz normalizada só quando a guarda confirma o candidato."""
+    return light_guard_module.detect_sheet_with_light_guard(
+        frame, light_normalize
+    )
+
+
+def _detect_sheet_for_run(frame, neural_detector, light_normalize,
+                          winning_light):
+    """Detecta um quadro e guarda o modo que deve ser usado na tinta.
+
+    O detector neural recebe o frame original, portanto uma detecção
+    neural confirmada mantém a tinta sem normalização. Quando ele não
+    fecha os cantos, a reserva clássica pode selecionar o modo aceito
+    pela guarda de luz.
+    """
+    winning_light["mode"] = "off"
+
+    def classic_with_light_guard(candidate_frame):
+        corners, verdict, winning = detect_sheet_with_light_guard(
+            candidate_frame, light_normalize
+        )
+        winning_light["mode"] = winning
+        return corners, verdict
+
+    return _detect_sheet_combined(
+        frame, neural_detector, classic_with_light_guard
+    )
+
+
+def _ink_input(warped, light_normalize="off"):
+    return light_module.normalize_light(warped, light_normalize)
 
 
 def run(
@@ -745,6 +739,13 @@ def run(
     hand_model=None,
     ink_model=None,
     session_baseline=False,
+    width=None,
+    height=None,
+    fps=None,
+    backend=None,
+    reconnect_attempts=3,
+    open_timeout_ms=3000,
+    light_normalize="off",
 ):
     neural_detector = None
     if neural_model is not None and not markers_mode:
@@ -795,10 +796,28 @@ def run(
             "desconhecida no canvas acumulativo."
         )
 
-    def detect_sheet(frame):
-        return _detect_sheet_combined(frame, neural_detector)
+    winning_light = {"mode": light_normalize}
 
-    capture = _open_capture(parse_source(source))
+    def detect_sheet(frame):
+        return _detect_sheet_for_run(
+            frame, neural_detector, light_normalize, winning_light
+        )
+
+    parsed_source = parse_source(source)
+    capture_kwargs = {
+        "width": width,
+        "height": height,
+        "fps": fps,
+        "backend": backend,
+        "open_timeout_ms": open_timeout_ms,
+    }
+    capture = _open_capture(parsed_source, **capture_kwargs)
+    if reconnect_attempts > 0:
+        capture = capture_module.ReconnectingCapture(
+            parsed_source,
+            attempts=reconnect_attempts,
+            **capture_kwargs,
+        ).attach(capture)
     frame_source = _LatestFrameCapture(capture).start()
     png_writer = _PngWriter()
     save_path = Path(save_dir)
@@ -885,10 +904,13 @@ def run(
             # a janela, sobre a ultima vista, e fica _DEAD_NOTICE_MS
             # ou ate uma tecla: so o console seria um congelamento
             # silencioso para quem esta olhando a janela.
-            print(
+            message = (
                 "A camera abriu, mas parou de entregar quadros. "
                 "Feche outros programas usando a camera e tente de novo."
             )
+            if frame_source.last_error is not None:
+                message += f" Erro mais recente: {frame_source.last_error}"
+            print(message)
             cv2.imshow("Draw", _dead_source_view(last_view))
             cv2.waitKey(_DEAD_NOTICE_MS)
             break
@@ -969,7 +991,10 @@ def run(
                     and session_corners is not None
                     else ink_corners
                 )
-                ink_warped = paper_module.warp_sheet(frame, warp_corners)
+                ink_warped = _ink_input(
+                    paper_module.warp_sheet(frame, warp_corners),
+                    winning_light["mode"],
+                )
                 visible = None
                 if hand_masker is not None:
                     camera_mask = hand_masker.mask(frame)
@@ -1069,7 +1094,10 @@ def run(
                 canvas = accumulated_canvas
             else:
                 ink_mask = ink_source(
-                    paper_module.warp_sheet(frame, tracker.corners)
+                    _ink_input(
+                        paper_module.warp_sheet(frame, tracker.corners),
+                        winning_light["mode"],
+                    )
                 )
                 canvas = ink_module.render_canvas(
                     ink_mask, out=view_canvas_buffer
@@ -1152,7 +1180,66 @@ def main():
     parser.add_argument(
         "--check",
         action="store_true",
-        help="valida a camera local porta por porta e sai, sem abrir janela",
+        help="testa a fonte selecionada com --source e sai",
+    )
+    parser.add_argument(
+        "--list-cameras",
+        action="store_true",
+        help="lista webcams locais que abrem e sai",
+    )
+    parser.add_argument(
+        "--test-source",
+        default=None,
+        metavar="FONTE",
+        help="faz um diagnóstico detalhado da fonte e sai",
+    )
+    parser.add_argument(
+        "--test-all",
+        action="store_true",
+        help="diagnostica todas as webcams locais e sai",
+    )
+    parser.add_argument(
+        "--include-urls",
+        nargs="*",
+        default=[],
+        help="com --test-all, diagnostica também estas URLs",
+    )
+    parser.add_argument(
+        "--report",
+        choices=("text", "json"),
+        default="text",
+        help="formato do diagnóstico de --test-source/--test-all",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="com --list-cameras, mostra detalhes da câmera",
+    )
+    parser.add_argument("--width", type=int, default=None)
+    parser.add_argument("--height", type=int, default=None)
+    parser.add_argument("--fps", type=float, default=None)
+    parser.add_argument(
+        "--backend",
+        default=None,
+        help="backend OpenCV (any, v4l2, msmf, dshow, ffmpeg, avfoundation, gstreamer)",
+    )
+    parser.add_argument(
+        "--reconnect-attempts",
+        type=int,
+        default=3,
+        help="tentativas de reabrir a câmera quando os quadros param",
+    )
+    parser.add_argument(
+        "--open-timeout-ms",
+        type=int,
+        default=3000,
+        help="limite para abrir a fonte, em milissegundos",
+    )
+    parser.add_argument(
+        "--light-normalize",
+        choices=list(light_guard_module.LIGHT_GUARD_MODES),
+        default="off",
+        help="normalização de fundo protegida: off (padrão) ou background",
     )
     parser.add_argument(
         "--session-baseline",
@@ -1165,9 +1252,80 @@ def main():
     )
     parser.add_argument("--save-dir", default="captures")
     args = parser.parse_args()
+    if args.test_source is not None or args.test_all or args.include_urls:
+        reports = []
+        if args.test_source is not None:
+            reports.append(
+                diagnose_module.probe_source(
+                    args.test_source, open_timeout_ms=args.open_timeout_ms
+                )
+            )
+        if args.test_all:
+            reports.extend(
+                diagnose_module.probe_all(
+                    include_urls=args.include_urls,
+                    open_timeout_ms=args.open_timeout_ms,
+                )
+            )
+        elif args.include_urls:
+            reports.extend(
+                diagnose_module.probe_all(
+                    include_urls=args.include_urls,
+                    list_fn=lambda: [],
+                    open_timeout_ms=args.open_timeout_ms,
+                )
+            )
+        if args.report == "json":
+            import json
+
+            print(json.dumps(
+                [report.to_dict() for report in reports],
+                indent=2,
+                default=str,
+            ))
+        else:
+            for report in reports:
+                print(diagnose_module.format_report(report))
+        if not reports:
+            sys.exit(2)
+        sys.exit(0 if all(report.ok for report in reports) else 1)
+    if args.list_cameras:
+        results = capture_module.list_cameras()
+        if args.verbose:
+            for item in results:
+                detail = ""
+                if item["opened"]:
+                    report = diagnose_module.probe_source(
+                        item["index"], read_frames=1,
+                        open_timeout_ms=args.open_timeout_ms,
+                    )
+                    props = []
+                    if report.width and report.height:
+                        props.append(f"{report.width}x{report.height}")
+                    if report.fps:
+                        props.append(f"{report.fps:g}fps")
+                    if report.fourcc:
+                        props.append(str(report.fourcc))
+                    if report.backend_used:
+                        props.append(str(report.backend_used))
+                    if props:
+                        detail = f" [{', '.join(props)}]"
+                node = f" ({item['node']})" if item.get("node") else ""
+                status = "ok" if item["opened"] else "não abriu"
+                print(f"  {item['index']}{node}: {status}{detail}")
+        else:
+            print(capture_module.format_camera_list(results))
+        sys.exit(0 if any(item["opened"] for item in results) else 1)
     if args.check:
-        parsed = parse_source(args.source)
-        sys.exit(run_check(parsed if isinstance(parsed, int) else 0))
+        sys.exit(run_check(args.source, args.open_timeout_ms))
+    if args.reconnect_attempts < 0:
+        parser.error("--reconnect-attempts precisa ser >= 0")
+    if args.open_timeout_ms <= 0:
+        parser.error("--open-timeout-ms precisa ser > 0")
+    try:
+        backend = capture_module.backend_from_name(args.backend)
+    except ValueError as error:
+        parser.error(str(error))
     neural_model = None
     if args.neural is not None:
         if args.markers:
@@ -1206,6 +1364,13 @@ def main():
             hand_model=hand_model,
             ink_model=ink_model,
             session_baseline=args.session_baseline,
+            width=args.width,
+            height=args.height,
+            fps=args.fps,
+            backend=backend,
+            reconnect_attempts=args.reconnect_attempts,
+            open_timeout_ms=args.open_timeout_ms,
+            light_normalize=args.light_normalize,
         )
     except (RuntimeError, FileNotFoundError) as error:
         print(f"Erro: {error}")

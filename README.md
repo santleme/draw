@@ -42,10 +42,12 @@ O script prepara o usbipd, anexa a câmera ao WSL e confere o resultado. Ele tam
 Se algo falhar, rode o diagnóstico antes de mexer em outra coisa.
 
 ```bash
-python main.py --check
+python main.py --list-cameras --verbose
+python main.py --test-source 0
+python main.py --test-all --report json
 ```
 
-O `--check` valida o OpenCV, a existência de `/dev/video*`, a permissão do processo sobre o dispositivo e a leitura de um quadro real. Cada falha sai nomeada, com a correção na linha seguinte.
+`--check` testa a fonte escolhida em `--source`. `--list-cameras` mostra quais webcams abrem; `--test-source` e `--test-all` também verificam quadros e propriedades negociadas e sugerem o que corrigir quando há falha. URLs só são testadas quando informadas explicitamente com `--include-urls`.
 
 ### Linux com câmera USB
 
@@ -70,7 +72,10 @@ python main.py --neural models/draw_seg_v3_dyn.onnx
 | `--ink-model [modelo.onnx]` | Modelo aprendido de tinta como fonte da máscara. Sem caminho, lê `DRAW_INK_MODEL`. Sem arquivo ou com erro de carga, o app avisa uma vez e segue com a heurística |
 | `--hand-model [modelo.task]` | Máscara de mão do MediaPipe para o canvas acumulativo. Sem caminho, lê `DRAW_HAND_MODEL` ou `models/hand_landmarker.task` |
 | `--markers` | Modo opcional com a folha-modelo impressa e marcadores ArUco |
-| `--check` | Valida a câmera porta por porta e sai, sem abrir janela |
+| `--check` | Testa a fonte escolhida em `--source` e sai, sem abrir janela |
+| `--list-cameras` | Lista webcams locais que abrem; `--verbose` mostra resolução, FPS e backend |
+| `--test-source FONTE` / `--test-all` | Diagnostica uma fonte ou todas as webcams locais; `--report json` gera JSON |
+| `--light-normalize MODO` | Usa a guarda medida de fundo (`background`); o padrão `off` mantém o comportamento atual |
 | `--save-dir pasta` | Pasta das capturas. O padrão é `captures` |
 
 A variável `DRAW_ORT_THREADS` troca o número de threads da sessão ONNX sem tocar no código. O padrão é 4, medido na máquina do autor.
