@@ -1,14 +1,9 @@
 """Regressao diferencial do InkAccumulator otimizado.
 
-A otimizacao de 2026-10-30 trocou o julgamento da histerese de
-float32 para inteiro (ink*escala >= coef*vis) e as escritas dos
-carimbos de pagina cheia para esparsas (so onde ha transicao). A
-promessa e equivalencia exata: este teste roda a implementacao
-nova (draw.ink) contra a anterior (ink_before.py, copia congelada
-de draw/ink.py antes da otimizacao, em draw-lab/bottleneck-
-2026-10-30/ink-optim/) sobre sequencias deterministicas e
-aleatorias semeadas, e exige canvas, estado e os dois planos de
-carimbo byte-identicos depois de CADA frame.
+Compara a implementacao atual (draw.ink) contra a referencia canonica
+em float32 + carimbos densos (tests._ink_reference) sobre sequencias
+deterministicas e aleatorias semeadas, e exige canvas, estado e os
+dois planos de carimbo byte-identicos depois de CADA frame.
 
 Cobertura deliberada: fracoes de fronteira exatas (9/20 na
 entrada, 4/20 na saida, com janela 20), denominadores impares
@@ -18,7 +13,6 @@ uint32, t repetido).
 Uso: python tests/test_accumulator_integer_sparse.py
 """
 
-import importlib.util
 import sys
 from pathlib import Path
 
@@ -27,20 +21,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from draw import ink as ink_new  # noqa: E402
-
-_BEFORE = (
-    Path.home()
-    / "workspace/draw-lab/bottleneck-2026-10-30/ink-optim/ink_before.py"
-)
-if not _BEFORE.exists():
-    print(f"ERRO: {_BEFORE} nao existe; copie draw/ink.py para la "
-          "antes de otimizar o acumulador.")
-    sys.exit(2)
-_spec = importlib.util.spec_from_file_location(
-    "draw._ink_before_optim", _BEFORE
-)
-ink_old = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(ink_old)
+from tests import _ink_reference as ink_old  # noqa: E402
 
 H, W = 1200, 850
 
@@ -195,6 +176,10 @@ def main():
     run_pair(random_frames(1234), "aleatoria semente 1234")
     run_pair(edge_time_frames(), "tempos de borda")
     print("DIFERENCIAL OK: implementacao nova identica a anterior")
+
+
+def test_accumulator_integer_sparse():
+    main()
 
 
 if __name__ == "__main__":

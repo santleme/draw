@@ -2,20 +2,18 @@
 
 Uso:
   python main.py                                  # webcam local (indice 0)
-  python main.py --check                          # valida a camera e sai
+  python main.py --check                          # valida a fonte e sai
   python main.py --markers                        # folha-modelo impressa
   python main.py --neural modelo.onnx             # detector neural primario
-  python main.py --ink-model modelo.onnx          # modelo aprendido de tinta
-  python main.py --hand-model modelo.task         # mascara de mao no canvas
+  python main.py --async-detect                   # detector em thread dedicada
+  python main.py --hand-model modelo.task         # mascara de mao + cursor
+  python main.py --session-baseline               # tinta da sessao (tecla C)
   python main.py --source 1                       # outra webcam local
   python main.py --source http://192.168.0.10:8080/video   # camera via rede
+  python main.py --source tcp://192.168.0.10:8765          # helper Windows TCP
+  python main.py --source sessao.drawcap                   # replay .drawcap
 
-A fonte via rede (MJPEG/RTSP) e o caminho recomendado no WSL. O WSL nao
-enxerga webcams USB do Windows por padrao, mas enxerga streams de rede.
-Assim todo o processamento (e o ML futuro) fica no Linux. A camera so
-envia os frames. Ela pode ser um celular, outro computador ou uma camera IP.
-
-Teclas: s = salvar o canvas como PNG, f = capturar um frame cru,
+Teclas: s = salvar o canvas como PNG (+ carimbos .npz), f = capturar um frame cru,
 g = ligar ou desligar a captura automatica de frames,
 c = congelar a pagina base (so com --session-baseline), q/Esc = sair.
 """
@@ -27,235 +25,39 @@ import queue
 import sys
 import threading
 import time
-from collections import deque
 from pathlib import Path
 
 import cv2
 import numpy as np
 
+from . import config
 from . import hand as hand_module
 from . import ink as ink_module
 try:
     from . import ink_model as ink_model_module
 except ImportError:
-    # O extrator de tinta por modelo aprendido e opcional e o modulo
-    # dele ainda nao faz parte do pacote publicado. Sem o modulo,
-    # --ink-model avisa e o app segue so com a heuristica.
     ink_model_module = None
 from . import neural as neural_module
-from . import paper as paper_module
+from .pipeline import (
+    DrawPipeline,
+    _INK_CORNER_HISTORY,
+    _SHEET_BLEND_ALPHA,
+    _SHEET_DETECT_INTERVAL,
+    _SHEET_JUMP_PERSIST_SECONDS,
+    _SHEET_LOST_MIN_FRAMES,
+    _SHEET_LOST_SECONDS,
+    _SHEET_NEAR_LIMIT_PX,
+    _SheetTracker,
+    _blend_corners,
+    _corner_distance,
+    _detect_sheet_combined,
+)
+from .protocol import HelperCapture, is_helper_source
 
-
-_SHEET_NEAR_LIMIT_PX = 40.0
-_SHEET_BLEND_ALPHA = 0.3
-# Confirmação de salto por TEMPO, não por contagem de detecções
-# (medido em 2026-10-30 no laboratório,
-# draw-lab/noite-2026-10-30/block6/): com a contagem de 3, um salto
-# selvagem confirmava em ~0,1 s na cadência densa de "missed" (a
-# detecção roda a cada quadro), e os vídeos de replay mediam 64
-# passos oficiais acima de 100 px em 1.857 quadros. Exigir que o
-# candidato persista 0,3 s de tempo de vídeo (o dobro para
-# blank_maybe, como era o dobro na contagem) derruba os passos
-# >100 px para 15 e o jitter médio da grade de 29,39 para 9,66 px,
-# sem nenhuma queda nova e com o atraso de remoção intacto em
-# 0,53 s. Ressalva: a medição é sobre gravações de tela com overlay
-# queimado; reconfirmar em captura crua.
-_SHEET_JUMP_PERSIST_SECONDS = 0.3
-_SHEET_DETECT_INTERVAL = 5
-# Perda da folha medida em tempo, nao em quadros: com a contagem em
-# quadros, o mesmo limite valia ~1 s a 30 fps e ~3 s numa sessao lenta,
-# e era esse o banner que ficava sobre a mesa vazia. O piso em quadros
-# impede a queda entre duas deteccoes agendadas quando o loop roda
-# devagar: a folha presente confirma de novo antes dos dois criterios.
-_SHEET_LOST_SECONDS = 0.5
-_SHEET_LOST_MIN_FRAMES = 10
-# A tinta e lida numa geometria estabilizada: a mediana dos ultimos
-# conjuntos de cantos do rastreador. O jitter de canto entre deteccoes
-# (media de ~5 px, com saltos de dezenas de pixels quando a mao cobre
-# um canto) desloca o traco de 1 a 3 px no espaco do papel e desfaz o
-# voto por pixel do canvas acumulativo; a mediana de 5 segura a
-# geometria no lugar por tempo bastante para a janela do acumulador.
-_INK_CORNER_HISTORY = 5
-# Limite de falhas seguidas de leitura que declara a fonte morta.
-# Era a contagem do laco principal (15 read() falhos seguidos e o app
-# avisava e saia); com a leitura numa thread propria, a contagem mora
-# na thread e o desfecho visivel e o mesmo.
 _CAPTURE_MAX_FAILURES = 15
-# Pausa entre tentativas de leitura no caminho de falha. Sem ela, um
-# driver que devolve False na hora faz a thread girar uma CPU inteira
-# enquanto a camera nao volta; o laco antigo girava sem dormir.
 _READ_RETRY_SECONDS = 0.005
-# Teto da espera pela drenagem da fila de PNG na saida do app.
 _PNG_DRAIN_SECONDS = 5.0
-# Tempo que o aviso de fonte morta fica na janela antes da saida.
-# Sem ele, a morte da fonte e um congelamento silencioso. O waitKey
-# devolve antes se qualquer tecla for apertada.
 _DEAD_NOTICE_MS = 3000
-
-
-def _corner_distance(current, detected):
-    return float(np.max(np.linalg.norm(current - detected, axis=1)))
-
-
-def _blend_corners(current, detected):
-    return (
-        (1.0 - _SHEET_BLEND_ALPHA) * current
-        + _SHEET_BLEND_ALPHA * detected
-    ).astype(np.float32)
-
-
-class _SheetTracker:
-    """Estabilizacao temporal do quadrilatero da folha.
-
-    Guarda o quadrilatero atual e decide, quadro a quadro, entre
-    misturar uma deteccao vizinha, exigir persistencia para um salto
-    de posicao e descartar a folha perdida. Deteccao perto mistura
-    com _SHEET_BLEND_ALPHA; salto (deteccao a mais de
-    _SHEET_NEAR_LIMIT_PX do quad atual) so confirma quando o
-    candidato persiste _SHEET_JUMP_PERSIST_SECONDS de relogio com
-    deteccoes seguintes pousando perto dele (o dobro para
-    blank_maybe). A perda dispara quando os dois criterios de
-    _SHEET_LOST_* passam: tempo sem confirmacao e quadros sem
-    confirmacao.
-
-    Presenca e posicao sao perguntas separadas no relogio de perda:
-    enquanto deteccoes "paper" plausiveis continuam chegando, a
-    folha esta la, mesmo com a posicao incerta. Por isso um salto
-    ainda nao confirmado com veredito "paper" renova o relogio de
-    perda sem mover o quadrilatero exibido, e um quadro com
-    veredito "paper" sem quadrilatero (o modelo afirmou papel e
-    nenhum ajuste fechou) tambem renova. Sem isso, a espera da
-    confirmacao por tempo esfomeia o relogio e a folha cai no meio
-    da janela da mao (medido no replay: 11 quadros sem folha e
-    atraso de remocao de 0,30 s, contra 0,53 s com a renovacao).
-    """
-
-    def __init__(self):
-        self.corners = None
-        self.verdict = None
-        self.missed = False
-        self._pending = None
-        self._pending_hits = 0
-        self._pending_since = None
-        self._frames_since_seen = 0
-        self._last_seen_at = None
-
-    def should_detect(self, frame_number):
-        return (
-            self.corners is None
-            or self.missed
-            or frame_number % _SHEET_DETECT_INTERVAL == 0
-        )
-
-    def _confirm(self, corners, verdict, now):
-        self.corners = corners
-        self.verdict = verdict
-        self._pending = None
-        self._pending_hits = 0
-        self._pending_since = None
-        self._frames_since_seen = 0
-        self._last_seen_at = now
-        self.missed = False
-
-    def update(self, detected, verdict, ran_detection, now):
-        """Alimenta o rastreador com o resultado do quadro.
-
-        detected e o quadrilatero detectado ou None; ran_detection
-        diz se a deteccao rodou neste quadro; now e um relogio
-        monotonico em segundos. Retorna "seen" quando uma deteccao
-        confirma a folha, "drop" quando a folha e descartada e None
-        nos demais quadros (so para diagnostico).
-        """
-        event = None
-        if (
-            detected is None
-            and ran_detection
-            and verdict == "paper"
-            and self.corners is not None
-        ):
-            # Evento so de presenca: quem detectou afirma papel mas
-            # nenhum quadrilatero utilizavel fechou (o ajuste neural
-            # foi recusado pela guarda de plausibilidade, ou nao
-            # fechou). A folha esta la; a posicao e que nao veio.
-            # Renova o relogio de perda, nao mexe no quadrilatero
-            # exibido nem no candidato pendente.
-            self._frames_since_seen = 0
-            self._last_seen_at = now
-            self.missed = True
-            return None
-        if detected is not None:
-            if self.corners is None and verdict == "paper":
-                self._confirm(detected.copy(), verdict, now)
-                event = "seen"
-            elif (
-                self.corners is not None
-                and _corner_distance(self.corners, detected)
-                <= _SHEET_NEAR_LIMIT_PX
-            ):
-                self._confirm(
-                    _blend_corners(self.corners, detected), verdict, now
-                )
-                event = "seen"
-            else:
-                # Salto de posicao ou candidato ainda sem trava.
-                # Candidato blank_maybe (branco e liso, sem textura
-                # de papel) exige o dobro do tempo de persistencia.
-                confirm_seconds = (
-                    2 * _SHEET_JUMP_PERSIST_SECONDS
-                    if verdict == "blank_maybe"
-                    else _SHEET_JUMP_PERSIST_SECONDS
-                )
-                if (
-                    self._pending is not None
-                    and _corner_distance(self._pending, detected)
-                    <= _SHEET_NEAR_LIMIT_PX
-                ):
-                    self._pending = _blend_corners(self._pending, detected)
-                    self._pending_hits += 1
-                else:
-                    self._pending = detected.copy()
-                    self._pending_hits = 1
-                    self._pending_since = now
-
-                if (
-                    self._pending_since is not None
-                    and now - self._pending_since >= confirm_seconds
-                ):
-                    self._confirm(self._pending.copy(), verdict, now)
-                    event = "seen"
-                else:
-                    if verdict == "paper":
-                        # Presenca renovada, posicao ainda incerta:
-                        # o relogio de perda nao corre contra uma
-                        # folha que o detector continua vendo.
-                        self._frames_since_seen = 0
-                        self._last_seen_at = now
-                    else:
-                        self._frames_since_seen += 1
-                    self.missed = True
-        elif self.corners is not None:
-            if ran_detection:
-                self._pending = None
-                self._pending_hits = 0
-                self._pending_since = None
-                self.missed = True
-            self._frames_since_seen += 1
-
-        if (
-            self.corners is not None
-            and self._frames_since_seen > _SHEET_LOST_MIN_FRAMES
-            and self._last_seen_at is not None
-            and now - self._last_seen_at > _SHEET_LOST_SECONDS
-        ):
-            self.corners = None
-            self.verdict = None
-            self._pending = None
-            self._pending_hits = 0
-            self._pending_since = None
-            self._frames_since_seen = 0
-            self.missed = False
-            event = "drop"
-        return event
 
 
 class _LatestFrameCapture:
@@ -317,7 +119,12 @@ class _LatestFrameCapture:
                     return
             ok, frame = self._capture.read()
             if ok and frame is not None:
-                capture_ms = int(time.monotonic() * 1000)
+                source_ts = getattr(self._capture, "last_capture_ts_ms", None)
+                capture_ms = (
+                    int(source_ts)
+                    if source_ts is not None
+                    else int(time.monotonic() * 1000)
+                )
                 with self._condition:
                     if self._stopped:
                         return
@@ -426,6 +233,7 @@ class _PngWriter:
         self._thread.join(timeout=_PNG_DRAIN_SECONDS)
 
 
+
 def parse_source(value):
     """'0'/'1' viram indice de webcam local; qualquer outra coisa e URL/arquivo."""
     if value is None:
@@ -445,9 +253,6 @@ def is_wsl():
 
 
 def _configure_local_capture(capture):
-    # MJPG comprimido e 720p: o formato cru padrao (YUYV em 1080p)
-    # estoura a banda do USB virtual do usbip no WSL e a entrega de
-    # quadros trava com timeout de select() no V4L2.
     capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
     capture.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
@@ -467,7 +272,7 @@ def _local_open_hint(source):
             hint += (
                 "Anexe a camera ao WSL com: bash scripts/setup_camera_wsl.sh. "
                 "A alternativa e uma camera via rede: python main.py "
-                "--source http://<ip-da-camera>:8080/video."
+                "--source tcp://<ip-do-windows>:8765 ou http://<ip>:8080/video."
             )
         else:
             hint += "Confira se a webcam esta conectada a este computador."
@@ -488,6 +293,15 @@ def _local_open_hint(source):
 
 
 def _open_capture(source):
+    if is_helper_source(source):
+        helper = HelperCapture(source)
+        if helper.isOpened():
+            return helper
+        raise RuntimeError(
+            f"Nao consegui abrir a fonte de protocolo Draw: {source!r}. "
+            "Confira se o arquivo .drawcap existe ou se o helper Windows "
+            "esta ouvindo na porta TCP informada."
+        )
     capture = cv2.VideoCapture(source)
     if capture.isOpened():
         if isinstance(source, int):
@@ -498,8 +312,8 @@ def _open_capture(source):
         hint += _local_open_hint(source)
     else:
         hint += (
-            "Confira se a URL esta certa, se a camera esta transmitindo e "
-            "se este computador alcanca o endereco dela na rede."
+            "Confira se a URL/caminho esta certo, se a camera esta "
+            "transmitindo e se este computador alcanca o endereco na rede."
         )
     raise RuntimeError(hint)
 
@@ -508,13 +322,53 @@ def _video_nodes():
     return sorted(
         path
         for path in glob.glob("/dev/video*")
-        if path[len("/dev/video"):].isdigit()
+        if path[len("/dev/video") :].isdigit()
     )
 
 
 def run_check(source=0):
-    """Validacao da camera local, porta por porta. Retorna 0 ou 1."""
+    """Validacao da fonte de video porta por porta. Retorna 0 ou 1."""
     print(f"PASS: OpenCV disponivel. Versao {cv2.__version__}.")
+    parsed = parse_source(source)
+
+    if not isinstance(parsed, int):
+        capture = (
+            HelperCapture(parsed, timeout=3.0)
+            if is_helper_source(parsed)
+            else cv2.VideoCapture(parsed)
+        )
+        if not capture.isOpened():
+            print(
+                f"FAIL: nao consegui abrir a fonte {parsed!r}. "
+                "Confira o caminho ou URL e se a transmissao esta ativa."
+            )
+            return 1
+        frame = None
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            ok, candidate = capture.read()
+            if ok and candidate is not None:
+                frame = candidate
+                break
+            time.sleep(0.05)
+        capture.release()
+        if frame is None:
+            print(
+                f"FAIL: {parsed!r} abriu, mas nenhum quadro chegou em "
+                "3 segundos."
+            )
+            return 1
+        extra = ""
+        if isinstance(capture, HelperCapture) and capture.last_capture_ts_ms is not None:
+            extra = (
+                f" Protocolo Draw: frame_id={capture.last_frame_id}, "
+                f"capture_ts_ms={capture.last_capture_ts_ms}."
+            )
+        print(
+            f"PASS: quadro lido de {parsed!r}. "
+            f"Formato (altura, largura, canais): {frame.shape}.{extra}"
+        )
+        return 0
 
     nodes = _video_nodes()
     if not nodes:
@@ -531,7 +385,18 @@ def run_check(source=0):
     print(f"PASS: dispositivos de video encontrados: {', '.join(nodes)}.")
 
     all_ok = True
-    node = nodes[0]
+    node = f"/dev/video{parsed}"
+    if node not in nodes:
+        print(
+            f"FAIL: {node} nao existe neste sistema "
+            f"(disponiveis: {', '.join(nodes)})."
+        )
+        first_idx = nodes[0][len("/dev/video") :]
+        print(
+            f"  Correcao: use --source {first_idx} ou confira o indice "
+            "da webcam desejada."
+        )
+        return 1
 
     access = os.access(node, os.R_OK | os.W_OK)
     group_note = ""
@@ -564,8 +429,7 @@ def run_check(source=0):
         print('  Correcao nesta sessao: sg video -c "python3 main.py".')
         all_ok = False
 
-    index = int(node[len("/dev/video"):])
-    capture = cv2.VideoCapture(index)
+    capture = cv2.VideoCapture(parsed)
     if not capture.isOpened():
         print(
             f"FAIL: nao consegui abrir {node}. Outro programa "
@@ -600,7 +464,7 @@ def run_check(source=0):
 def _fit(image, max_h=700):
     h, w = image.shape[:2]
     if h <= max_h:
-        return image
+        return image.copy()
     scale = max_h / h
     return cv2.resize(image, (int(w * scale), max_h))
 
@@ -612,21 +476,30 @@ def _blank_sheet():
     global _BLANK_SHEET
     if _BLANK_SHEET is None:
         _BLANK_SHEET = ink_module.render_canvas(
-            np.zeros(
-                (ink_module.config.PAPER_H, ink_module.config.PAPER_W),
-                dtype=np.uint8,
-            )
+            np.zeros((config.PAPER_H, config.PAPER_W), dtype=np.uint8)
         )
     return _BLANK_SHEET
 
 
-def _compose_view(camera_img, canvas_img):
-    """Janela unica: camera a esquerda, folha ao vivo a direita.
+def _draw_cursor_overlay(sheet_img, cursor):
+    """Desenha indicador de cursor apenas na cópia de visualização."""
+    if cursor is None or not cursor.has_position or cursor.position_stale:
+        return
+    if cursor.x is None or cursor.y is None:
+        return
+    sh, sw = sheet_img.shape[:2]
+    cx = int(round(cursor.x * sw / float(config.PAPER_W)))
+    cy = int(round(cursor.y * sh / float(config.PAPER_H)))
+    if not (0 <= cx < sw and 0 <= cy < sh):
+        return
+    if cursor.pen_down:
+        cv2.circle(sheet_img, (cx, cy), 5, (20, 160, 40), -1)
+    else:
+        cv2.circle(sheet_img, (cx, cy), 6, (200, 120, 20), 2)
 
-    A folha ao vivo e o canvas digital (fundo branco, tinta preta) na
-    mesma janela e na mesma altura da camera: o traco no papel e o
-    traco digital aparecem lado a lado, sem janelas separadas.
-    """
+
+def _compose_view(camera_img, canvas_img, cursor=None):
+    """Janela unica: camera a esquerda, folha ao vivo a direita."""
     target_h = 640
     cam = _fit(camera_img, target_h)
     sheet = _fit(canvas_img, target_h)
@@ -634,7 +507,9 @@ def _compose_view(camera_img, canvas_img):
         h = min(cam.shape[0], sheet.shape[0])
         cam = cv2.resize(cam, (int(cam.shape[1] * h / cam.shape[0]), h))
         sheet = cv2.resize(
-            sheet, (int(sheet.shape[1] * h / sheet.shape[0]), h))
+            sheet, (int(sheet.shape[1] * h / sheet.shape[0]), h)
+        )
+    _draw_cursor_overlay(sheet, cursor)
     cv2.putText(
         sheet,
         "folha ao vivo",
@@ -647,10 +522,6 @@ def _compose_view(camera_img, canvas_img):
     divider = np.full((cam.shape[0], 6, 3), (60, 60, 60), dtype=np.uint8)
     view = np.hstack([cam, divider, sheet])
     if view.shape[:2] != (640, 1600):
-        # Tamanho final fixo: sem isto, a geometria da janela
-        # depende do tamanho entregue pela camera (com 1289x710 o
-        # resize antigo cortava a altura para 632; com 1280x720
-        # ele nem rodava e a vista saia com 1596 de largura).
         view = cv2.resize(view, (1600, 640))
     return view
 
@@ -737,6 +608,7 @@ def _detect_sheet_combined(frame, neural_detector):
     return paper_module.detect_sheet_with_confidence(frame)
 
 
+
 def run(
     source=0,
     save_dir="captures",
@@ -745,6 +617,7 @@ def run(
     hand_model=None,
     ink_model=None,
     session_baseline=False,
+    async_detect=False,
 ):
     neural_detector = None
     if neural_model is not None and not markers_mode:
@@ -771,36 +644,42 @@ def run(
                     "A heuristica segue como reserva por frame."
                 )
 
-    session_ink = None
     if session_baseline and not markers_mode:
-        session_ink = ink_module.SessionBaselineInk()
         print(
             "Tinta da sessao ativa: com a folha na cena, aperte C "
             "para congelar a pagina base; so o traco feito depois "
             "dela entra no canvas."
         )
 
-    def ink_source(warped_img):
-        if ink_extractor is not None:
-            mask = ink_extractor.ink_mask(warped_img)
-            if mask is not None:
-                return mask
-        return ink_module.extract_ink(warped_img)
-
     hand_masker = None
     if hand_model is not None and not markers_mode:
         hand_masker = hand_module.HandMasker(hand_model or None)
         print(
             "Mascara de mao solicitada: mao sobre a folha vira regiao "
-            "desconhecida no canvas acumulativo."
+            "desconhecida no canvas acumulativo e alimenta fusao do cursor."
         )
 
-    def detect_sheet(frame):
-        return _detect_sheet_combined(frame, neural_detector)
+    parsed_source = parse_source(source)
+    capture = _open_capture(parsed_source)
+    is_replay_file = isinstance(parsed_source, str) and (
+        parsed_source.lower().endswith(".drawcap")
+        or Path(parsed_source).is_file()
+    )
 
-    capture = _open_capture(parse_source(source))
+    pipeline = DrawPipeline(
+        markers_mode=markers_mode,
+        neural_detector=neural_detector,
+        hand_masker=hand_masker,
+        ink_extractor=ink_extractor,
+        session_baseline=session_baseline,
+        async_detect=async_detect,
+    )
     frame_source = _LatestFrameCapture(capture).start()
     png_writer = _PngWriter()
+    canvas_buffer = np.empty(
+        (config.PAPER_H, config.PAPER_W, 3), dtype=np.uint8
+    )
+
     save_path = Path(save_dir)
     if markers_mode:
         print("Draw v0 rodando. Mostre a folha-modelo para a camera.")
@@ -808,26 +687,18 @@ def run(
         print("Draw v0 rodando. Mostre uma folha para a camera.")
     print(
         "Teclas: s = salvar canvas, f = capturar frame, "
-        "g = captura automatica (desligada), q/Esc = sair."
+        "g = captura automatica (desligada), c = pagina base, q/Esc = sair."
     )
 
     frames_path = save_path / "frames"
     frames_saved = 0
     auto_capture = False
-    restart_reference = False
-    baseline_armed = False
-    # Geometria da tinta CONGELADA na tecla C: os warps da sessao
-    # usam estes cantos, nao os do rastreador ao vivo. Medido nos
-    # frames reais de 2026-10-30: sobre o caderno aberto, o ajuste
-    # do detector oscila ate 314 px entre frames de uma cena
-    # parada; com a geometria viva, o warp teleporta e nenhuma
-    # referencia sobrevive. O rastreador segue vivo para o
-    # contorno verde e os banners; a tinta vive na geometria do C.
-    session_corners = None
-    freeze_pending = False
     loop_frames = 0
+    last_seq = 0
+    last_view = None
 
     def save_raw_frame(img):
+        nonlocal frames_saved
         frames_path.mkdir(parents=True, exist_ok=True)
         out = frames_path / f"frame_{int(time.time() * 1000)}.png"
 
@@ -838,12 +709,24 @@ def run(
 
         png_writer.save(out, img, _saved)
 
-    def handle_capture_key(key, img):
-        nonlocal auto_capture, restart_reference
-        if key == ord("f"):
+    def handle_key(key, img, current_canvas):
+        nonlocal auto_capture
+        if key == ord("s"):
+            def _saved(path):
+                print(f"Canvas salvo em {path}")
+
+            png_out, npz_out = pipeline.save_artifacts(
+                save_path,
+                canvas_override=current_canvas,
+                png_writer=png_writer,
+                on_png_saved=_saved,
+            )
+            if png_out is not None:
+                if npz_out is not None:
+                    print(f"Carimbos salvos em {npz_out}")
+        elif key == ord("f"):
             save_raw_frame(img)
-        elif key == ord("c") and session_ink is not None:
-            restart_reference = True
+        elif key == ord("c") and pipeline.trigger_baseline():
             print(
                 "Pagina base pedida: capturando os proximos quadros "
                 "retificados. Maos fora da folha."
@@ -858,256 +741,120 @@ def run(
             else:
                 print("Captura automatica desligada.")
 
-    tracker = _SheetTracker()
-    ink_accumulator = ink_module.InkAccumulator()
-    corner_history = deque(maxlen=_INK_CORNER_HISTORY)
-    ink_session_open = False
-    accumulated_canvas = None
-    # Buffers donos dos canvas renderizados no laco. O acumulado
-    # mora em canvas_buffer de um frame de deteccao ao outro, e
-    # view_canvas_buffer serve aos canvas transitorios de exibicao.
-    # Sao buffers separados porque o acumulado e retido entre
-    # frames: nenhum outro uso pode escrever nele.
-    canvas_buffer = np.empty(
-        (ink_module.config.PAPER_H, ink_module.config.PAPER_W, 3),
-        dtype=np.uint8,
-    )
-    view_canvas_buffer = np.empty_like(canvas_buffer)
-    frame_number = 0
-    last_seq = 0
-    last_view = None
-    while True:
-        item = frame_source.wait_next(last_seq)
-        if item is None:
-            # A thread de captura declarou a fonte morta (falhas
-            # seguidas de leitura ou excecao no read) e wait_next
-            # acordou sem quadro. O aviso vai para o console e para
-            # a janela, sobre a ultima vista, e fica _DEAD_NOTICE_MS
-            # ou ate uma tecla: so o console seria um congelamento
-            # silencioso para quem esta olhando a janela.
-            print(
-                "A camera abriu, mas parou de entregar quadros. "
-                "Feche outros programas usando a camera e tente de novo."
-            )
-            cv2.imshow("Draw", _dead_source_view(last_view))
-            cv2.waitKey(_DEAD_NOTICE_MS)
-            break
-        frame, frame_capture_ms, last_seq = item
-        # O carimbo de captura nasce na thread de captura, logo que
-        # o read() retorna la: a camera nao expoe carimbo de
-        # hardware neste caminho, entao esse e o instante mais perto
-        # da captura que o app conhece. E ele que carimba os pixels
-        # no acumulador, como fazia o carimbo tirado no laco.
-
-        loop_frames += 1
-        if auto_capture and loop_frames % 10 == 0:
-            save_raw_frame(frame)
-
-        if markers_mode:
-            warped, markers = paper_module.warp_paper(frame)
-            sheet_present = warped is not None
-        else:
-            markers = {}
-            if tracker.should_detect(frame_number):
-                detected_corners, detected_verdict = detect_sheet(frame)
-                ran_detection = True
-            else:
-                detected_corners, detected_verdict = None, None
-                ran_detection = False
-            tracker_event = tracker.update(
-                detected_corners,
-                detected_verdict,
-                ran_detection,
-                time.monotonic(),
-            )
-            if tracker_event == "drop":
-                ink_session_open = False
-                session_corners = None
-                freeze_pending = False
-
-            frame_number += 1
-            # Presenca e o estado do rastreador: warp_sheet com
-            # cantos nunca devolve None, entao o warp por quadro
-            # era so um teste de presenca caro, e o resultado era
-            # descartado. O unico consumo dos pixels fora do bloco
-            # de tinta e o fallback de exibicao, que retifica sob
-            # demanda.
-            sheet_present = tracker.corners is not None
-            warped = None
-
-            if ran_detection and tracker.corners is not None:
-                if not ink_session_open:
-                    # Folha nova na cena: canvas e geometria recomecam.
-                    ink_accumulator.reset()
-                    if session_ink is not None:
-                        session_ink.reset()
-                        baseline_armed = False
-                        session_corners = None
-                        freeze_pending = False
-                    corner_history.clear()
-                    ink_session_open = True
-                if restart_reference:
-                    # Tecla C: novo ponto zero da sessao. O canvas
-                    # acumulado zera junto, porque a pagina base nova
-                    # redefine o que conta como traco desta sessao.
-                    # A geometria congela nos cantos deste momento.
-                    restart_reference = False
-                    ink_accumulator.reset()
-                    session_ink.reset()
-                    baseline_armed = True
-                    freeze_pending = True
-                corner_history.append(tracker.corners.copy())
-                ink_corners = np.median(
-                    np.stack(corner_history), axis=0
-                ).astype(np.float32)
-                if freeze_pending:
-                    session_corners = ink_corners.copy()
-                    freeze_pending = False
-                warp_corners = (
-                    session_corners
-                    if session_ink is not None
-                    and session_corners is not None
-                    else ink_corners
+    try:
+        while True:
+            item = frame_source.wait_next(last_seq)
+            if item is None:
+                if is_replay_file:
+                    break
+                print(
+                    "A camera abriu, mas parou de entregar quadros. "
+                    "Feche outros programas usando a camera e tente de novo."
                 )
-                ink_warped = paper_module.warp_sheet(frame, warp_corners)
-                visible = None
-                if hand_masker is not None:
-                    camera_mask = hand_masker.mask(frame)
-                    if camera_mask is not None:
-                        hand_warped = paper_module.warp_sheet(
-                            camera_mask, warp_corners
-                        )
-                        visible = hand_warped == 0
-                if session_ink is not None:
-                    if not session_ink.ready:
-                        if baseline_armed:
-                            session_ink.add_sample(ink_warped, visible)
-                        observed = np.zeros(
-                            ink_warped.shape[:2], dtype=np.uint8)
-                    else:
-                        observed = session_ink.observe(
-                            ink_warped, visible)
-                else:
-                    observed = ink_source(ink_warped)
-                accumulated_canvas = ink_module.render_canvas(
-                    ink_accumulator.update(
-                        observed, visible,
-                        t_capture_ms=frame_capture_ms
-                    ),
-                    out=canvas_buffer,
-                )
+                last_view = _dead_source_view(last_view)
+                cv2.imshow("Draw", last_view)
+                cv2.waitKey(_DEAD_NOTICE_MS)
+                break
+            frame, frame_capture_ms, last_seq = item
 
-        status = frame.copy()
-        if markers_mode:
-            for (x, y) in markers.values():
-                cv2.circle(status, (int(x), int(y)), 8, (0, 255, 0), -1)
-        elif tracker.corners is not None:
-            outline = tracker.corners.astype(np.int32).reshape((-1, 1, 2))
-            cv2.polylines(status, [outline], True, (0, 255, 0), 2)
-            for x, y in tracker.corners:
-                cv2.circle(status, (int(x), int(y)), 8, (0, 255, 0), -1)
-        if not sheet_present:
+            now_s = time.monotonic()
+
+            loop_frames += 1
+            if auto_capture and loop_frames % 10 == 0:
+                save_raw_frame(frame)
+
+            res = pipeline.process_frame(
+                frame,
+                t_capture_ms=frame_capture_ms,
+                now_s=now_s,
+                canvas_buffer=canvas_buffer,
+            )
+
+            status = frame.copy()
             if markers_mode:
+                for x, y in res.markers.values():
+                    cv2.circle(status, (int(x), int(y)), 8, (0, 255, 0), -1)
+            elif res.corners is not None:
+                outline = res.corners.astype(np.int32).reshape((-1, 1, 2))
+                cv2.polylines(status, [outline], True, (0, 255, 0), 2)
+                for x, y in res.corners:
+                    cv2.circle(status, (int(x), int(y)), 8, (0, 255, 0), -1)
+
+            if not res.sheet_present:
                 status_text = (
-                    f"Mostre a folha-modelo ({len(markers)}/4 marcadores)"
+                    f"Mostre a folha-modelo ({len(res.markers)}/4 marcadores)"
+                    if markers_mode
+                    else "Mostre uma folha para a camera"
                 )
-            else:
-                status_text = "Mostre uma folha para a camera"
-            cv2.putText(
-                status,
-                status_text,
-                (20, 40),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (0, 0, 255),
-                2,
-            )
-            panel = (
-                accumulated_canvas
-                if accumulated_canvas is not None
-                else _blank_sheet()
-            )
-            last_view = _compose_view(status, panel)
-            cv2.imshow("Draw", last_view)
-        else:
-            if not markers_mode:
-                if tracker.verdict == "blank_maybe":
-                    status_text = "Folha detectada (baixa confianca)"
-                    status_color = (0, 255, 255)
-                else:
-                    status_text = "Folha detectada"
-                    status_color = (0, 255, 0)
-                if session_ink is not None and not session_ink.ready:
-                    if baseline_armed:
-                        status_text = (
-                            "Folha detectada: capturando a pagina "
-                            "base, maos fora da folha"
-                        )
-                    else:
-                        status_text = (
-                            "Folha detectada: aperte C para comecar "
-                            "(pagina base)"
-                        )
-                    status_color = (0, 255, 255)
                 cv2.putText(
                     status,
                     status_text,
                     (20, 40),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.8,
-                    status_color,
+                    (0, 0, 255),
                     2,
                 )
-            if markers_mode:
-                ink_mask = ink_module.extract_ink(
-                    warped, clear_markers=True
-                )
-                canvas = ink_module.render_canvas(
-                    ink_mask, out=view_canvas_buffer
-                )
-            elif accumulated_canvas is not None:
-                canvas = accumulated_canvas
+                panel = res.canvas if res.canvas is not None else _blank_sheet()
+                last_view = _compose_view(status, panel, res.cursor)
+                cv2.imshow("Draw", last_view)
             else:
-                ink_mask = ink_source(
-                    paper_module.warp_sheet(frame, tracker.corners)
-                )
-                canvas = ink_module.render_canvas(
-                    ink_mask, out=view_canvas_buffer
-                )
-            last_view = _compose_view(status, canvas)
-            cv2.imshow("Draw", last_view)
+                if not markers_mode:
+                    if res.verdict == "blank_maybe":
+                        status_text = "Folha detectada (baixa confianca)"
+                        status_color = (0, 255, 255)
+                    else:
+                        status_text = "Folha detectada"
+                        status_color = (0, 255, 0)
+                    if (
+                        pipeline.session_ink is not None
+                        and not pipeline.session_ink.ready
+                    ):
+                        if pipeline.baseline_armed:
+                            status_text = (
+                                "Folha detectada: capturando a pagina "
+                                "base, maos fora da folha"
+                            )
+                        else:
+                            status_text = (
+                                "Folha detectada: aperte C para comecar "
+                                "(pagina base)"
+                            )
+                        status_color = (0, 255, 255)
+                    cv2.putText(
+                        status,
+                        status_text,
+                        (20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8,
+                        status_color,
+                        2,
+                    )
+                panel = res.canvas if res.canvas is not None else _blank_sheet()
+                last_view = _compose_view(status, panel, res.cursor)
+                cv2.imshow("Draw", last_view)
 
             key = cv2.waitKey(1) & 0xFF
-            if key == ord("s"):
-                save_path.mkdir(parents=True, exist_ok=True)
-                out = save_path / f"canvas_{int(time.time())}.png"
-                png_writer.save(
-                    out,
-                    canvas,
-                    lambda path: print(f"Canvas salvo em {path}"),
-                )
-            handle_capture_key(key, frame)
+            handle_key(key, frame, res.canvas)
             if key in (ord("q"), 27):
                 break
-            continue
-
-        key = cv2.waitKey(1) & 0xFF
-        handle_capture_key(key, frame)
-        if key in (ord("q"), 27):
-            break
-
-    frame_source.stop()
-    png_writer.close()
-    cv2.destroyAllWindows()
+    finally:
+        pipeline.close()
+        frame_source.stop()
+        png_writer.close()
+        cv2.destroyAllWindows()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Draw v0, papel para o digital")
+    parser = argparse.ArgumentParser(
+        description="Draw v0, papel para o digital"
+    )
     parser.add_argument(
         "--source",
         default="0",
-        help="indice da webcam local (0, 1...) ou URL do stream "
-        "(ex.: http://192.168.0.10:8080/video). Padrao: 0",
+        help="indice da webcam local (0, 1...), URL MJPEG/RTSP, "
+        "tcp://host[:8765] do helper Windows ou arquivo .drawcap. "
+        "Padrao: 0",
     )
     parser.add_argument(
         "--markers",
@@ -1125,16 +872,20 @@ def main():
         "DRAW_NEURAL_MODEL",
     )
     parser.add_argument(
+        "--async-detect",
+        action="store_true",
+        help="executa a deteccao da folha numa thread dedicada em "
+        "segundo plano, desacoplando o custo do ONNX da cadencia de "
+        "extracao de tinta e fusao do cursor",
+    )
+    parser.add_argument(
         "--ink-model",
         nargs="?",
         const="",
         default=None,
         metavar="MODELO.onnx",
-        help="modelo aprendido de tinta (ONNX) como fonte da mascara "
-        "no modo sem marcadores, no lugar da heuristica. Sem caminho, "
-        "usa a variavel de ambiente DRAW_INK_MODEL. Sem o arquivo ou "
-        "com erro de carga, o app avisa uma vez e segue com a "
-        "heuristica",
+        help="modelo aprendido de tinta (ONNX) opcional; sem modulo "
+        "presente, o app avisa uma vez e segue com a heuristica",
     )
     parser.add_argument(
         "--hand-model",
@@ -1143,31 +894,25 @@ def main():
         default=None,
         metavar="MODELO.task",
         help="mascara de mao (MediaPipe Hand Landmarker) para o "
-        "canvas acumulativo: a mao vira regiao desconhecida e nao "
-        "ganha nem perde tinta. Sem caminho, usa a variavel de "
-        "ambiente DRAW_HAND_MODEL ou models/hand_landmarker.task. "
-        "Sem o pacote mediapipe ou sem o modelo, o app roda sem a "
-        "mascara e avisa uma vez",
+        "canvas acumulativo e fusao do cursor. Sem caminho, usa "
+        "DRAW_HAND_MODEL ou models/hand_landmarker.task",
     )
     parser.add_argument(
         "--check",
         action="store_true",
-        help="valida a camera local porta por porta e sai, sem abrir janela",
+        help="valida a fonte de captura e sai, sem abrir janela",
     )
     parser.add_argument(
         "--session-baseline",
         action="store_true",
         help="tinta da sessao: a pagina como esta quando voce aperta "
-        "a tecla C vira fundo (pauta, margem impressa e desenho "
-        "antigo somem do canvas); so o traco feito depois da pagina "
-        "base entra. Apertar C de novo congela uma base nova. "
+        "a tecla C vira fundo; so o traco feito depois entra. "
         "Incompativel com --markers",
     )
     parser.add_argument("--save-dir", default="captures")
     args = parser.parse_args()
     if args.check:
-        parsed = parse_source(args.source)
-        sys.exit(run_check(parsed if isinstance(parsed, int) else 0))
+        sys.exit(run_check(parse_source(args.source)))
     neural_model = None
     if args.neural is not None:
         if args.markers:
@@ -1190,6 +935,8 @@ def main():
             )
     if args.session_baseline and args.markers:
         parser.error("--session-baseline nao combina com --markers")
+    if args.async_detect and args.markers:
+        parser.error("--async-detect nao combina com --markers")
     hand_model = None
     if args.hand_model is not None:
         if args.markers:
@@ -1206,6 +953,7 @@ def main():
             hand_model=hand_model,
             ink_model=ink_model,
             session_baseline=args.session_baseline,
+            async_detect=args.async_detect,
         )
     except (RuntimeError, FileNotFoundError) as error:
         print(f"Erro: {error}")

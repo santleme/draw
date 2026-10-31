@@ -41,6 +41,10 @@ _DEFAULT_CANDIDATES = ("models/hand_landmarker.task",)
 _MIN_CONFIDENCE = 0.3
 _HULL_SCALE = 1.30
 _DILATE_PX = 15
+INDEX_FINGER_TIP = 8
+_DILATE_KERNEL = cv2.getStructuringElement(
+    cv2.MORPH_ELLIPSE, (2 * _DILATE_PX + 1, 2 * _DILATE_PX + 1)
+)
 
 
 def _resolve_model_path(model_path):
@@ -153,10 +157,15 @@ class HandMasker:
         self._landmarker = created
         return True
 
-    def mask(self, frame):
-        """A máscara de mão do frame, ou None se indisponível."""
+    def detect(self, frame):
+        """Retorna (mascara_uint8_ou_None, lista_de_marcos_21x2_float32).
+
+        Expõe os 21 marcos de cada mão detectada no espaço do frame junto
+        com a máscara dilatada de oclusão, permitindo alimentar
+        draw.fusion.PenTipFusion (marco 8) sem rodar o MediaPipe duas vezes.
+        """
         if not self._ensure():
-            return None
+            return None, []
         import mediapipe as mp
 
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -164,19 +173,20 @@ class HandMasker:
         result = self._landmarker.detect(image)
         mask = np.zeros(frame.shape[:2], dtype=np.uint8)
         if not result.hand_landmarks:
-            return mask
+            return mask, []
         frame_h, frame_w = frame.shape[:2]
+        hands_points = []
         for hand in result.hand_landmarks:
             points = np.array(
-                [
-                    [lm.x * frame_w, lm.y * frame_h]
-                    for lm in hand
-                ],
+                [[lm.x * frame_w, lm.y * frame_h] for lm in hand],
                 dtype=np.float32,
             )
+            hands_points.append(points)
             for polygon in _hand_polygons(points, frame.shape):
                 cv2.fillPoly(mask, [polygon], 255)
-        kernel = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE, (2 * _DILATE_PX + 1, 2 * _DILATE_PX + 1)
-        )
-        return cv2.dilate(mask, kernel)
+        return cv2.dilate(mask, _DILATE_KERNEL), hands_points
+
+    def mask(self, frame):
+        """A máscara de mão do frame, ou None se indisponível."""
+        mask_img, _landmarks = self.detect(frame)
+        return mask_img

@@ -24,6 +24,7 @@ from draw.fusion import (
 )
 
 FAILURES = []
+_COLLECT_ONLY = False
 
 
 def check(name, condition, detail=""):
@@ -32,6 +33,8 @@ def check(name, condition, detail=""):
     else:
         FAILURES.append(name)
         print("FALHOU - %s %s" % (name, detail))
+        if not _COLLECT_ONLY:
+            raise AssertionError(f"{name} {detail}".strip())
 
 
 def test_gate():
@@ -158,10 +161,16 @@ def test_fusion_correction_and_gate():
 
 
 def main():
-    test_gate()
-    test_one_euro_still_and_step()
-    test_pen_up_irregular_times()
-    test_fusion_correction_and_gate()
+    global _COLLECT_ONLY
+    FAILURES.clear()
+    _COLLECT_ONLY = True
+    try:
+        test_gate()
+        test_one_euro_still_and_step()
+        test_pen_up_irregular_times()
+        test_fusion_correction_and_gate()
+    finally:
+        _COLLECT_ONLY = False
     if FAILURES:
         print("\n%d teste(s) falharam: %s" % (len(FAILURES), FAILURES))
         return 1

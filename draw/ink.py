@@ -32,6 +32,7 @@ apagaria desenho de verdade perto dos cantos da página.
 
 from collections import deque
 from fractions import Fraction
+import math
 import time
 
 import cv2
@@ -40,6 +41,8 @@ import numpy as np
 from . import config
 
 _VETO_DELTA = 6.0
+_MORPH_OPEN_KERNEL = np.ones((2, 2), dtype=np.uint8)
+_ERODE_3X3_KERNEL = np.ones((3, 3), dtype=np.uint8)
 
 
 def _marker_mask(shape):
@@ -51,6 +54,21 @@ def _marker_mask(shape):
     return mask
 
 
+def _twice_median_rows_u8(arr_u8):
+    """Retorna 2 * mediana de cada linha de um array uint8 2D, em int16.
+
+    Exato bit a bit contra 2 * np.median(arr.astype(float32), axis=1),
+    sem alocar cópia float32 de 4 MiB da página inteira.
+    """
+    w = arr_u8.shape[1]
+    mid = w // 2
+    if w % 2 == 1:
+        part = np.partition(arr_u8, mid, axis=1)
+        return part[:, mid].astype(np.int16) * 2
+    part = np.partition(arr_u8, (mid - 1, mid), axis=1)
+    return part[:, mid - 1].astype(np.int16) + part[:, mid].astype(np.int16)
+
+
 def _separable_veto(gray):
     """True onde o pixel é escuro contra a linha e a coluna inteiras.
 
@@ -60,13 +78,49 @@ def _separable_veto(gray):
     Estruturas que ocupam a linha ou a coluna inteira têm delta
     perto de zero contra a própria mediana e são vetadas; o traço,
     local e bem mais escuro, passa.
+
+    Para gray uint8 e _VETO_DELTA semisseiro/inteiro, a desigualdade
+    gray <= mediana - delta equivale exatamente a
+    2*gray <= 2*mediana - 2*delta, ou gray < floor((2*med - 2*delta)/2) + 1
+    limitado a [0, 255] em uint8 (quando o limite é negativo, clip em 0
+    torna gray < 0 sempre False). Zero pixels divergentes da versão float32.
     """
-    gray_f = gray.astype(np.float32)
-    bg_row = np.median(gray_f, axis=1, keepdims=True)
-    bg_col = np.median(gray_f, axis=0, keepdims=True)
-    return (gray_f <= bg_row - _VETO_DELTA) & (
-        gray_f <= bg_col - _VETO_DELTA
-    )
+    if gray.dtype != np.uint8:
+        gray_f = gray.astype(np.float32)
+        bg_row = np.median(gray_f, axis=1, keepdims=True)
+        bg_col = np.median(gray_f, axis=0, keepdims=True)
+        return (gray_f <= bg_row - _VETO_DELTA) & (
+            gray_f <= bg_col - _VETO_DELTA
+        )
+    delta2 = int(round(2.0 * _VETO_DELTA))
+    r2 = _twice_median_rows_u8(gray)
+    c2 = _twice_median_rows_u8(np.ascontiguousarray(gray.T))
+    r_u8 = np.clip(((r2 - delta2) >> 1) + 1, 0, 255).astype(np.uint8)[:, None]
+    c_u8 = np.clip(((c2 - delta2) >> 1) + 1, 0, 255).astype(np.uint8)[None, :]
+    return gray < np.minimum(r_u8, c_u8)
+
+
+def _apply_separable_veto_sparse(ink, gray):
+    """Zera em `ink` os pixels reprovados pelo veto separável.
+
+    Calcula as medianas apenas nas linhas e colunas que já contêm
+    algum candidato em `ink` após o limiar adaptativo: linhas e
+    colunas sem tinta não precisam de partição. Resultado idêntico
+    pixel a pixel a `ink[~_separable_veto(gray)] = 0`.
+    """
+    rows = np.flatnonzero(ink.any(axis=1))
+    if rows.size == 0:
+        return
+    cols = np.flatnonzero(ink.any(axis=0))
+    delta2 = int(round(2.0 * _VETO_DELTA))
+    r2 = _twice_median_rows_u8(gray[rows])
+    c2 = _twice_median_rows_u8(np.ascontiguousarray(gray[:, cols].T))
+    r_u8 = np.clip(((r2 - delta2) >> 1) + 1, 0, 255).astype(np.uint8)[:, None]
+    c_u8 = np.clip(((c2 - delta2) >> 1) + 1, 0, 255).astype(np.uint8)[None, :]
+    thresh = np.minimum(r_u8, c_u8)
+    sub_ink = ink[np.ix_(rows, cols)]
+    sub_ink[gray[np.ix_(rows, cols)] >= thresh] = 0
+    ink[np.ix_(rows, cols)] = sub_ink
 
 
 def extract_ink(warped, clear_markers=False):
@@ -96,10 +150,9 @@ def extract_ink(warped, clear_markers=False):
     if clear_markers:
         ink[_marker_mask(warped.shape) > 0] = 0
     # Remove ruído pequeno (poeira, textura do papel).
-    kernel = np.ones((2, 2), dtype=np.uint8)
-    ink = cv2.morphologyEx(ink, cv2.MORPH_OPEN, kernel)
+    ink = cv2.morphologyEx(ink, cv2.MORPH_OPEN, _MORPH_OPEN_KERNEL)
     if not clear_markers:
-        ink[~_separable_veto(gray)] = 0
+        _apply_separable_veto_sparse(ink, gray)
     return ink
 
 
@@ -131,6 +184,7 @@ _SESSION_INK_DELTA = 12.0
 # bloqueia a sessao; portoes foram removidos (ver observe).
 _ALIGN_MAX_SHIFT_PX = 10.0
 _BASE_MIN_VISIBLE = 1
+_MIN_GAIN_VISIBLE_SUBSAMPLES = 256
 _ALIGN_WINDOW = None
 
 
@@ -196,7 +250,6 @@ class SessionBaselineInk:
         self._baseline_min = None
         self.reference = None
         self._ref_median = None
-        self._base_blur = None
 
     @property
     def ready(self):
@@ -243,13 +296,11 @@ class SessionBaselineInk:
             # ela que o realinhamento mede o deslocamento do
             # quadro atual quando o caderno se mexe.
             self.reference = base_raw
-            self._ref_median = float(np.median(base))
-            self._base_blur = base
+            self._ref_median = float(np.median(base[::2, ::2]))
             # Minimo local 3x3: a estrutura escura da base ganha um
             # halo de 1 px que absorve o jitter residual do warp,
             # para a pauta nao virar tinta quando o quadro treme.
-            self._baseline_min = cv2.erode(
-                base, np.ones((3, 3), dtype=np.uint8))
+            self._baseline_min = cv2.erode(base, _ERODE_3X3_KERNEL)
             self._samples = []
             self._sample_vis = []
 
@@ -275,46 +326,49 @@ class SessionBaselineInk:
         shape = warped.shape[:2]
         if not self.ready:
             return np.zeros(shape, dtype=np.uint8)
-        gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
-        gray = gray.astype(np.float32)
+        gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY).astype(np.float32)
         aligned, _est, _response, _ok = align_to_reference(
             self.reference, gray)
-        cur_median = float(np.median(aligned))
+        sub_aligned = aligned[::2, ::2]
+        if visible is not None:
+            vis_bool = (
+                visible if visible.dtype == bool else (visible > 0)
+            )
+            sub_vis = vis_bool[::2, ::2]
+            if int(sub_vis.sum()) >= _MIN_GAIN_VISIBLE_SUBSAMPLES:
+                cur_median = float(np.median(sub_aligned[sub_vis]))
+            else:
+                cur_median = self._ref_median or 0.0
+        else:
+            cur_median = float(np.median(sub_aligned))
+            vis_bool = None
         gain = 1.0
         if cur_median > 1.0 and self._ref_median is not None:
             gain = float(np.clip(
                 self._ref_median / cur_median, 0.85, 1.18))
-        blurred = cv2.GaussianBlur(aligned * gain, (3, 3), 0)
+        scaled = aligned * gain if gain != 1.0 else aligned
+        blurred = cv2.GaussianBlur(scaled, (3, 3), 0)
         delta = self._baseline_min - blurred
         ink = delta >= _SESSION_INK_DELTA
-        if visible is not None:
+        if vis_bool is not None:
             # Pixel coberto nao e tinta: a mao pousada sobre a
             # pagina escurece contra a base, mas nao desenha. O
             # acumulador tambem veta por visibilidade; zerar aqui
             # mantem a saida do observe limpa para qualquer
             # consumidor.
-            ink &= visible
-        return np.where(ink, 255, 0).astype(np.uint8)
+            ink &= vis_bool
+        return ink.view(np.uint8) * np.uint8(255)
 
 
 def render_canvas(ink_mask, out=None):
-    """Renderiza o canvas digital: fundo branco, tinta preta.
-
-    Com out, escreve num buffer do chamador em vez de alocar um
-    canvas novo por chamada. O buffer precisa ter a forma e o tipo
-    do canvas; quem passa out é dono dele e decide se o conteúdo
-    pode ser sobrescrito na próxima chamada.
-    """
+    """Renderiza canvas branco com tinta preta, reutilizando ``out`` se dado."""
     if out is None:
-        canvas = np.full(
-            (config.PAPER_H, config.PAPER_W, 3), 255, dtype=np.uint8
-        )
+        canvas = np.full((config.PAPER_H, config.PAPER_W, 3), 255, dtype=np.uint8)
     else:
-        if out.shape != (config.PAPER_H, config.PAPER_W, 3) \
-                or out.dtype != np.uint8:
+        expected_shape = (config.PAPER_H, config.PAPER_W, 3)
+        if out.shape != expected_shape or out.dtype != np.uint8:
             raise ValueError(
-                "out de render_canvas precisa ser "
-                f"{(config.PAPER_H, config.PAPER_W, 3)} uint8, "
+                f"out de render_canvas precisa ser {expected_shape} uint8, "
                 f"veio {out.shape} {out.dtype}"
             )
         canvas = out
@@ -395,6 +449,25 @@ class InkAccumulator:
         self._enter_coef = enter_frac.numerator * exit_frac.denominator
         self._exit_coef = exit_frac.numerator * enter_frac.denominator
         self._min_visible = min_visible
+        # Para window <= 254 (padrão: 15), contagens cabem em uint8 e a
+        # histerese inteira inteira vira duas buscas SIMD via cv2.LUT
+        # (~6x mais rápido e sem 16 MiB de temporários int32 por frame),
+        # preservando equivalência matemática exata par a par.
+        self._use_u8_lut = int(window) <= 254
+        if self._use_u8_lut:
+            lut_en = np.full(256, int(window) + 1, dtype=np.uint8)
+            lut_ex = np.zeros(256, dtype=np.uint8)
+            for v in range(int(window) + 1):
+                if v >= min_visible:
+                    lut_en[v] = min(255, math.ceil(v * enter_frac))
+                    # Compara (ink + 1) <= lut_ex[v] para cobrir ink=0
+                    # sem underflow em uint8 (0 representa nunca sair).
+                    lut_ex[v] = min(255, math.floor(v * exit_frac) + 1)
+            self._enter_lut = lut_en
+            self._exit_lut = lut_ex
+        else:
+            self._enter_lut = None
+            self._exit_lut = None
         size = 2 * tolerance + 1
         self._kernel = np.ones((size, size), dtype=np.uint8)
         self._shape = shape
@@ -404,8 +477,9 @@ class InkAccumulator:
         """Esquece a janela e esvazia o canvas (folha nova, sessão nova)."""
         self._ink_votes = deque()
         self._vis_votes = deque()
-        self._ink_counts = np.zeros(self._shape, dtype=np.int16)
-        self._vis_counts = np.zeros(self._shape, dtype=np.int16)
+        count_dtype = np.uint8 if self._use_u8_lut else np.int16
+        self._ink_counts = np.zeros(self._shape, dtype=count_dtype)
+        self._vis_counts = np.zeros(self._shape, dtype=count_dtype)
         self.state = np.zeros(self._shape, dtype=bool)
         self._first_seen_ms = np.zeros(self._shape, dtype=np.uint32)
         self._last_update_ms = np.zeros(self._shape, dtype=np.uint32)
@@ -448,18 +522,21 @@ class InkAccumulator:
         self._vis_votes.append(visible)
         self._ink_counts += evidence
         self._vis_counts += visible
-        judged = self._vis_counts >= self._min_visible
-        # Mesmo denominador efetivo da forma float, max(vis, 1):
-        # pixel nunca visivel na janela tem fracao 0 nos dois
-        # mundos, e a multiplicacao cruzada nao degenera nele.
-        vis = np.maximum(self._vis_counts, 1).astype(np.int32)
-        scaled = self._ink_counts.astype(np.int32) * self._count_scale
-        enter = judged & ~self.state & (scaled >= vis * self._enter_coef)
-        clear = judged & self.state & (scaled <= vis * self._exit_coef)
+        if self._use_u8_lut:
+            th_en = cv2.LUT(self._vis_counts, self._enter_lut)
+            th_ex = cv2.LUT(self._vis_counts, self._exit_lut)
+            enter = ~self.state & (self._ink_counts >= th_en)
+            clear = self.state & (self._ink_counts + np.uint8(1) <= th_ex)
+        else:
+            judged = self._vis_counts >= self._min_visible
+            vis = np.maximum(self._vis_counts, 1).astype(np.int32)
+            scaled = self._ink_counts.astype(np.int32) * self._count_scale
+            enter = judged & ~self.state & (scaled >= vis * self._enter_coef)
+            clear = judged & self.state & (scaled <= vis * self._exit_coef)
         self.state[enter] = True
         self.state[clear] = False
         self._update_stamps(evidence, visible, t_ms)
-        return (self.state * 255).astype(np.uint8)
+        return self.state.view(np.uint8) * np.uint8(255)
 
     def _update_stamps(self, evidence, visible, t_ms):
         """Mantém first_seen/last_update sobre o estado já atualizado.

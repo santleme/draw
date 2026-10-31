@@ -4,10 +4,10 @@ Duas frentes:
 
 1. Regressão de raster: uma sequência sintética determinística de
    máscaras de tinta (semente fixa), com máscara de mão num trecho e
-   um episódio de borracha, roda na implementação anterior aos
-   carimbos (/tmp/ink_pre_stamp.py, cópia de draw/ink.py antes da
-   mudança) e na atual. Os canvas de todos os frames têm de ser
-   byte-idênticos: carimbo não pode mudar o raster.
+   um episódio de borracha, roda na implementação de referência em
+   float32 (tests/_ink_reference.py) e na atual (draw/ink.py). Os
+   canvas de todos os frames têm de ser byte-idênticos: carimbo e
+   otimizações não podem mudar o raster.
 
 2. Invariantes dos carimbos na implementação nova: first_seen <=
    last_update onde há tinta carimbada; first_seen estável enquanto
@@ -18,7 +18,6 @@ Duas frentes:
 Uso: python tests/test_accumulator_stamps.py
 """
 
-import importlib.util
 import sys
 from pathlib import Path
 
@@ -27,19 +26,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from draw import ink as ink_new  # noqa: E402
-
-_PRE_STAMP = Path("/tmp/ink_pre_stamp.py")
-if not _PRE_STAMP.exists():
-    print(
-        "ERRO: /tmp/ink_pre_stamp.py nao existe; copie draw/ink.py "
-        "para la antes de mudar o acumulador."
-    )
-    sys.exit(2)
-_spec = importlib.util.spec_from_file_location(
-    "draw._ink_pre_stamp", _PRE_STAMP
-)
-ink_old = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(ink_old)
+from tests import _ink_reference as ink_old  # noqa: E402
 
 H, W = 1200, 850
 N_FRAMES = 60
@@ -190,6 +177,10 @@ def main():
     assert bytes_planos == 2 * H * W * 4
 
     print("TESTE DOS CARIMBOS OK")
+
+
+def test_accumulator_stamps():
+    main()
 
 
 if __name__ == "__main__":

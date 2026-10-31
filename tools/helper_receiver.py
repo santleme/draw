@@ -23,121 +23,25 @@ Como biblioteca:
 
 import argparse
 import socket
-import struct
 import sys
 import threading
 from pathlib import Path
 
-MAGIC = b"DRAW"
-VERSION = 1
-# magic, versao, reservado, frame_id, capture_ts_us, payload_len.
-HEADER = struct.Struct("<4sHHQqI")
-HEADER_SIZE = HEADER.size  # 28 bytes
-DEFAULT_PORT = 8765
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-
-class ProtocolError(Exception):
-    """O fluxo violou bridge/PROTOCOL.md (magic, versão ou truncamento)."""
-
-
-def pack_record(frame_id, capture_ts_us, payload):
-    """Monta um registro completo (cabeçalho + payload) para escrever."""
-    return HEADER.pack(
-        MAGIC, VERSION, 0, frame_id, capture_ts_us, len(payload)
-    ) + payload
-
-
-def _read_exact(read, size):
-    """Lê exatamente size bytes via read(n) -> bytes.
-
-    Retorna None se a fonte acabar limpa antes do primeiro byte.
-    Levanta ProtocolError se acabar no meio.
-    """
-    chunks = []
-    remaining = size
-    while remaining > 0:
-        chunk = read(remaining)
-        if not chunk:
-            if not chunks:
-                return None
-            raise ProtocolError(
-                f"fluxo truncado: faltaram {remaining} de {size} bytes"
-            )
-        chunks.append(chunk)
-        remaining -= len(chunk)
-    return b"".join(chunks)
-
-
-def _iter_records(read):
-    """Itera registros sobre uma função read(n) -> bytes.
-
-    Produz (frame_id, capture_ts_us, payload, bruto), onde bruto é o
-    registro byte a byte como chegou (o que o gravador escreve).
-    """
-    while True:
-        header = _read_exact(read, HEADER_SIZE)
-        if header is None:
-            return
-        magic, version, _reserved, frame_id, capture_ts_us, payload_len = (
-            HEADER.unpack(header)
-        )
-        if magic != MAGIC:
-            raise ProtocolError(
-                f"magic invalido: {magic!r} (esperado {MAGIC!r}); "
-                "fluxo dessincronizado ou arquivo de outro formato"
-            )
-        if version != VERSION:
-            raise ProtocolError(
-                f"versao {version} nao suportada (esperada {VERSION})"
-            )
-        payload = _read_exact(read, payload_len)
-        if payload is None:
-            raise ProtocolError(
-                "fluxo truncado: cabecalho sem payload "
-                f"(frame_id {frame_id}, {payload_len} bytes esperados)"
-            )
-        yield frame_id, capture_ts_us, payload, header + payload
-
-
-def frames_from_file(path):
-    """Itera (frame_id, capture_ts_us, jpeg_bytes) de um arquivo gravado."""
-    with open(path, "rb") as handle:
-        for frame_id, capture_ts_us, payload, _raw in _iter_records(
-            handle.read
-        ):
-            yield frame_id, capture_ts_us, payload
-
-
-def frames_from_socket(host, port=DEFAULT_PORT, timeout=None):
-    """Itera (frame_id, capture_ts_us, jpeg_bytes) do ajudante via TCP."""
-    with socket.create_connection((host, port), timeout=timeout) as sock:
-        for frame_id, capture_ts_us, payload, _raw in _iter_records(
-            sock.recv
-        ):
-            yield frame_id, capture_ts_us, payload
-
-
-def record(host, port, out_path, max_frames=None, timeout=None):
-    """Grava o fluxo do socket byte a byte num arquivo. Retorna n."""
-    count = 0
-    with socket.create_connection((host, port), timeout=timeout) as sock:
-        with open(out_path, "wb") as handle:
-            for _fid, _ts, _payload, raw in _iter_records(sock.recv):
-                handle.write(raw)
-                count += 1
-                if max_frames is not None and count >= max_frames:
-                    break
-    return count
-
-
-def decode_jpeg(jpeg_bytes):
-    """Decodifica um payload em imagem BGR (numpy) ou None se inválido."""
-    import cv2
-    import numpy as np
-
-    return cv2.imdecode(
-        np.frombuffer(jpeg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR
-    )
+from draw.protocol import (  # noqa: E402
+    DEFAULT_PORT,
+    HEADER,
+    HEADER_SIZE,
+    MAGIC,
+    VERSION,
+    ProtocolError,
+    decode_jpeg,
+    frames_from_file,
+    frames_from_socket,
+    pack_record,
+    record_socket as record,
+)
 
 
 def _synthetic_frames(n, base_id=1000, base_ts_us=5_000_000):

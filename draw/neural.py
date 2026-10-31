@@ -70,12 +70,22 @@ _ORT_INTRA_THREADS = 4
 _ENV_THREADS_VAR = "DRAW_ORT_THREADS"
 _MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+_NORM_SCALE = (1.0 / (255.0 * _STD)).astype(np.float32)
+_NORM_BIAS = (-_MEAN / _STD).astype(np.float32)
 _MASK_THRESHOLD = 0.5
+_LOGIT_MARGIN = float(np.log(_MASK_THRESHOLD / (1.0 - _MASK_THRESHOLD)))
 _MIN_CONTOUR_AREA_RATIO = 0.01
 _FIT_MAX_DISPLACE_PX = 100.0
 _FIT_MIN_EDGE_COVERAGE = 0.5
+_FIT_MAX_INLIER_RESIDUAL_PX = 6.0
+_FIT_MIN_INLIER_RATIO = 0.50
+_FIT_MAX_INLIER_RMS_PX = 4.0
 _MEMORY_MIN_MASK_IOU = 0.7
 _MEMORY_MASK_STRIDE = 4
+_MEMORY_STATIONARY_ANGLE_DEG = 3.0
+_MEMORY_STATIONARY_SHIFT_PX = 8.0
+_MEMORY_SINGLE_OUTLIER_ANGLE_DEG = 6.0
+_MEMORY_SINGLE_OUTLIER_SHIFT_PX = 18.0
 _ENV_MODEL_VAR = "DRAW_NEURAL_MODEL"
 _PAPER_CLASS = 1
 _INK_CLASS = 3
@@ -267,45 +277,109 @@ def _segment_distances(points, start, end):
     return np.linalg.norm(points - (start + np.outer(t, segment)), axis=1)
 
 
+def _line_residuals(points, line):
+    dir_fit, point_fit = line
+    normal = np.array([-dir_fit[1], dir_fit[0]], dtype=np.float64)
+    return np.abs((points - point_fit) @ normal)
+
+
+def _line_angle_diff_deg(line_a, line_b):
+    dir_a = line_a[0] / max(float(np.linalg.norm(line_a[0])), 1e-9)
+    dir_b = line_b[0] / max(float(np.linalg.norm(line_b[0])), 1e-9)
+    cos_ang = min(1.0, abs(float(dir_a @ dir_b)))
+    return float(np.degrees(np.arccos(cos_ang)))
+
+
+def _line_normal_shift_at(point, line_ref):
+    dir_ref, pt_ref = line_ref
+    normal = np.array([-dir_ref[1], dir_ref[0]], dtype=np.float64)
+    normal /= max(float(np.linalg.norm(normal)), 1e-9)
+    return abs(float((point - pt_ref) @ normal))
+
+
+def _best_inlier_seed_line(side, along):
+    """Escolhe semente linear robusta a entalhe de braço no meio da aresta."""
+    candidates = [_fit_line(side)]
+    order = np.argsort(along)
+    n = len(order)
+    if n >= 16:
+        for q0, q1 in ((0.06, 0.94), (0.06, 0.38), (0.62, 0.94), (0.18, 0.82)):
+            p0 = side[order[int(q0 * (n - 1))]]
+            p1 = side[order[int(q1 * (n - 1))]]
+            chord = p1 - p0
+            chord_len = float(np.linalg.norm(chord))
+            if chord_len >= 12.0:
+                candidates.append((chord / chord_len, p0))
+
+    best_line = candidates[0]
+    best_score = (-1, -1e9)
+    for cand in candidates:
+        res = _line_residuals(side, cand)
+        inliers = res <= _FIT_MAX_INLIER_RESIDUAL_PX
+        count = int(inliers.sum())
+        neg_med = -float(np.median(res[inliers])) if count > 0 else -1e9
+        score = (count, neg_med)
+        if score > best_score:
+            best_score = score
+            best_line = cand
+    return best_line
+
+
 def _edge_line(side, start, end, centroid, fallback=None):
     """A reta de uma aresta: ajustada, herdada ou travada na direção.
 
-    Com cobertura boa (os pontos ocupam pelo menos
-    _FIT_MIN_EDGE_COVERAGE do comprimento do segmento), vale o
-    ajuste de Huber com poda por resíduo de sempre, e a reta é
-    confiável. Com cobertura curta, os pontos são um fragmento da
-    aresta (o resto está coberto, tipicamente pela mão) e nem a
-    direção ajustada nem o fragmento localizam a aresta: medido nos
-    quadros de escape do vídeo de teste, os pontos do fragmento são
-    a borda do braço sobre a folha, a dezenas de pixels da aresta
-    verdadeira, e a reta ajustada projeta os cantos a centenas de
-    pixels; o teto de deslocamento veta a correção e o canto fica
-    congelado no vértice da aproximação, que nesses quadros mora
-    sobre a borda do quadro porque a máscara corre por ela.
-
-    Sem cobertura, a ordem de preferência é: a reta herdada da
-    chamada anterior (a folha é rígida e a câmera é fixa; a última
-    reta confiável da mesma aresta é a melhor estimativa dela
-    coberta); na falta dela, a reta travada na direção do segmento
-    com o deslocamento mediano dos pontos, cuja projeção nasce
-    limitada. Retorna (reta, travada, confiavel).
+    Com cobertura boa E colinearidade real dentro de resíduo absoluto
+    (_FIT_MAX_INLIER_RESIDUAL_PX), vale o ajuste de Huber podado aos
+    inliers retos e a reta é confiável. Quando um braço/mão curvo invade
+    a máscara mantendo cobertura >= 0,5, o portão absoluto de retidão
+    reprova a aresta: ela não contamina a memória (_edge_lines) e herda
+    `fallback` quando disponível.
     """
     segment = end - start
     length = float(np.linalg.norm(segment))
     if length < 1e-6:
-        return _fit_line(side), False, True
+        return _fit_line(side), False, False
     direction = segment / length
     along = (side - start) @ direction
     coverage = float(along.max() - along.min()) / length
     if coverage >= _FIT_MIN_EDGE_COVERAGE:
-        line = _fit_line(side)
-        dir_fit, point_fit = line
-        normal = np.array([-dir_fit[1], dir_fit[0]])
-        residuals = np.abs((side - point_fit) @ normal)
-        keep = residuals <= max(3.0, float(np.percentile(residuals, 70)))
-        if keep.sum() >= 8:
+        seed = _best_inlier_seed_line(side, along)
+        residuals = _line_residuals(side, seed)
+        tol = min(
+            _FIT_MAX_INLIER_RESIDUAL_PX,
+            max(3.0, float(np.percentile(residuals, 70))),
+        )
+        keep = residuals <= tol
+        if int(keep.sum()) >= 8:
             line = _fit_line(side[keep])
-        return line, False, True
+            residuals = _line_residuals(side, line)
+            inliers = residuals <= _FIT_MAX_INLIER_RESIDUAL_PX
+            if int(inliers.sum()) >= 8:
+                line = _fit_line(side[inliers])
+                residuals = _line_residuals(side, line)
+                inliers = residuals <= _FIT_MAX_INLIER_RESIDUAL_PX
+        else:
+            line = seed
+            inliers = residuals <= _FIT_MAX_INLIER_RESIDUAL_PX
+
+        n_inliers = int(inliers.sum())
+        if n_inliers >= 8:
+            inlier_along = along[inliers]
+            inlier_cov = float(inlier_along.max() - inlier_along.min()) / length
+            inlier_ratio = n_inliers / float(len(side))
+            inlier_rms = float(np.sqrt(np.mean(residuals[inliers] ** 2)))
+            # Aceita também entalhe localizado no meio quando sobram >= 24
+            # inliers colineares cobrindo ambos os lados da aresta.
+            ratio_ok = (inlier_ratio >= _FIT_MIN_INLIER_RATIO) or (
+                n_inliers >= 24 and inlier_cov >= 0.70
+            )
+            if (
+                inlier_cov >= _FIT_MIN_EDGE_COVERAGE
+                and ratio_ok
+                and inlier_rms <= _FIT_MAX_INLIER_RMS_PX
+            ):
+                return line, False, True
+
     if fallback is not None:
         return fallback, True, False
     normal = np.array([-direction[1], direction[0]])
@@ -378,6 +452,40 @@ def _refit_corners(contour, quad, frame_shape, fallback_lines=None):
         lines.append(line)
         locked.append(is_locked)
         trusted.append(is_trusted)
+
+    if fallback_lines is not None:
+        # Guarda de corpo rígido: se >= 2 outras arestas confirmam que a
+        # folha continua parada, uma única aresta que salte em ângulo ou
+        # posição (ex.: manga/antebraço reto cobrindo metade de um lado)
+        # não pode girar sozinha nem contaminar a memória.
+        steady = []
+        jumped = []
+        for i in range(4):
+            prev = fallback_lines[i]
+            if prev is None or not trusted[i]:
+                continue
+            mid = 0.5 * (quad[i].astype(np.float64) + quad[(i + 1) % 4].astype(np.float64))
+            # Mede deslocamento no ponto médio da aresta nova contra a reta anterior.
+            dir_cur, pt_cur = lines[i]
+            proj_mid = pt_cur + float((mid - pt_cur) @ dir_cur) * dir_cur
+            ang = _line_angle_diff_deg(lines[i], prev)
+            shf = _line_normal_shift_at(proj_mid, prev)
+            if (
+                ang <= _MEMORY_STATIONARY_ANGLE_DEG
+                and shf <= _MEMORY_STATIONARY_SHIFT_PX
+            ):
+                steady.append(i)
+            elif (
+                ang > _MEMORY_SINGLE_OUTLIER_ANGLE_DEG
+                or shf > _MEMORY_SINGLE_OUTLIER_SHIFT_PX
+            ):
+                jumped.append(i)
+        if len(steady) >= 2 and len(jumped) == 1:
+            bad = jumped[0]
+            lines[bad] = fallback_lines[bad]
+            locked[bad] = True
+            trusted[bad] = False
+
     refined = quad.copy()
     for i in range(4):
         corner = _intersect(lines[i - 1], lines[i])
@@ -493,6 +601,7 @@ class NeuralSheetDetector:
     def __init__(self, model_path):
         self.model_path = str(model_path)
         self._session = None
+        self._output_names = None
         self._resolved_input_size = None
         self._edge_lines = None
         self._memory_mask = None
@@ -520,7 +629,7 @@ class NeuralSheetDetector:
             return None
         return self._edge_lines
 
-    def _fit(self, mask, frame):
+    def _fit(self, mask, frame=None):
         """fit_quad com a memória de arestas do detector.
 
         A guarda de plausibilidade (_fit_plausible) fecha o caminho:
@@ -529,9 +638,8 @@ class NeuralSheetDetector:
         """
         fallback = self._fallback_lines(mask)
         corners, lines, trusted = _fit_quad_impl(mask, frame, fallback)
-        if corners is not None and not _fit_plausible(
-            corners, frame.shape
-        ):
+        ref_shape = frame.shape if frame is not None else mask.shape
+        if corners is not None and not _fit_plausible(corners, ref_shape):
             return None
         if lines is not None:
             stored = (
@@ -561,30 +669,40 @@ class NeuralSheetDetector:
             self._resolved_input_size = _session_input_size(session)
         size = self._resolved_input_size
         frame_h, frame_w = frame.shape[:2]
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        resized = cv2.resize(
-            rgb,
+        resized_bgr = cv2.resize(
+            frame,
             (size, size),
             interpolation=cv2.INTER_LINEAR,
-        ).astype(np.float32)
-        tensor = ((resized / 255.0 - _MEAN) / _STD).transpose(2, 0, 1)
-        tensor = tensor[None].astype(np.float32)
-        output_names = [output.name for output in session.get_outputs()]
-        outputs = session.run(output_names, {"image": tensor})
-        by_name = dict(zip(output_names, outputs))
+        )
+        rgb_f32 = resized_bgr[:, :, ::-1].astype(np.float32)
+        tensor = (rgb_f32 * _NORM_SCALE + _NORM_BIAS).transpose(2, 0, 1)[None]
+        input_tensor = np.ascontiguousarray(tensor, dtype=np.float32)
 
-        if "mask_logits" in by_name and "presence_logit" in by_name:
-            logits = by_name["mask_logits"]
-            presence = by_name["presence_logit"]
+        # Inspeciona o contrato uma vez por predição; a inferência usa a
+        # chamada direta de saídas no caminho legado, que é o modelo de
+        # produção medido. Sessões de teste antigas sem get_outputs seguem
+        # assumidas como contrato legado.
+        if self._output_names is None:
+            self._output_names = (
+                [output.name for output in session.get_outputs()]
+                if hasattr(session, "get_outputs")
+                else ["mask_logits", "presence_logit"]
+            )
+        output_names = self._output_names
+        if output_names == ["mask_logits", "presence_logit"]:
+            logits, presence = session.run(
+                output_names, {"image": input_tensor}
+            )
             channel_bg, channel_paper = logits[0, 0], logits[0, 1]
-            peak = np.maximum(channel_bg, channel_paper)
-            exp_bg = np.exp(channel_bg - peak)
-            exp_paper = np.exp(channel_paper - peak)
-            probability = exp_paper / (exp_bg + exp_paper)
-            mask_small = (probability > _MASK_THRESHOLD).astype(np.uint8)
+            if _MASK_THRESHOLD == 0.5:
+                mask_small = (channel_paper > channel_bg).astype(np.uint8)
+            else:
+                mask_small = (
+                    (channel_paper - channel_bg) > _LOGIT_MARGIN
+                ).astype(np.uint8)
             self.last_presence_logit = float(presence[0])
         elif output_names == ["logits"]:
-            logits = by_name["logits"]
+            logits = session.run(output_names, {"image": input_tensor})[0]
             if logits.ndim != 4 or logits.shape[1] != 4:
                 raise ValueError(
                     "saída 'logits' precisa ter forma [N, 4, H, W] "

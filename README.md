@@ -65,12 +65,14 @@ python main.py --neural models/draw_seg_v3_dyn.onnx
 
 | Flag | O que faz |
 |---|---|
-| `--source N` ou URL | Webcam local por índice (padrão 0) ou stream MJPEG por URL |
+| `--source N`, URL ou arquivo | Webcam local por índice (padrão 0), stream MJPEG/RTSP, protocolo binário `tcp://host[:8765]` ou gravação `.drawcap` |
 | `--neural [modelo.onnx]` | Detector neural como primário, com o clássico de reserva. Sem caminho, lê `DRAW_NEURAL_MODEL` |
-| `--ink-model [modelo.onnx]` | Modelo aprendido de tinta como fonte da máscara. Sem caminho, lê `DRAW_INK_MODEL`. Sem arquivo ou com erro de carga, o app avisa uma vez e segue com a heurística |
-| `--hand-model [modelo.task]` | Máscara de mão do MediaPipe para o canvas acumulativo. Sem caminho, lê `DRAW_HAND_MODEL` ou `models/hand_landmarker.task` |
+| `--async-detect` | Roda a detecção da folha em thread dedicada de segundo plano, desacoplando o custo do ONNX da cadência de tinta e cursor |
+| `--session-baseline` | Tinta da sessão: a página como está ao apertar `c` vira fundo (pauta, margem e desenho antigo somem); só entra o traço novo |
+| `--hand-model [modelo.task]` | Máscara de mão e marcos 21-pontos do MediaPipe para o canvas acumulativo e fusão do cursor (`PenTipFusion`). Sem caminho, lê `DRAW_HAND_MODEL` ou `models/hand_landmarker.task` |
+| `--ink-model [modelo.onnx]` | Gancho opcional para extrator aprendido de tinta; sem módulo instalado no pacote, avisa uma vez e segue com a heurística |
 | `--markers` | Modo opcional com a folha-modelo impressa e marcadores ArUco |
-| `--check` | Valida a câmera porta por porta e sai, sem abrir janela |
+| `--check` | Valida a fonte informada (`--source`) porta por porta e sai, sem abrir janela |
 | `--save-dir pasta` | Pasta das capturas. O padrão é `captures` |
 
 A variável `DRAW_ORT_THREADS` troca o número de threads da sessão ONNX sem tocar no código. O padrão é 4, medido na máquina do autor.
@@ -85,7 +87,8 @@ Sem o pacote ou sem o modelo, o app roda sem a máscara e avisa uma vez.
 
 Teclas dentro do app:
 
-- `s` salva o canvas digital como PNG em `captures/`
+- `s` salva o canvas digital como PNG em `captures/` (e `canvas_<ts>_stamps.npz` com os carimbos temporais do acumulador quando há tinta consolidada)
+- `c` congela ou reinicia a página base de 12 quadros quando `--session-baseline` está ativo
 - `f` salva o frame cru atual em `captures/frames/`
 - `g` liga ou desliga a captura automática, um frame cru a cada 10 quadros
 - `q` ou `Esc` sai
@@ -128,9 +131,17 @@ Um limiar adaptativo separa a tinta do papel na folha retificada. Um veto separ�
 
 O canvas não é uma foto do frame atual. Ele acumula evidência com histerese sobre uma janela de 15 frames. Um pixel entra na tinta com fração de amostras visíveis de 0,45 e sai com 0,20, com um mínimo de 4 amostras visíveis. O traço sobrevive à mão passando por cima. A borracha também funciona por esse caminho. A tinta apagada some do canvas depois de amostras limpas visíveis o bastante, não no frame seguinte.
 
-Com a máscara de mão ligada, a região sob a mão vira desconhecida. Ela não ganha nem perde tinta enquanto está coberta.
+Com a máscara de mão ligada, a região sob a mão vira desconhecida (não ganha nem perde tinta enquanto está coberta) e o marco 8 (ponta do indicador) projetado no espaço do papel alimenta `draw/fusion.py` (`PenTipFusion` com One Euro Filter + centroide do delta fresco por quadro) para estimar posição e toque da caneta sem rodar o MediaPipe duas vezes.
 
-O app também aceita um modelo aprendido de tinta por `--ink-model`. A integração está pronta e testada com um ONNX da arquitetura. O treino do modelo de tinta ainda não rodou. Sem ele, vale o caminho heurístico descrito acima.
+Com `--session-baseline`, `SessionBaselineInk` captura a mediana visível de 12 quadros ao apertar `c`, realinha cada quadro à referência em escala nativa por correlação de fase (`512x864`, largura total da folha) e normaliza o ganho global apenas sobre os pixels visíveis fora da mão, preservando traços finos de lápis sem transformar pauta ou margem impressa em falsa tinta.
+
+### Vetorização offline e primitivas geométricas (Camada 2)
+
+`tools/vectorize.py` converte o PNG do canvas salvo (e opcionalmente o `_stamps.npz` correspondente) em polilinhas simplificadas, primitivas geométricas em milímetros do A4 (`line`, `circle`, `rectangle`, `polygon`, `polyline`), SVG semântico e JSON estruturado:
+
+```bash
+python tools/vectorize.py captures/canvas_1730000000.png --clean --stamps captures/canvas_1730000000_stamps.npz --primitives --json saida.json
+```
 
 ## Desempenho medido
 
@@ -167,31 +178,33 @@ O kernel da v3 levou 44,7 minutos numa T4. O kernel da v2 levou 3 horas e 51 min
 
 ## Arquitetura
 
-- `draw/` é o pacote principal. `app.py` tem o loop da webcam, as janelas e as validações de câmera. `paper.py` tem a detecção clássica, o portão de textura e a homografia. `neural.py` tem o detector neural por ONNX, com presença, máscara e quadrilátero. `ink.py` tem a heurística de tinta e o canvas acumulativo. `ink_model.py` tem o extrator do modelo aprendido de tinta. `hand.py` tem a máscara de mão do MediaPipe. `config.py` guarda o tamanho da folha retificada e os dados dos marcadores.
+- `draw/` é o pacote principal:
+  - `app.py` tem o loop da janela OpenCV, atalhos de teclado e diagnóstico `--check`.
+  - `pipeline.py` concentra o `DrawPipeline` sem GUI (estabilização `_SheetTracker`, cadência uniforme 1/1 de tinta/mão/cursor, trabalhador opcional `--async-detect` e persistência de PNG + `_stamps.npz`).
+  - `paper.py` tem a detecção clássica, o portão de textura em ROI com mapas preguiçosos e a homografia (`warp_sheet`, `perspective_matrix`, `warp_points`).
+  - `neural.py` tem o detector neural por ONNX, com presença, máscara, memória de arestas e guardas de retidão/corpo rígido contra oclusão de braço.
+  - `ink.py` tem a heurística de tinta (`extract_ink`), a tinta diferencial da sessão (`SessionBaselineInk` + `align_to_reference`) e o canvas acumulativo em inteiros/LUT (`InkAccumulator`).
+  - `hand.py` tem a máscara de oclusão e extração dos 21 marcos da mão via MediaPipe (`HandMasker.detect`).
+  - `fusion.py` tem a fusão temporal marco 8 + delta fresco de tinta (`PenTipFusion`, `OneEuroFilter2D`).
+  - `protocol.py` implementa o protocolo binário `bridge/PROTOCOL.md` e o adaptador `HelperCapture` para arquivos `.drawcap` e sockets `tcp://host[:8765]`.
+  - `config.py` guarda o tamanho da folha retificada (`850x1200`) e os dados dos marcadores.
 - `template/` tem o gerador da folha-modelo imprimível, usado só pelo modo `--markers`. O PNG gerado não entra no versionamento.
-- `bridge/` tem a ponte de captura no Windows. Um `ffmpeg.exe` no Windows serve a webcam como stream MJPEG e o Draw consome pelo `--source`. O passo a passo fica em [bridge/README.md](bridge/README.md).
-- `scripts/` tem os scripts de instalação. Hoje guarda `setup_camera_wsl.sh`, o instalador da câmera do WSL.
-- `tests/` tem os testes sem webcam. Hoje guarda `selftest.py`, que valida detecção, homografia, extração de tinta e o portão de textura em cenas sintéticas.
-- `tools/` tem as ferramentas de apoio. `label_frames.py` rotula frames capturados. `eval_real_frames.py` é o harness dos frames reais, o portão de qualquer modelo neural.
-- `verification/` é o registro da verificação formal limitada da v0. Ele guarda a skill do projeto e o script que prova propriedades da homografia com sondas numéricas. É um registro histórico de uma etapa concluída, não uma etapa do pipeline.
-- `docs/` tem a documentação de instalação, com o guia do Windows com WSL.
-- `main.py` é o ponto de entrada. Ele só chama o app.
+- `bridge/` tem a especificação do protocolo binário de captura (`bridge/PROTOCOL.md`) e instruções da ponte de captura no Windows ([bridge/README.md](bridge/README.md)).
+- `scripts/` guarda `setup_camera_wsl.sh`, o instalador da câmera do WSL.
+- `tests/` guarda toda a bateria sem webcam (`run_all.py`, `selftest.py`, testes diferenciais do acumulador e carimbos, `SessionBaselineInk`, guardas neurais, `DrawPipeline`/fontes, fusão e vetorização v2).
+- `tools/` reúne as ferramentas de apoio e bancada: `vectorize.py` (vetorização + primitivas da Camada 2), `helper_receiver.py` (gravação/inspeção `.drawcap` e TCP), `step0_latency.py`, `run_log.py`, `label_frames.py` e `eval_real_frames.py`.
+- `verification/` guarda a skill e o verificador geométrico da homografia (`run_verification.py`, cobrindo o caminho com marcadores, o caminho sem marcadores em 10 poses e a contraprova `--sabotage`).
+- `docs/` tem o guia do Windows com WSL e os registros técnicos de bancada.
+- `main.py` é o ponto de entrada.
 - `VISION.md` é o documento de visão do projeto.
 
 ## Desenvolvimento
 
-Sem webcam por perto, o pipeline inteiro se valida com cenas sintéticas.
+Sem webcam por perto, a bateria inteira (selftest, 198 sondas de homografia + contraprova `--sabotage`, testes unitários/diferenciais e selfchecks de todas as ferramentas em `tools/`) roda num comando só:
 
 ```bash
-python tests/selftest.py
-```
-
-O selftest roda os casos com marcadores, sem marcadores, de folha aninhada e do portão de textura. Ele imprime o erro máximo de canto e o recall de tinta de cada caso. Todos precisam passar antes de qualquer publicação.
-
-A verificação formal limitada roda com o comando abaixo.
-
-```bash
-python verification/run_verification.py
+python tests/run_all.py
+pytest tests/ -q
 ```
 
 Para rotular frames capturados:
@@ -214,7 +227,10 @@ Feito:
 - Portão de textura com veredito de baixa confiança para folha lisa
 - Segmentação de papel treinada no Kaggle, com sinal de presença, nas versões v1, v2 e v3
 - Datasets reais de documentos e frames da mesa do autor no treino
-- Canvas acumulativo com histerese e máscara de mão opcional
+- Canvas acumulativo com histerese em LUT uint8, carimbos temporais e máscara de mão opcional
+- Tinta diferencial da sessão (`--session-baseline`) com realinhamento subpixel por correlação de fase e ganho mascarado por visibilidade
+- Pipeline desacoplado (`DrawPipeline`) com cadência uniforme 1/1, detecção assíncrona (`--async-detect`), fusão de ponta de caneta (`PenTipFusion`) e suporte direto a `.drawcap` / `tcp://`
+- Vetorização offline v2 (`tools/vectorize.py`) com indexação O(H*W), poda 8-mínima de esporões, costura em junções, ordenação temporal e classificação de primitivas geométricas (Camada 2: reta, círculo, retângulo)
 - Pacote de desempenho com threads fixadas e modelo dinâmico a 384
 
 Em andamento:

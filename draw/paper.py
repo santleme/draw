@@ -126,15 +126,53 @@ def _refine_corners(frame, corners):
     return (refined.reshape(4, 2) - pad).astype(np.float32)
 
 
-def _texture_maps(frame):
-    """Mapas de textura do frame inteiro, calculados uma vez por frame.
+_TEXTURE_ERODE_KERNEL = np.ones((9, 9), np.uint8)
 
-    Saturação, valor, Laplaciano e bordas não dependem do candidato:
-    quem muda de candidato para candidato é só a máscara do interior.
-    Antes, cada candidato pagava as conversões e os operadores de
-    frame inteiro de novo, e o caso mais caro era o sem papel, em que
-    todos os candidatos são medidos e nenhum passa.
+
+class _LazyTextureMaps:
+    """Mapas de textura calculados sob demanda e reusados no frame.
+
+    Evita pagar Laplacian e Canny no frame inteiro quando os candidatos
+    já caem no filtro barato de fração de branco (ex.: tapete de mesa,
+    caixa de papelão, monitor escuro) ou quando a variância do
+    Laplaciano já decide sozinha (< 30 ou >= 200).
     """
+
+    def __init__(self, frame):
+        self._frame = frame
+        self._gray = None
+        self._hsv = None
+        self._cache = {}
+
+    def _ensure_gray(self):
+        if self._gray is None:
+            self._gray = cv2.cvtColor(self._frame, cv2.COLOR_BGR2GRAY)
+        return self._gray
+
+    def _ensure_hsv(self):
+        if self._hsv is None:
+            self._hsv = cv2.cvtColor(self._frame, cv2.COLOR_BGR2HSV)
+        return self._hsv
+
+    def __getitem__(self, key):
+        if key in self._cache:
+            return self._cache[key]
+        if key == "saturation":
+            val = self._ensure_hsv()[:, :, 1]
+        elif key == "value":
+            val = self._ensure_hsv()[:, :, 2]
+        elif key == "laplacian":
+            val = cv2.Laplacian(self._ensure_gray(), cv2.CV_32F)
+        elif key == "edges":
+            val = cv2.Canny(self._ensure_gray(), 30, 100)
+        else:
+            raise KeyError(key)
+        self._cache[key] = val
+        return val
+
+
+def _texture_maps(frame):
+    """Mapas de textura do frame inteiro (compatibilidade direta)."""
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     return {
@@ -145,53 +183,83 @@ def _texture_maps(frame):
     }
 
 
+def _candidate_interior_roi(frame_shape, corners):
+    """Recorta e erode a máscara do interior apenas na bounding box."""
+    fh, fw = frame_shape[:2]
+    center = corners.mean(axis=0)
+    shrunk = (
+        center + (corners - center) * _TEXTURE_INTERIOR_SHRINK
+    ).astype(np.int32)
+    pad = 6
+    x0 = max(0, int(shrunk[:, 0].min()) - pad)
+    y0 = max(0, int(shrunk[:, 1].min()) - pad)
+    x1 = min(fw, int(shrunk[:, 0].max()) + pad + 1)
+    y1 = min(fh, int(shrunk[:, 1].max()) + pad + 1)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    mask = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
+    local_poly = shrunk - np.array([x0, y0], dtype=np.int32)
+    cv2.fillPoly(mask, [local_poly], 255)
+    eroded = cv2.erode(mask, _TEXTURE_ERODE_KERNEL)
+    selected = eroded > 0
+    if not selected.any():
+        return None
+    return slice(y0, y1), slice(x0, x1), selected
+
+
 def _texture_features(frame, corners, maps=None):
     """Mede o interior de um quadrilátero candidato.
 
     Retorna (fração de branco, densidade de bordas, variância do
-    Laplaciano). O interior é encolhido para 86% em torno do centroide
-    e erodido com núcleo 9x9, para a borda do candidato não contaminar
-    as medidas. Branco é saturação abaixo de 60 e valor acima de 180
-    no HSV. A variância é a do Laplaciano CV_32F sobre o cinza. As
-    bordas internas são Canny 30/100 sobre o cinza, contadas só dentro
-    do interior encolhido. Os mapas de frame inteiro vêm de
-    _texture_maps, calculados uma vez e reusados entre candidatos;
-    sem mapas prontos, eles são calculados aqui.
+    Laplaciano). Opera sobre a caixa delimitadora do interior encolhido
+    para não alocar nem erodir máscaras do frame inteiro por candidato.
     """
     if maps is None:
-        maps = _texture_maps(frame)
-    center = corners.mean(axis=0)
-    shrunk = center + (corners - center) * _TEXTURE_INTERIOR_SHRINK
-    mask = np.zeros(frame.shape[:2], dtype=np.uint8)
-    cv2.fillPoly(mask, [shrunk.astype(np.int32)], 255)
-    eroded = cv2.erode(mask, np.ones((9, 9), np.uint8))
-    selected = eroded > 0
-
-    saturation = maps["saturation"][selected]
-    value = maps["value"][selected]
+        maps = _LazyTextureMaps(frame)
+    roi = _candidate_interior_roi(frame.shape, corners)
+    if roi is None:
+        return 0.0, 0.0, 0.0
+    ys, xs, selected = roi
+    saturation = maps["saturation"][ys, xs][selected]
+    value = maps["value"][ys, xs][selected]
     white_fraction = float(np.mean((saturation < 60) & (value > 180)))
-    laplacian_variance = float(np.var(maps["laplacian"][selected]))
-    edge_density = float(np.mean(maps["edges"][selected] > 0))
+    laplacian_variance = float(np.var(maps["laplacian"][ys, xs][selected]))
+    edge_density = float(np.mean(maps["edges"][ys, xs][selected] > 0))
     return white_fraction, edge_density, laplacian_variance
 
 
 def _texture_verdict(frame, corners, maps=None):
-    """Veredito do portão de textura para um candidato.
+    """Veredito do portão de textura com avaliação em curto-circuito.
 
-    "paper" quando o interior parece papel. "blank_maybe" quando o
-    candidato é branco o bastante, mas liso demais para afirmar papel.
-    None quando nem branco o bastante ele é.
+    1) Rejeita direto quando white_fraction < 0,5 (sem calcular
+       Laplaciano nem Canny).
+    2) Decide "blank_maybe" (< 30) ou "paper" (>= 200) só com o
+       Laplaciano (sem calcular Canny).
+    3) Só mede Canny na faixa intermediária 30 <= Laplaciano < 200.
+    Resultado 100% idêntico à avaliação completa.
     """
-    white_fraction, edge_density, laplacian_variance = _texture_features(
-        frame, corners, maps
-    )
+    if maps is None:
+        maps = _LazyTextureMaps(frame)
+    roi = _candidate_interior_roi(frame.shape, corners)
+    if roi is None:
+        return None
+    ys, xs, selected = roi
+    saturation = maps["saturation"][ys, xs][selected]
+    value = maps["value"][ys, xs][selected]
+    white_fraction = float(np.mean((saturation < 60) & (value > 180)))
     if white_fraction < _TEXTURE_MIN_WHITE_FRACTION:
         return None
-    textured = laplacian_variance >= _TEXTURE_MIN_LAPLACIAN_VARIANCE and (
-        edge_density >= _TEXTURE_MIN_EDGE_DENSITY
-        or laplacian_variance >= _TEXTURE_HIGH_LAPLACIAN_VARIANCE
+    laplacian_variance = float(np.var(maps["laplacian"][ys, xs][selected]))
+    if laplacian_variance < _TEXTURE_MIN_LAPLACIAN_VARIANCE:
+        return "blank_maybe"
+    if laplacian_variance >= _TEXTURE_HIGH_LAPLACIAN_VARIANCE:
+        return "paper"
+    edge_density = float(np.mean(maps["edges"][ys, xs][selected] > 0))
+    return (
+        "paper"
+        if edge_density >= _TEXTURE_MIN_EDGE_DENSITY
+        else "blank_maybe"
     )
-    return "paper" if textured else "blank_maybe"
 
 
 def detect_sheet(frame):
@@ -256,7 +324,7 @@ def detect_sheet_with_confidence(frame):
         if corners is None:
             continue
         if texture_maps is None:
-            texture_maps = _texture_maps(frame)
+            texture_maps = _LazyTextureMaps(frame)
         verdict = _texture_verdict(frame, corners, texture_maps)
         if verdict == "paper":
             return _refine_corners(frame, corners), "paper"
@@ -281,8 +349,8 @@ def detect_markers(frame):
     return found
 
 
-def warp_sheet(frame, corners, destination=None):
-    """Retifica a folha a partir de quatro cantos explícitos."""
+def perspective_matrix(corners, destination=None):
+    """Matriz de homografia 3x3 dos cantos da cena para a folha retificada."""
     src = np.asarray(corners, dtype=np.float32).reshape(4, 2)
     if destination is None:
         destination = [
@@ -292,7 +360,21 @@ def warp_sheet(frame, corners, destination=None):
             (0, config.PAPER_H),
         ]
     dst = np.asarray(destination, dtype=np.float32).reshape(4, 2)
-    matrix = cv2.getPerspectiveTransform(src, dst)
+    return cv2.getPerspectiveTransform(src, dst)
+
+
+def warp_points(points, corners, destination=None):
+    """Projeta pontos Nx2 do frame da câmera para o espaço retificado."""
+    pts = np.asarray(points, dtype=np.float32).reshape(-1, 1, 2)
+    if pts.size == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    matrix = perspective_matrix(corners, destination=destination)
+    return cv2.perspectiveTransform(pts, matrix).reshape(-1, 2)
+
+
+def warp_sheet(frame, corners, destination=None):
+    """Retifica a folha a partir de quatro cantos explícitos."""
+    matrix = perspective_matrix(corners, destination=destination)
     return cv2.warpPerspective(
         frame, matrix, (config.PAPER_W, config.PAPER_H)
     )

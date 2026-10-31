@@ -34,11 +34,12 @@ This must FAIL (exit 1, most probes failing). The sabotage rotates the homograph
 Python with OpenCV has no code-level formal verifier, so this checks the real code against generated inputs, exhaustively inside a bounded family:
 
 - Synthetic camera scenes of 1600x1200 px
-- 12 sheet placements: the selftest base pose, that pose with the sheet rotated in plane by 90, 180 and 270 degrees, and 8 convex quads with deterministic jitter up to 70 px (seed 20261028)
-- 9 ink probes (discs of radius 10) on a 3x3 grid in the usable area
+- 12 marker-mode sheet placements (`--markers`): the selftest base pose, that pose with the sheet rotated in plane by 90, 180 and 270 degrees, and 8 convex quads with deterministic jitter up to 70 px (seed 20261028)
+- 10 markerless sheet placements (default mode): the base pose, nested pose over a light desk mat, and the same 8 convex quads with deterministic jitter up to 70 px (seed 20261028)
+- 9 ink probes (discs of radius 10) on a 3x3 grid in the usable area (198 probes total across the 22 scenes)
 - Per probe: recovered centroid within 5 px of the drawn center, and at least 40 percent of the probe ink recovered in a 30 px window
 
-Not covered: real lighting, blur, partial marker occlusion, a real webcam, curved or folded paper, and anything outside the probe grid. A pass covers this scope, not the whole system. Last full run (2026-10-28): all 108 probes passed, worst centroid error 3.05 px. Under `--sabotage`, 96 of 108 probes failed.
+Not covered: real lighting, blur, partial corner/marker occlusion, a real webcam, curved or folded paper, and anything outside the probe grid. A pass covers this scope, not the whole system. Last full run (2026-10-30): all 198 probes passed, worst centroid error 3.05 px (2.43 px in markerless mode). Under `--sabotage`, 176 of 198 probes failed.
 
 ## Reading a failure
 
@@ -54,11 +55,11 @@ If the check uses a TLA+ model in the future, read every result with the pstack 
 
 ## Coverage record
 
-- `draw/paper.py`: `detect_markers`, `warp_paper` (homography from the four marker centers)
-- `draw/ink.py`: `extract_ink` (only as the readout that locates recovered probes)
+- `draw/paper.py`: `detect_markers`, `warp_paper`, `detect_sheet_with_confidence`, `_order_corners`, `warp_sheet`
+- `draw/ink.py`: `extract_ink` (both `clear_markers=True` and default markerless path with `_separable_veto`)
 - `draw/config.py`: `MARKER_IDS`, `MARKER_CENTERS`, `PAPER_W`, `PAPER_H`
-- `template/generate_template.py`: `build_template` (the printed sheet the scenes are built from)
-- Sync commit: `6bdfe891d837e8d7917d0051e016e3f53a6dc87f` (v0 as published at github.com/santleme/draw, remote HEAD confirmed 2026-10-28, checked against the local workspace copy)
+- `template/generate_template.py`: `build_template` (the printed sheet the marker scenes are built from)
+- Sync commit: `e0b8f360413c4b8cf33c8a462531f33234b8f38e` (updated 2026-10-30 on `arena/691b8788-draw` to cover both marker and markerless pipelines)
 
 When code listed above changes after the sync commit, this verification needs another look before its result means anything. Move the sync commit forward only after you confirm the verification describes the code at the new commit, and record the new worst centroid error here.
 
