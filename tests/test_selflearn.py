@@ -81,6 +81,7 @@ def test_recorder_writes_files_and_manifest_hash_matches(tmp_path):
     assert saved["session_id"] == "sess1"
     assert saved["model_sha"] == "abc123"
     assert saved["origin"] == "live"
+    assert saved["split"] == "train"
     assert saved["corners"] == corners
 
 

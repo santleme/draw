@@ -1,33 +1,36 @@
-"""Uma rodada de treino do loop que aprende sozinho (U5, fatia 1).
+"""Uma rodada auditável de treino do loop que aprende sozinho (U5).
 
-Estilo UniMatch V1 simplificado sobre a U-Net da page-clean
-(mesmas larguras: base 16, blocos duplos com BatchNorm):
+Estilo UniMatch V1 simplificado sobre a U-Net da page-clean:
 
-- Todo batch carrega paginas ROTULADAS (replay integral: a rodada
-  nunca treina so com pseudo-rotulo, que e a receita do vies de
-  confirmacao) com perda supervisionada BCE+Dice.
-- Paginas nao rotuladas: o teacher EMA gera a probabilidade na
-  vista fraca (flip + translacao de poucos px) e o pseudo-rotulo
-  passa pelo veto da testemunha classica
-  (draw/selflearn/teacher.py: pseudo_label): tinta prevista sem
-  escurecimento local e escurecimento que a rede nao viu vao para
-  ignore, nunca viram alvo de fundo nem de tinta. O aluno treina
-  na vista forte (a mesma geometria, com brilho, sombra e blur)
-  com a perda de consistencia mascarada por esse rotulo vetado.
-  Limitacao explicita: esta rodada ve uma passada por pagina
-  (K = 1, a "mediana" e a propria passada); a agregacao temporal
-  do teacher so atua onde ha passadas alinhadas da mesma pagina,
-  no caminho offline.
-- EMA com decay 0.999 atualizado a cada passo.
+- Todo batch carrega páginas ROTULADAS com perda supervisionada BCE+Dice.
+- O teacher EMA rotula a vista fraca; o aluno treina na vista forte com
+  pseudo-rótulos vetados pela testemunha clássica. Desacordo vira ignore.
+- O teacher usa EMA com rampa inicial e teto 0.999. Uma rodada posterior
+  deve carregar ``--init-checkpoint``; começar do zero exige a decisão
+  explícita ``--allow-random-init``.
+- Treino, não rotulados e holdout têm linhagem obrigatória. O holdout é
+  por sessão, independente e revisado; os guards de draw.selflearn.split
+  são executados tanto no CLI quanto dentro de ``run_round``.
+- O holdout só é avaliado DEPOIS do treino, no mosaico completo da
+  inferência e no threshold fixo de produção (0.7). Não escolhe época,
+  pesos nem limiar. A promoção continua em tools/selflearn/judge_gate.py.
+
+Formato de cada diretório:
+    input/<arquivo>.png
+    mask/<arquivo>.png             (labeled e holdout)
+    manifest.jsonl                 (uma linha por arquivo)
+
+O manifesto segue ExampleRecorder: ``file``, ``session_id``, ``origin`` e
+``split``. No holdout são obrigatórios ``origin=independent_label``,
+``label_source=final_minus_reference`` e ``label_reviewed=true``.
 
 Uso:
     python tools/selflearn/train_round.py --smoke
-    python tools/selflearn/train_round.py --labeled-dir D \
-        --unlabeled-dir U --out O --epochs 12
+    python tools/selflearn/train_round.py --labeled-dir D --unlabeled-dir U \
+        --holdout-dir H --init-checkpoint out/round_checkpoint.pt --out O
 
-O smoke gera um dataset sintetico minimo (paginas com tracos, GT
-exato), roda passos em CPU e afirma: a perda supervisionada caiu,
-os pesos EMA se moveram, o ONNX exporta e metrics.json existe.
+O smoke prova otimização, EMA, linhagem, avaliação e exportação num dataset
+sintético mínimo. Ele não é evidência de generalização no mundo real.
 """
 
 import argparse
@@ -45,13 +48,24 @@ from torch import nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from draw.selflearn.gate import MIN_HOLDOUT_PAGES, MIN_HOLDOUT_SESSIONS  # noqa: E402
+from draw.selflearn.split import (  # noqa: E402
+    HOLDOUT,
+    assert_no_leakage,
+    guard_holdout_example,
+    guard_pseudo_labeling,
+    guard_train_example,
+)
 from draw.selflearn.teacher import pseudo_label  # noqa: E402
 
 BASE = 16
 EMA_DECAY = 0.999
+EMA_WARMUP_STEPS = 10
 INK_THR = 0.9
 BG_THR = 0.1
 CONS_WEIGHT = 0.5
+EVAL_THRESHOLD = 0.7
+ONNX_MAX_ABS_DIFF = 1e-3
 
 
 class Block(nn.Module):
@@ -97,12 +111,63 @@ class UNet(nn.Module):
         return self.head(y)
 
 
-def supervised_loss(logits, target, valid=None):
-    """BCE+Dice supervisionada; `valid` (0/1) exclui pixels da perda.
+class PageExample:
+    """Página + linhagem mínima exigida pelos guards do loop."""
 
-    Pixels sem conteudo valido (a faixa descoberta por uma translacao
-    geometrica) nao sao fundo: sao ignorados, nao rotulados.
-    """
+    def __init__(self, image, mask, session_id, origin, file, split="train",
+                 label_source=None, label_reviewed=False):
+        self.image = image
+        self.mask = mask
+        self.session_id = session_id
+        self.origin = origin
+        self.file = file
+        self.split = split
+        self.label_source = label_source
+        self.label_reviewed = bool(label_reviewed)
+
+    def lineage(self):
+        return {
+            "session_id": self.session_id,
+            "origin": self.origin,
+            "file": self.file,
+            "split": self.split,
+            "label_source": self.label_source,
+            "label_reviewed": self.label_reviewed,
+        }
+
+
+def _guard_lineage(labeled, unlabeled, holdout, previous_holdout_ids=()):
+    if not labeled:
+        raise ValueError("nenhuma página rotulada")
+    if not holdout:
+        raise ValueError("holdout independente é obrigatório")
+    if previous_holdout_ids is None or isinstance(previous_holdout_ids, (str, bytes)) or any(
+        not isinstance(session_id, str) or not session_id
+        for session_id in previous_holdout_ids
+    ):
+        raise ValueError("sessões seladas do checkpoint precisam ser ids de texto")
+    for page in list(labeled) + list(unlabeled) + list(holdout):
+        if not isinstance(page, PageExample):
+            raise TypeError("run_round exige PageExample com linhagem")
+    holdout_ids = sorted(
+        {page.session_id for page in holdout} | set(previous_holdout_ids)
+    )
+    train_ids = [page.session_id for page in labeled]
+    unlabeled_ids = [page.session_id for page in unlabeled]
+    assert_no_leakage(train_ids + unlabeled_ids, holdout_ids)
+    for page in list(labeled) + list(unlabeled):
+        guard_train_example(page.lineage(), holdout_ids)
+    if unlabeled:
+        guard_pseudo_labeling(
+            [page.lineage() for page in unlabeled], holdout_ids
+        )
+    for page in holdout:
+        guard_holdout_example(page.lineage())
+    return sorted(set(holdout_ids))
+
+
+def supervised_loss(logits, target, valid=None):
+    """BCE+Dice supervisionada; `valid` (0/1) exclui pixels da perda."""
     pos_weight = torch.tensor(8.0, device=logits.device,
                               dtype=logits.dtype)
     p = torch.sigmoid(logits)
@@ -122,9 +187,7 @@ def supervised_loss(logits, target, valid=None):
 
 
 def shift_with_fill(arr, dy, dx, fill):
-    """Translacao inteira SEM wraparound: a faixa descoberta recebe
-    `fill`, em vez de pixels da borda oposta (np.roll e circular e
-    criava costura artificial conectando tracos separados)."""
+    """Translação inteira sem wraparound; a faixa descoberta recebe fill."""
     out = np.full(arr.shape, fill, dtype=arr.dtype)
     h, w = arr.shape[:2]
     ys0, ys1 = max(0, -dy), min(h, h - dy)
@@ -135,14 +198,12 @@ def shift_with_fill(arr, dy, dx, fill):
 
 
 def geo_valid_mask(shape, dy, dx):
-    """1 onde o pixel veio do conteudo original, 0 na faixa descoberta
-    pela translacao (flip nao muda a cobertura: espelha uns)."""
+    """1 onde o pixel veio do conteúdo original, 0 na faixa descoberta."""
     return shift_with_fill(np.ones(shape, dtype=np.float32), dy, dx, 0.0)
 
 
 def _background_estimate(img):
-    """Mediana dos pixels de borda: estimativa robusta do fundo da
-    pagina (a borda e dominada por fundo, mesmo com traco encostando)."""
+    """Mediana dos pixels de borda: estimativa robusta do fundo da página."""
     if img.ndim == 3:
         border = np.concatenate(
             [img[0], img[-1], img[:, 0], img[:, -1]], axis=0)
@@ -152,12 +213,7 @@ def _background_estimate(img):
 
 
 def geo_view(img, rng, flip=None, dx=None, dy=None, fill=None):
-    """Vista geometrica fraca: flip + translacao inteira pequena.
-
-    A translacao preenche a faixa descoberta com o fundo estimado da
-    imagem (ou `fill`, ex.: 0 numa mascara) — nunca com pixels
-    transportados da borda oposta.
-    """
+    """Vista geométrica fraca: flip + translação inteira pequena."""
     out = img
     if flip is None:
         flip = rng.random() < 0.5
@@ -189,19 +245,14 @@ def strong_view(img, rng):
     return np.clip(out, 0.0, 1.0)
 
 
-def consistency_targets(prob, weak_rgb):
-    """Alvo e peso da consistencia para uma pagina nao rotulada.
+def consistency_targets(prob, weak_bgr):
+    """Alvo/peso da consistência para uma página BGR não rotulada.
 
-    `prob`: mapa HxW de probabilidade do teacher EMA na vista fraca.
-    `weak_rgb`: a vista fraca, float 0..1 RGB.
-
-    Devolve (target, weight) float32 HxW: target 1 so onde o
-    pseudo-rotulo vetado diz tinta; weight 0 onde o veto manda
-    ignorar (tinta prevista sem escurecimento, escurecimento que a
-    rede nao viu, zona cinzenta). Discordancia nunca vira alvo.
+    Tinta prevista sem escurecimento e escurecimento não visto viram
+    ignore. A testemunha confirma escurecimento, não semântica: impresso,
+    pauta e sombra ainda exigem holdout independente e revisão humana.
     """
-    bgr = (np.clip(weak_rgb, 0.0, 1.0)[..., ::-1] * 255.0) \
-        .round().astype(np.uint8)
+    bgr = (np.clip(weak_bgr, 0.0, 1.0) * 255.0).round().astype(np.uint8)
     mask, ignore, _confidence = pseudo_label(
         prob, bgr, ink_thr=INK_THR, bg_thr=BG_THR)
     target = (mask > 0).astype(np.float32)
@@ -209,22 +260,78 @@ def consistency_targets(prob, weak_rgb):
     return target, weight
 
 
-def load_pages(root, with_mask):
+def _manifest_rows(root):
+    path = root / "manifest.jsonl"
+    if not path.is_file():
+        raise ValueError(
+            f"{root}: manifest.jsonl obrigatório para provar session_id/origem/split"
+        )
+    rows = {}
+    for line_number, line in enumerate(
+            path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        name = Path(row.get("file", "")).stem
+        if not name:
+            raise ValueError(f"{path}:{line_number}: linha sem file")
+        if name in rows:
+            raise ValueError(f"{path}: file duplicado no manifesto: {name}")
+        rows[name] = row
+    return rows
+
+
+def load_pages(root, with_mask, holdout=False, holdout_session_ids=()):
+    """Carrega páginas em BGR, como PageCleanInk, com linhagem obrigatória."""
     root = Path(root)
+    rows = _manifest_rows(root)
     pages = []
     for path in sorted((root / "input").glob("*.png")):
-        img = cv2.imread(str(path))
+        row = rows.get(path.stem)
+        if row is None:
+            raise ValueError(f"{path}: arquivo ausente do manifest.jsonl")
+        img = cv2.imread(str(path), cv2.IMREAD_COLOR)
         if img is None:
-            continue
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+            raise ValueError(f"imagem ilegível: {path}")
+        # Contrato do PageCleanInk: BGR / 255, sem conversão para RGB.
+        img = img.astype(np.float32) / 255.0
         mask = None
         if with_mask:
             mpath = root / "mask" / path.name
             raw = cv2.imread(str(mpath), cv2.IMREAD_GRAYSCALE)
             if raw is None:
-                continue
+                raise ValueError(f"máscara ausente/ilegível para {path}: {mpath}")
+            if raw.shape != img.shape[:2]:
+                raise ValueError(
+                    f"imagem/máscara com dimensões diferentes em {path}: "
+                    f"{img.shape[:2]} x {raw.shape[:2]}"
+                )
             mask = (raw > 127).astype(np.float32)
-        pages.append((img, mask))
+        metadata = dict(row)
+        metadata["file"] = path.stem
+        metadata.setdefault("split", HOLDOUT if holdout else "train")
+        if holdout:
+            metadata["split"] = HOLDOUT
+            guard_holdout_example(metadata)
+        else:
+            guard_train_example(metadata, holdout_session_ids)
+        page = PageExample(
+            img,
+            mask,
+            session_id=metadata["session_id"],
+            origin=metadata["origin"],
+            file=path.stem,
+            split=metadata["split"],
+            label_source=metadata.get("label_source"),
+            label_reviewed=metadata.get("label_reviewed") is True,
+        )
+        pages.append(page)
+    if not pages:
+        raise ValueError(f"nenhuma página encontrada em {root / 'input'}")
+    if not with_mask and not holdout:
+        guard_pseudo_labeling(
+            [page.lineage() for page in pages], holdout_session_ids
+        )
     return pages
 
 
@@ -240,133 +347,406 @@ def to_tensor(img):
     return torch.from_numpy(np.ascontiguousarray(img)).permute(2, 0, 1)
 
 
+def ema_decay_at_step(step, base=EMA_DECAY, warmup=EMA_WARMUP_STEPS):
+    """Rampa usual de Mean Teacher: evita ancorar a EMA em pesos aleatórios."""
+    if step < 0 or warmup < 1 or not 0.0 < base < 1.0:
+        raise ValueError("step/warmup/base de EMA inválidos")
+    return min(float(base), float(step + 1) / float(step + warmup))
+
+
+def _load_student_checkpoint(student, checkpoint, device):
+    try:
+        payload = torch.load(checkpoint, map_location=device, weights_only=True)
+    except TypeError:
+        payload = torch.load(checkpoint, map_location=device)
+    state = payload.get("student", payload) if isinstance(payload, dict) else payload
+    student.load_state_dict(state)
+    previous_holdout = (
+        payload.get("holdout_sessions_not_for_training", [])
+        if isinstance(payload, dict) and "student" in payload else []
+    )
+    if not isinstance(previous_holdout, (list, tuple)):
+        raise ValueError("holdout_sessions_not_for_training precisa ser uma lista")
+    return list(previous_holdout)
+
+
+def _mean3(values):
+    return float(np.mean(values[-3:])) if values else None
+
+
+def _mean_first3(values):
+    return float(np.mean(values[:3])) if values else None
+
+
+def predict_page_probability(model, page, device, patch=256):
+    """Inferência BGR em mosaico, com zero-padding igual a PageCleanInk."""
+    model.eval()
+    h, w = page.image.shape[:2]
+    tiles, positions = [], []
+    for y in range(0, h, patch):
+        for x in range(0, w, patch):
+            tile = page.image[y:y + patch, x:x + patch]
+            pad_h, pad_w = patch - tile.shape[0], patch - tile.shape[1]
+            if pad_h or pad_w:
+                tile = np.pad(tile, [(0, pad_h), (0, pad_w), (0, 0)])
+            tiles.append(to_tensor(tile))
+            positions.append((y, x))
+    result = np.zeros((h, w), dtype=np.float32)
+    with torch.no_grad():
+        for start in range(0, len(tiles), 16):
+            positions_group = positions[start:start + 16]
+            batch = torch.stack(tiles[start:start + 16]).to(device)
+            probs = torch.sigmoid(model(batch))[:, 0].cpu().numpy()
+            for index, (y, x) in enumerate(positions_group):
+                hh, ww = min(patch, h - y), min(patch, w - x)
+                result[y:y + hh, x:x + ww] = probs[index, :hh, :ww]
+    return result
+
+
+def binary_counts(pred, target):
+    """Contagens binárias + suporte de traço fino (largura aproximada <=3 px)."""
+    pred = np.asarray(pred, dtype=bool)
+    target = np.asarray(target, dtype=bool)
+    if pred.shape != target.shape:
+        raise ValueError("pred/target binários com formas diferentes")
+    tp = int(np.count_nonzero(pred & target))
+    fp = int(np.count_nonzero(pred & ~target))
+    fn = int(np.count_nonzero(~pred & target))
+    distance = cv2.distanceTransform(target.astype(np.uint8), cv2.DIST_L2, 3)
+    thin = target & (distance <= 1.5)
+    return {
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
+        "tn": int(np.count_nonzero(~pred & ~target)),
+        "thin_gt": int(np.count_nonzero(thin)),
+        "thin_tp": int(np.count_nonzero(pred & thin)),
+        "pixels": int(target.size),
+        "gt_ink": int(np.count_nonzero(target)),
+    }
+
+
+def _sum_counts(groups):
+    keys = ("tp", "fp", "fn", "tn", "thin_gt", "thin_tp", "pixels", "gt_ink")
+    return {key: sum(group[key] for group in groups) for key in keys}
+
+
+def _metrics_from_counts(counts):
+    tp, fp, fn = counts["tp"], counts["fp"], counts["fn"]
+    union = tp + fp + fn
+    precision_den, recall_den = tp + fp, tp + fn
+    return {
+        "iou": tp / union if union else 1.0,
+        "dice": (2 * tp / (2 * tp + fp + fn)) if (2 * tp + fp + fn) else 1.0,
+        "precision": (
+            1.0 if precision_den == 0 and recall_den == 0
+            else (tp / precision_den if precision_den else 0.0)
+        ),
+        "recall": (
+            1.0 if recall_den == 0 and precision_den == 0
+            else (tp / recall_den if recall_den else 0.0)
+        ),
+        "thin_ink_recall": (
+            counts["thin_tp"] / counts["thin_gt"] if counts["thin_gt"] else None
+        ),
+        "support": counts,
+    }
+
+
+def evaluate_holdout(model, pages, device, patch=256, threshold=EVAL_THRESHOLD):
+    """Avalia páginas seladas uma única vez, sem ajustar modelo ou threshold."""
+    page_reports, session_groups = [], {}
+    for page in pages:
+        prob = predict_page_probability(model, page, device, patch=patch)
+        target = page.mask > 0.5
+        pred = prob > threshold  # mesmo limiar estrito de PageCleanInk.ink_mask
+        counts = binary_counts(pred, target)
+        report = _metrics_from_counts(counts)
+        page_reports.append({
+            "file": page.file,
+            "session_id": page.session_id,
+            **{key: value for key, value in report.items() if key != "support"},
+            "support": counts,
+        })
+        session_groups.setdefault(page.session_id, []).append(counts)
+
+    total = _sum_counts([report["support"] for report in page_reports])
+    micro = _metrics_from_counts(total)
+    session_reports = {}
+    for session_id, groups in sorted(session_groups.items()):
+        session_reports[session_id] = _metrics_from_counts(_sum_counts(groups))
+    blank = [r["support"] for r in page_reports if r["support"]["gt_ink"] == 0]
+    blank_fp = sum(r["fp"] for r in blank)
+    blank_pixels = sum(r["pixels"] for r in blank)
+    sessions = sorted(session_groups)
+    worst_session = min(
+        sessions, key=lambda sid: session_reports[sid]["iou"]
+    )
+    candidate_real = {
+        "primary": float(np.mean([r["iou"] for r in page_reports])),
+        "worst_group": session_reports[worst_session]["iou"],
+        "holdout_sessions": len(sessions),
+        "holdout_pages": len(page_reports),
+    }
+    return {
+        "evaluation": "sealed_holdout_after_training_only",
+        "threshold": threshold,
+        "patch": patch,
+        "n_sessions": len(sessions),
+        "n_pages": len(page_reports),
+        "minimum_n_sufficient": (
+            len(sessions) >= MIN_HOLDOUT_SESSIONS
+            and len(page_reports) >= MIN_HOLDOUT_PAGES
+        ),
+        "minimum_n_required": {
+            "sessions": MIN_HOLDOUT_SESSIONS, "pages": MIN_HOLDOUT_PAGES
+        },
+        "micro": micro,
+        "macro_page_iou": candidate_real["primary"],
+        "worst_session": {"session_id": worst_session, **session_reports[worst_session]},
+        "sessions": session_reports,
+        "empty_pages": {
+            "count": len(blank),
+            "false_positive_px": blank_fp,
+            "false_positive_fraction": blank_fp / blank_pixels if blank_pixels else 0.0,
+        },
+        "pages": page_reports,
+        "candidate_real": candidate_real,
+    }
+
+
+def validate_round_onnx(model, onnx_path, dummy):
+    """Compara logits PyTorch/ONNX e testa também o lote dinâmico."""
+    try:
+        import onnxruntime as ort
+    except ImportError as exc:
+        return {"status": "skipped", "reason": str(exc)}
+    model.eval()
+    with torch.no_grad():
+        expected = model(dummy).detach().cpu().numpy()
+    try:
+        session = ort.InferenceSession(
+            str(onnx_path), providers=["CPUExecutionProvider"]
+        )
+        input_name = session.get_inputs()[0].name
+        actual = session.run(None, {input_name: dummy.numpy()})[0]
+        batch2 = session.run(None, {input_name: dummy.repeat(2, 1, 1, 1).numpy()})[0]
+    except Exception as exc:  # noqa: BLE001 - relatório estruturado
+        return {"status": "failed", "error": str(exc)}
+    max_diff = float(np.max(np.abs(expected - actual)))
+    dynamic_ok = batch2.shape[0] == 2 and batch2.shape[1:] == actual.shape[1:]
+    ok = expected.shape == actual.shape and max_diff <= ONNX_MAX_ABS_DIFF and dynamic_ok
+    return {
+        "status": "ok" if ok else "degraded",
+        "max_abs_diff": max_diff,
+        "max_abs_diff_tolerance": ONNX_MAX_ABS_DIFF,
+        "dynamic_batch_ok": bool(dynamic_ok),
+        "torch_shape": list(expected.shape),
+        "onnx_shape": list(actual.shape),
+    }
+
+
 def run_round(labeled, unlabeled, out_dir, steps, batch=4,
-              patch=256, lr=2e-3, seed=0, log=print):
+              patch=256, lr=2e-3, seed=0, log=print, holdout=None,
+              init_checkpoint=None, allow_random_init=False):
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
+    if steps < 3:
+        raise ValueError("steps >= 3 é necessário para as médias first3/last3")
+    holdout_ids = _guard_lineage(labeled, unlabeled, holdout or [])
+    if init_checkpoint is None and not allow_random_init:
+        raise ValueError(
+            "rodada fria recusada: use init_checkpoint ou allow_random_init explícito"
+        )
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log(f"device: {device}")
     student = UNet().to(device)
+    if init_checkpoint is not None:
+        previous_holdout_ids = _load_student_checkpoint(
+            student, init_checkpoint, device
+        )
+        holdout_ids = _guard_lineage(
+            labeled, unlabeled, holdout, previous_holdout_ids
+        )
+        log(f"warm start: {init_checkpoint}")
     teacher = copy.deepcopy(student)
     for p in teacher.parameters():
         p.requires_grad_(False)
     teacher.eval()
-    ema_init = {k: v.detach().clone()
-                for k, v in teacher.state_dict().items()}
+    ema_init = {k: v.detach().clone() for k, v in teacher.state_dict().items()}
     opt = torch.optim.Adam(student.parameters(), lr=lr)
 
-    sup_history = []
+    sup_history, cons_history, coverage_history, ink_history = [], [], [], []
+    decay_history = []
     t0 = time.time()
     for step in range(steps):
         imgs, targets, valids = [], [], []
         for _ in range(batch):
-            img, mask = labeled[int(rng.integers(0, len(labeled)))]
-            y, x, size = sample_patch(img, patch, rng)
-            img_p = img[y:y + size, x:x + size]
-            mask_p = mask[y:y + size, x:x + size]
+            page = labeled[int(rng.integers(0, len(labeled)))]
+            y, x, size = sample_patch(page.image, patch, rng)
+            img_p = page.image[y:y + size, x:x + size]
+            mask_p = page.mask[y:y + size, x:x + size]
             flip = rng.random() < 0.5
             dx = int(rng.integers(-3, 4))
             dy = int(rng.integers(-3, 4))
             img_g, _, _, _ = geo_view(img_p, rng, flip, dx, dy)
-            mask_g, _, _, _ = geo_view(mask_p, rng, flip, dx, dy,
-                                       fill=0.0)
+            mask_g, _, _, _ = geo_view(mask_p, rng, flip, dx, dy, fill=0.0)
             imgs.append(to_tensor(np.ascontiguousarray(img_g)))
-            targets.append(torch.from_numpy(
-                np.ascontiguousarray(mask_g))[None])
+            targets.append(torch.from_numpy(np.ascontiguousarray(mask_g))[None])
             valids.append(torch.from_numpy(
                 geo_valid_mask(mask_p.shape, dy, dx))[None])
         x_lab = torch.stack(imgs).to(device)
         y_lab = torch.stack(targets).to(device)
         v_lab = torch.stack(valids).to(device)
-        logits = student(x_lab)
-        loss_sup = supervised_loss(logits, y_lab, v_lab)
+        loss_sup = supervised_loss(student(x_lab), y_lab, v_lab)
 
         loss = loss_sup
+        loss_cons_value = None
+        coverage_value = None
+        ink_value = None
         if unlabeled:
             weak, strong, weak_np = [], [], []
             for _ in range(batch):
-                img, _ = unlabeled[int(rng.integers(0, len(unlabeled)))]
-                y, x, size = sample_patch(img, patch, rng)
-                img_p = img[y:y + size, x:x + size]
-                img_g, _, _, _ = geo_view(img_p, rng)
+                page = unlabeled[int(rng.integers(0, len(unlabeled)))]
+                y, x, size = sample_patch(page.image, patch, rng)
+                img_g, _, _, _ = geo_view(page.image[y:y + size, x:x + size], rng)
                 weak.append(to_tensor(np.ascontiguousarray(img_g)))
                 weak_np.append(np.ascontiguousarray(img_g))
                 strong.append(to_tensor(strong_view(img_g, rng)))
             x_weak = torch.stack(weak).to(device)
             x_strong = torch.stack(strong).to(device)
             with torch.no_grad():
-                probs = torch.sigmoid(teacher(x_weak))[:, 0] \
-                    .cpu().numpy()
-            targets, weights = [], []
+                probs = torch.sigmoid(teacher(x_weak))[:, 0].cpu().numpy()
+            targets_u, weights_u = [], []
             for i in range(batch):
                 t_i, w_i = consistency_targets(probs[i], weak_np[i])
-                targets.append(torch.from_numpy(t_i)[None])
-                weights.append(torch.from_numpy(w_i)[None])
-            target = torch.stack(targets).to(device)
-            weight = torch.stack(weights).to(device)
+                targets_u.append(torch.from_numpy(t_i)[None])
+                weights_u.append(torch.from_numpy(w_i)[None])
+            target_u = torch.stack(targets_u).to(device)
+            weight_u = torch.stack(weights_u).to(device)
             logits_s = student(x_strong)
             bce = F.binary_cross_entropy_with_logits(
-                logits_s, target, reduction="none")
-            loss_cons = (bce * weight).sum() / weight.sum().clamp(min=1)
+                logits_s, target_u, reduction="none")
+            loss_cons = (bce * weight_u).sum() / weight_u.sum().clamp(min=1)
             loss = loss + CONS_WEIGHT * loss_cons
+            loss_cons_value = float(loss_cons.detach())
+            coverage_value = float(weight_u.mean().detach())
+            ink_value = float((target_u * weight_u).sum().detach()) / max(
+                float(weight_u.sum().detach()), 1.0
+            )
 
-        opt.zero_grad()
+        opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
+        decay = ema_decay_at_step(step)
         with torch.no_grad():
-            for p_t, p_s in zip(teacher.parameters(),
-                                student.parameters()):
-                p_t.mul_(EMA_DECAY).add_(p_s.detach(),
-                                         alpha=1 - EMA_DECAY)
+            for p_t, p_s in zip(teacher.parameters(), student.parameters()):
+                p_t.mul_(decay).add_(p_s.detach(), alpha=1 - decay)
             for b_t, b_s in zip(teacher.buffers(), student.buffers()):
                 b_t.copy_(b_s)
         sup_history.append(float(loss_sup.detach()))
+        if loss_cons_value is not None:
+            cons_history.append(loss_cons_value)
+            coverage_history.append(coverage_value)
+            ink_history.append(ink_value)
+        decay_history.append(decay)
         if step % 10 == 0 or step == steps - 1:
+            cons_log = "n/a" if loss_cons_value is None else f"{loss_cons_value:.4f}"
+            cov_log = "n/a" if coverage_value is None else f"{coverage_value:.3f}"
             log(f"step {step}: sup {sup_history[-1]:.4f} "
-                f"total {float(loss.detach()):.4f}")
+                f"cons {cons_log} coverage {cov_log} ema {decay:.4f}")
 
     ema_changed = any(
         not torch.equal(ema_init[k], v)
-        for k, v in teacher.state_dict().items()
-        if v.dtype.is_floating_point)
+        for k, v in teacher.state_dict().items() if v.dtype.is_floating_point
+    )
 
+    # O holdout só aparece aqui: nunca seleciona checkpoint, threshold ou EMA.
+    holdout_metrics = evaluate_holdout(
+        student, holdout, device, patch=patch, threshold=EVAL_THRESHOLD
+    )
     student.eval()
     student.to("cpu")
+    checkpoint_path = out_dir / "round_checkpoint.pt"
+    torch.save({
+        "student": student.state_dict(),
+        "seed": seed,
+        "steps": steps,
+        "patch": patch,
+        "input_color_space": "BGR",
+        "holdout_sessions_not_for_training": holdout_ids,
+    }, checkpoint_path)
+
     onnx_path = out_dir / "page_clean_round.onnx"
     dummy = torch.zeros(1, 3, 256, 256)
-    torch.onnx.export(
-        student, dummy, str(onnx_path), input_names=["image"],
-        output_names=["logits"], opset_version=17, dynamo=False,
-        dynamic_axes={"image": {0: "n"}, "logits": {0: "n"}})
-    first = float(np.mean(sup_history[:3]))
-    last = float(np.mean(sup_history[-3:]))
+    try:
+        torch.onnx.export(
+            student, dummy, str(onnx_path), input_names=["image"],
+            output_names=["logits"], opset_version=17, dynamo=False,
+            dynamic_axes={"image": {0: "n"}, "logits": {0: "n"}})
+        onnx_check = validate_round_onnx(student, onnx_path, dummy)
+    except Exception as exc:  # noqa: BLE001 - preservar checkpoint e métricas
+        onnx_check = {"status": "failed", "error": str(exc)}
+    delivery_status = "validated" if onnx_check["status"] == "ok" else "blocked_onnx_validation"
     metrics = {
         "steps": steps,
-        "sup_loss_first3": first,
-        "sup_loss_last3": last,
+        "sup_loss_first3": _mean_first3(sup_history),
+        "sup_loss_last3": _mean3(sup_history),
+        "cons_loss_first3": _mean_first3(cons_history),
+        "cons_loss_last3": _mean3(cons_history),
+        "pseudo_label_coverage_first3": _mean_first3(coverage_history),
+        "pseudo_label_coverage_last3": _mean3(coverage_history),
+        "pseudo_label_ink_fraction_first3": _mean_first3(ink_history),
+        "pseudo_label_ink_fraction_last3": _mean3(ink_history),
+        "semi_supervised_effect_note": "comparar com uma rodada supervisionada equivalente; cobertura/loss não provam ganho causal",
         "ema_changed": bool(ema_changed),
-        "ema_decay": EMA_DECAY,
+        "ema_decay_base": EMA_DECAY,
+        "ema_decay_final": decay_history[-1],
+        "ema_warmup_steps": EMA_WARMUP_STEPS,
         "n_labeled": len(labeled),
         "n_unlabeled": len(unlabeled),
+        "labeled_sessions": sorted({page.session_id for page in labeled}),
+        "unlabeled_sessions": sorted({page.session_id for page in unlabeled}),
+        "sealed_holdout_sessions": holdout_ids,
+        "init_checkpoint": str(init_checkpoint) if init_checkpoint else None,
+        "random_init": init_checkpoint is None,
+        "input_color_space": "BGR",
+        "holdout": holdout_metrics,
+        "candidate_real": holdout_metrics["candidate_real"],
+        "checkpoint": checkpoint_path.name,
         "onnx": onnx_path.name,
+        "onnx_validation": onnx_check,
+        "delivery_status": delivery_status,
+        "promotion_status": "not_attempted_human_gate_required",
         "seconds": round(time.time() - t0, 1),
     }
-    (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
+    (out_dir / "metrics.json").write_text(
+        json.dumps(metrics, indent=2), encoding="utf-8"
+    )
+    (out_dir / "candidate_real.json").write_text(
+        json.dumps(holdout_metrics["candidate_real"], indent=2), encoding="utf-8"
+    )
     return metrics
 
 
-def make_synthetic(root, n_labeled=24, n_unlabeled=16, size=64, seed=1):
-    """Dataset minimo do smoke: paginas claras com tracos escuros."""
+def make_synthetic(root, n_labeled=24, n_unlabeled=16, n_holdout=8,
+                   size=64, seed=1):
+    """Dataset mínimo com sessões e manifestos para exercitar os guards."""
     rng = np.random.default_rng(seed)
     root = Path(root)
-    for split, count, with_mask in (("labeled", n_labeled, True),
-                                    ("unlabeled", n_unlabeled, False)):
+    splits = (
+        ("labeled", n_labeled, True),
+        ("unlabeled", n_unlabeled, False),
+        ("holdout", n_holdout, True),
+    )
+    for split, count, with_mask in splits:
         (root / split / "input").mkdir(parents=True, exist_ok=True)
         if with_mask:
             (root / split / "mask").mkdir(parents=True, exist_ok=True)
+        manifest = []
         for i in range(count):
             page = np.full((size, size, 3), 235, dtype=np.uint8)
             page = page + rng.integers(-6, 7, page.shape).astype(np.int16)
@@ -378,15 +758,34 @@ def make_synthetic(root, n_labeled=24, n_unlabeled=16, size=64, seed=1):
                 thick = int(rng.integers(1, 3))
                 cv2.line(page, (x0, y), (x1, y + int(rng.integers(-4, 5))),
                          (30, 30, 30), thick)
-            noise = page.astype(np.int16) \
-                + rng.integers(-8, 9, page.shape).astype(np.int16)
+            noise = page.astype(np.int16) + rng.integers(
+                -8, 9, page.shape).astype(np.int16)
             page = np.clip(noise, 0, 255).astype(np.uint8)
-            mask = (cv2.cvtColor(page, cv2.COLOR_BGR2GRAY) < 120) \
-                .astype(np.uint8) * 255
-            cv2.imwrite(str(root / split / "input" / f"p{i:03d}.png"), page)
+            mask = (cv2.cvtColor(page, cv2.COLOR_BGR2GRAY) < 120).astype(np.uint8) * 255
+            name = f"p{i:03d}"
+            cv2.imwrite(str(root / split / "input" / f"{name}.png"), page)
             if with_mask:
-                cv2.imwrite(str(root / split / "mask" / f"p{i:03d}.png"),
-                            mask)
+                cv2.imwrite(str(root / split / "mask" / f"{name}.png"), mask)
+            if split == "holdout":
+                row = {
+                    "session_id": f"holdout-s{i % 5}", "origin": "independent_label",
+                    "split": "holdout", "label_source": "final_minus_reference",
+                    "label_reviewed": True,
+                }
+            elif split == "labeled":
+                row = {
+                    "session_id": f"train-s{i % 4}", "origin": "human_correction",
+                    "split": "train",
+                }
+            else:
+                row = {
+                    "session_id": f"unlabeled-s{i % 4}", "origin": "collected_unlabeled",
+                    "split": "train",
+                }
+            manifest.append({"file": name, **row})
+        (root / split / "manifest.jsonl").write_text(
+            "".join(json.dumps(row) + "\n" for row in manifest), encoding="utf-8"
+        )
     return root
 
 
@@ -395,6 +794,9 @@ def main(argv=None):
     ap.add_argument("--smoke", action="store_true")
     ap.add_argument("--labeled-dir")
     ap.add_argument("--unlabeled-dir")
+    ap.add_argument("--holdout-dir")
+    ap.add_argument("--init-checkpoint")
+    ap.add_argument("--allow-random-init", action="store_true")
     ap.add_argument("--out", default="selflearn_round_out")
     ap.add_argument("--epochs", type=int, default=12)
     ap.add_argument("--steps-per-epoch", type=int, default=50)
@@ -404,30 +806,50 @@ def main(argv=None):
         import tempfile
         tmp = Path(tempfile.mkdtemp(prefix="selflearn_smoke_"))
         data = make_synthetic(tmp / "data")
-        labeled = load_pages(data / "labeled", with_mask=True)
-        unlabeled = load_pages(data / "unlabeled", with_mask=False)
-        metrics = run_round(labeled, unlabeled, tmp / "out", steps=60,
-                            batch=4, patch=64, seed=0)
+        holdout = load_pages(data / "holdout", with_mask=True, holdout=True)
+        holdout_ids = [page.session_id for page in holdout]
+        labeled = load_pages(
+            data / "labeled", with_mask=True, holdout_session_ids=holdout_ids
+        )
+        unlabeled = load_pages(
+            data / "unlabeled", with_mask=False, holdout_session_ids=holdout_ids
+        )
+        metrics = run_round(
+            labeled, unlabeled, tmp / "out", steps=60, batch=4, patch=64,
+            seed=0, holdout=holdout, allow_random_init=True,
+        )
         print(json.dumps(metrics, indent=2))
         assert metrics["sup_loss_last3"] < metrics["sup_loss_first3"], \
-            "perda supervisionada nao caiu no smoke"
-        assert metrics["ema_changed"], "pesos EMA nao se moveram"
+            "perda supervisionada não caiu no smoke"
+        assert metrics["ema_changed"], "pesos EMA não se moveram"
+        assert metrics["holdout"]["n_pages"] == 8
+        assert metrics["pseudo_label_coverage_last3"] is not None
         assert (tmp / "out" / "page_clean_round.onnx").exists()
+        assert metrics["delivery_status"] == "validated", metrics["onnx_validation"]
         print("PASS")
         return 0
 
-    if not args.labeled_dir:
-        ap.error("--labeled-dir e obrigatorio fora do smoke")
-    labeled = load_pages(args.labeled_dir, with_mask=True)
+    if not args.labeled_dir or not args.holdout_dir:
+        ap.error("--labeled-dir e --holdout-dir são obrigatórios fora do smoke")
+    if not args.init_checkpoint and not args.allow_random_init:
+        ap.error("use --init-checkpoint ou autorize --allow-random-init explicitamente")
+    holdout = load_pages(args.holdout_dir, with_mask=True, holdout=True)
+    holdout_ids = [page.session_id for page in holdout]
+    labeled = load_pages(
+        args.labeled_dir, with_mask=True, holdout_session_ids=holdout_ids
+    )
     unlabeled = []
     if args.unlabeled_dir:
-        unlabeled = load_pages(args.unlabeled_dir, with_mask=False)
-    if not labeled:
-        ap.error("nenhuma pagina rotulada encontrada")
-    metrics = run_round(labeled, unlabeled, args.out,
-                        steps=args.epochs * args.steps_per_epoch)
+        unlabeled = load_pages(
+            args.unlabeled_dir, with_mask=False, holdout_session_ids=holdout_ids
+        )
+    metrics = run_round(
+        labeled, unlabeled, args.out, steps=args.epochs * args.steps_per_epoch,
+        holdout=holdout, init_checkpoint=args.init_checkpoint,
+        allow_random_init=args.allow_random_init,
+    )
     print(json.dumps(metrics, indent=2))
-    return 0
+    return 0 if metrics["delivery_status"] == "validated" else 3
 
 
 if __name__ == "__main__":

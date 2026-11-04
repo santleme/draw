@@ -31,7 +31,7 @@ class ExampleRecorder:
         self._count = 0
 
     def record(self, session_id, warped_bgr, prob, corners,
-               model_sha, origin):
+               model_sha, origin, split="train"):
         """Grava um exemplo e retorna a linha do manifesto (dict).
 
         O nome combina sessao, instante, contador e um sufixo
@@ -90,6 +90,7 @@ class ExampleRecorder:
             "sha256": hashlib.sha256(image_bytes).hexdigest(),
             "model_sha": model_sha,
             "origin": origin,
+            "split": split,
             "corners": np.asarray(corners, dtype=float).tolist(),
         }
         with open(self.manifest_path, "a") as f:

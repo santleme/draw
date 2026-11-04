@@ -68,6 +68,14 @@ INK = 3
 
 CLASSES = {0: "background", 1: "paper", 2: "hand", 3: "ink"}
 
+# A cópia FreiHAND documentada tem 32.560 mãos base e quatro variantes
+# de fundo por mão, gravadas em blocos de 32.560 arquivos. O id do arquivo
+# identifica a variante; o split precisa usar o id base (módulo), nunca o
+# nome do arquivo sozinho. As máscaras JPEG têm ringing na borda e a regra
+# de referência é binarizar em 127, não aceitar qualquer valor não zero.
+FREIHAND_BASE_HAND_COUNT = 32_560
+HAND_MASK_THRESHOLD = 127
+
 PAPER_STYLES = ["white", "yellowed", "ruled", "notebook"]
 BACKGROUND_SOURCES = [
     "table_wood",
@@ -112,6 +120,29 @@ class HandSource:
     rgb: np.ndarray  # BGR, HxWx3
     mask: np.ndarray  # uint8, 0/255
     placeholder: bool = False
+    # Uma mão base pode ter vários arquivos/backgrounds. Todos ficam no
+    # mesmo split; para fontes sem variantes, base_id == source_id.
+    base_id: str | None = None
+
+    @property
+    def split_id(self) -> str:
+        return self.base_id or self.source_id
+
+
+def freihand_base_id(source_id: str) -> str:
+    """Id da mão base no layout FreiHAND de quatro blocos de variantes.
+
+    Ids não numéricos (mãos placeholder ou fontes já agrupadas) permanecem
+    inalterados. Para o FreiHAND direto, ``00032560.jpg`` é outra variante
+    de ``00000000.jpg`` e precisa cair no mesmo split.
+    """
+    try:
+        index = int(source_id)
+    except ValueError:
+        return source_id
+    if index < 0:
+        raise ValueError(f"hand source_id numérico negativo: {source_id!r}")
+    return f"{index % FREIHAND_BASE_HAND_COUNT:08d}"
 
 
 def synthetic_hand_sources(count: int = 5) -> list[HandSource]:
@@ -160,7 +191,9 @@ def load_hands(hands_dir: str | Path | None) -> list[HandSource]:
     * ``<nome>.png`` + ``<nome>_mask.png`` no mesmo diretório;
     * ``rgb/<nome>.png`` + ``mask/<nome>.png``;
     * ``<nome>_rgb.png`` + ``<nome>_mask.png``.
-    Máscara: qualquer canal > 0 vira 255. Retorna [] se não houver nada.
+    Máscara: canal > 127 vira 255 (artefatos JPEG 1..127 não viram mão).
+    Variantes FreiHAND da mesma mão base compartilham ``base_id``. Retorna
+    [] se não houver nenhum par utilizável.
     """
     if not hands_dir:
         return []
@@ -189,8 +222,15 @@ def load_hands(hands_dir: str | Path | None) -> list[HandSource]:
         mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
         if rgb is None or mask is None:
             continue
-        mask = (mask > 0).astype(np.uint8) * 255
-        found[stem] = HandSource(stem, rgb, mask, placeholder=False)
+        if rgb.shape[:2] != mask.shape[:2]:
+            raise ValueError(
+                f"RGB e máscara de mão com dimensões diferentes em {path}: "
+                f"{rgb.shape[:2]} x {mask.shape[:2]}"
+            )
+        mask = (mask > HAND_MASK_THRESHOLD).astype(np.uint8) * 255
+        found[stem] = HandSource(
+            stem, rgb, mask, placeholder=False, base_id=freihand_base_id(stem)
+        )
     return [found[k] for k in sorted(found)]
 
 
@@ -225,6 +265,32 @@ def split_sources(
         "val": ids[n_train : n_train + n_val],
         "test": ids[n_train + n_val :],
     }
+
+
+def split_hand_sources(hands: list[HandSource], seed: int):
+    """Split por mão base, mantendo todas as suas variantes juntas.
+
+    Retorna ``(variant_splits, base_splits)``: o primeiro alimenta a
+    geração das cenas; o segundo vai ao manifesto para auditoria de
+    vazamento. Dois ids de arquivo diferentes nunca bastam para provar
+    que as mãos são diferentes.
+    """
+    grouped: dict[str, list[str]] = {}
+    source_ids = [hand.source_id for hand in hands]
+    if len(source_ids) != len(set(source_ids)):
+        raise ValueError("hand source_id duplicado")
+    for hand in hands:
+        grouped.setdefault(hand.split_id, []).append(hand.source_id)
+    base_splits = split_sources(sorted(grouped), seed)
+    variant_splits = {
+        split: [
+            source_id
+            for base_id in base_splits[split]
+            for source_id in sorted(grouped[base_id])
+        ]
+        for split in ("train", "val", "test")
+    }
+    return variant_splits, base_splits
 
 
 # ---------------------------------------------------------------- papel
@@ -498,6 +564,7 @@ def compose_scene(
         "paper_style": paper_style if scene_type not in ("empty_table", "hand_no_sheet", "white_object") else None,
         "background_source": background_source,
         "hand_source": hand.source_id if hand else None,
+        "hand_base_source": hand.split_id if hand else None,
         "hand_placeholder": bool(hand.placeholder) if hand else False,
         "hand_placement": None,
         "has_valid_sheet": False,
@@ -599,9 +666,9 @@ def generate_dataset(
     hands = load_hands(hands_dir)
     if not hands:
         hands = synthetic_hand_sources()
-    hand_ids = [h.source_id for h in hands]
+    hand_splits, hand_base_splits = split_hand_sources(hands, seed)
     splits = {
-        "hands": split_sources(hand_ids, seed),
+        "hands": hand_splits,
         "papers": split_sources(PAPER_SOURCES, seed + 1),
         "backgrounds": split_sources(BACKGROUND_SOURCES, seed + 2),
     }
@@ -611,6 +678,8 @@ def generate_dataset(
         "image_size": SIZE,
         "classes": {str(k): v for k, v in CLASSES.items()},
         "splits": splits,
+        "hand_base_splits": hand_base_splits,
+        "hand_mask_threshold": HAND_MASK_THRESHOLD,
         "scenes": [],
         "notes": (
             "ink_full is NOT a training class. hand_placeholder=true means "

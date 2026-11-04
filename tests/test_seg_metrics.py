@@ -253,6 +253,28 @@ def _install_fake_torch_and_ort(onnx_logits, monkeypatch):
     return _DummyModel(), "dummy.onnx"
 
 
+def test_onnx_input_moves_torch_like_cuda_tensor_through_cpu():
+    calls = []
+    expected = np.zeros((1, 4, 2, 2), dtype=np.float32)
+
+    class CudaLikeTensor:
+        def detach(self):
+            calls.append("detach")
+            return self
+
+        def cpu(self):
+            calls.append("cpu")
+            return self
+
+        def numpy(self):
+            calls.append("numpy")
+            return expected
+
+    actual = validate_onnx._as_onnx_input(CudaLikeTensor())
+    assert actual is expected
+    assert calls == ["detach", "cpu", "numpy"]
+
+
 def test_validate_onnx_dummy_identical_is_ok(monkeypatch):
     mask = _mask_with_all_classes()
     logits = _logits_from_mask(mask)
@@ -332,17 +354,18 @@ def test_fake_modules_do_not_leak_into_sys_modules():
 
 def test_validate_onnx_skipped_without_libraries(monkeypatch):
     # Sem torch/ort instalados de verdade, o relatório é skipped,
-    # nunca "ok" falso. Remove os fakes caso outro teste os tenha posto.
-    monkeypatch.delitem(sys.modules, "torch", raising=False)
-    monkeypatch.delitem(sys.modules, "onnxruntime", raising=False)
-    # Se o ambiente tiver torch de verdade, este teste não se aplica;
-    # nesse caso, pular em vez de falhar por causa do ambiente.
+    # nunca "ok" falso. Se torch existir, detecta antes de removê-lo de
+    # sys.modules: reimportá-lo depois disso registra namespaces nativos
+    # duas vezes em versões recentes.
     try:
         import torch  # noqa: F401
     except ImportError:
         pass
     else:
         pytest.skip("torch instalado neste ambiente; skipped não se aplica")
+    # Remove os fakes caso outro teste os tenha posto.
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
+    monkeypatch.delitem(sys.modules, "onnxruntime", raising=False)
     report = validate_onnx.validate_onnx(object(), "dummy.onnx", np.zeros((1, 4, 2, 2)))
     assert report["status"] == "skipped"
     assert report["degraded"] is None

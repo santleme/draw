@@ -105,12 +105,63 @@ def pair_images_masks(split_dir):
                 continue
             mask_path = split_dir / (img_path.stem + "_mask.png")
             if not mask_path.exists():
-                continue
+                raise FileNotFoundError(f"máscara ausente para {img_path}")
             ink_full = split_dir / (img_path.stem + "_ink_full.png")
             pairs.append((img_path, mask_path, ink_full if ink_full.exists() else None))
     if not pairs:
         raise ValueError(f"nenhum par imagem/máscara em {split_dir}")
     return pairs
+
+
+def _assert_disjoint_source_splits(named_splits, context):
+    """Rejeita uma mesma fonte em train/val/test de um manifesto."""
+    split_sets = {
+        split: set(named_splits.get(split, []))
+        for split in ("train", "val", "test")
+    }
+    for left, right in (("train", "val"), ("train", "test"), ("val", "test")):
+        overlap = split_sets[left] & split_sets[right]
+        if overlap:
+            sample = sorted(overlap)[:5]
+            raise ValueError(
+                f"vazamento de fontes no manifesto ({context}, {left}/{right}): {sample}"
+            )
+
+
+def validate_split_manifest(manifest):
+    """Valida os formatos de split emitidos pelo gerador do Draw.
+
+    ``splits`` guarda fonte -> split -> ids; ``hand_base_splits`` guarda
+    split -> ids das mãos base. Manifestos antigos que só listam os nomes
+    dos splits continuam aceitos, mas não recebem uma falsa aprovação de
+    conteúdo: o retorno registra quantas famílias foram verificadas.
+    """
+    if not isinstance(manifest, dict):
+        raise ValueError("split manifest precisa ser um objeto JSON")
+    checked = []
+    splits = manifest.get("splits")
+    if isinstance(splits, dict):
+        for kind, named_splits in splits.items():
+            if isinstance(named_splits, dict):
+                _assert_disjoint_source_splits(named_splits, str(kind))
+                checked.append(str(kind))
+    base_splits = manifest.get("hand_base_splits")
+    if isinstance(base_splits, dict):
+        _assert_disjoint_source_splits(base_splits, "hand_base_splits")
+        checked.append("hand_base_splits")
+    return {"checked_source_families": checked}
+
+
+def load_split_manifest(data_dir):
+    """Lê split_manifest.json ou o manifest.json nativo do gerador."""
+    root = Path(data_dir)
+    for name in ("split_manifest.json", "manifest.json"):
+        path = root / name
+        if path.is_file():
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+            validation = validate_split_manifest(manifest)
+            return manifest, path, validation
+    return None, None, {"checked_source_families": []}
 
 
 def validate_mask(mask):
@@ -218,14 +269,30 @@ def build_model(cfg):
     return model
 
 
-def build_dataset(data_dir, split, cfg, augment=False, extra_pairs=None):
-    """Dataset torch. Import lazy: sem torch, esta função não existe."""
+def build_dataset(
+    data_dir,
+    split,
+    cfg,
+    augment=False,
+    extra_pairs=None,
+    extra_sample_weight=1.0,
+    return_sample_weights=False,
+):
+    """Dataset torch. Import lazy: sem torch, esta função não existe.
+
+    ``extra_pairs`` pode receber um peso menor para propostas reais não
+    revisadas. O peso é por amostra e não altera validação nem teste.
+    """
     import torch
     from torch.utils.data import Dataset
 
     pairs = pair_images_masks(Path(data_dir) / split)
+    sample_weights = [1.0] * len(pairs)
     if extra_pairs:
+        if not 0.0 < float(extra_sample_weight) <= 1.0:
+            raise ValueError("extra_sample_weight precisa estar em (0, 1]")
         pairs.extend(extra_pairs)
+        sample_weights.extend([float(extra_sample_weight)] * len(extra_pairs))
     size = cfg["model"]["input"]["height"]
     aug = None
     if augment:
@@ -273,6 +340,11 @@ def build_dataset(data_dir, split, cfg, augment=False, extra_pairs=None):
             img_path, mask_path, _ = pairs[i]
             image = load_image_rgb(img_path)
             mask = load_mask(mask_path)
+            if image.shape[:2] != mask.shape[:2]:
+                raise ValueError(
+                    f"imagem/máscara com dimensões diferentes em {img_path}: "
+                    f"{image.shape[:2]} x {mask.shape[:2]}"
+                )
             if aug is not None:
                 out = aug(image=image, mask=mask)
                 image, mask = out["image"], out["mask"]
@@ -281,16 +353,30 @@ def build_dataset(data_dir, split, cfg, augment=False, extra_pairs=None):
             image = image.astype(np.float32) / 255.0
             image = (image - IMAGENET_MEAN) / IMAGENET_STD
             image = np.transpose(image, (2, 0, 1))
-            return (
-                torch.from_numpy(image),
-                torch.from_numpy(mask.astype(np.int64)),
-            )
+            image_tensor = torch.from_numpy(image)
+            mask_tensor = torch.from_numpy(mask.astype(np.int64))
+            if return_sample_weights:
+                return image_tensor, mask_tensor, float(sample_weights[i])
+            return image_tensor, mask_tensor
 
     return SegDataset()
 
 
-def combined_loss(logits, target, class_weights, ce_weight=0.5, dice_weight=0.5):
-    """CE ponderada + Dice multiclasse; target=255 não supervisiona o pixel."""
+def combined_loss(
+    logits,
+    target,
+    class_weights,
+    ce_weight=0.5,
+    dice_weight=0.5,
+    sample_weights=None,
+):
+    """CE ponderada + Dice multiclasse; target=255 não supervisiona o pixel.
+
+    Sem ``sample_weights`` preserva a redução original do treino. Com ela,
+    calcula CE+Dice por imagem e faz a média ponderada das amostras válidas;
+    é o caminho usado para reduzir a influência de pseudo-rótulos reais não
+    revisados sem alterar os pixels sintéticos supervisionados.
+    """
     import torch
     import torch.nn.functional as F
 
@@ -300,7 +386,23 @@ def combined_loss(logits, target, class_weights, ce_weight=0.5, dice_weight=0.5)
         # produz gradiente zero quando o lote inteiro foi deliberadamente ignorado.
         return logits.sum() * 0.0
 
-    ce = F.cross_entropy(logits, target, weight=class_weights, ignore_index=IGNORE_INDEX)
+    if sample_weights is None:
+        ce = F.cross_entropy(
+            logits, target, weight=class_weights, ignore_index=IGNORE_INDEX
+        )
+    else:
+        ce_map = F.cross_entropy(
+            logits,
+            target,
+            weight=class_weights,
+            ignore_index=IGNORE_INDEX,
+            reduction="none",
+        )
+        safe_target = target.clamp(min=0, max=NUM_CLASSES - 1)
+        pixel_weights = class_weights[safe_target] * valid
+        ce = (ce_map * valid).reshape(target.shape[0], -1).sum(dim=1) / (
+            pixel_weights.reshape(target.shape[0], -1).sum(dim=1).clamp(min=1e-12)
+        )
     prob = torch.softmax(logits, dim=1)
     valid_flat = valid.reshape(target.shape[0], -1)
     sample_is_valid = valid_flat.any(dim=1)
@@ -312,11 +414,18 @@ def combined_loss(logits, target, class_weights, ce_weight=0.5, dice_weight=0.5)
         inter = (p * t).sum(dim=1)
         dice = dice + (1.0 - (2 * inter + 1e-6) / (p.sum(dim=1) + t.sum(dim=1) + 1e-6))
     dice = dice / NUM_CLASSES
-    # Correção do reteste no Kaggle: sem esta média, dice tem shape [batch]
-    # e loss.backward() falha com "grad can be implicitly created only
-    # for scalar outputs". A loss tem que ser escalar.
-    dice = dice[sample_is_valid].mean()
-    return ce_weight * ce + dice_weight * dice
+    if sample_weights is None:
+        # A loss precisa ser escalar inclusive com acumulação de gradiente.
+        return ce_weight * ce + dice_weight * dice[sample_is_valid].mean()
+
+    per_sample = ce_weight * ce + dice_weight * dice
+    weights = torch.as_tensor(sample_weights, dtype=logits.dtype, device=logits.device)
+    if weights.shape != (target.shape[0],):
+        raise ValueError("sample_weights precisa ter um valor por imagem do batch")
+    if bool((weights <= 0).any()):
+        raise ValueError("sample_weights precisa ser estritamente positivo")
+    weights = weights * sample_is_valid
+    return (per_sample * weights).sum() / weights.sum().clamp(min=1e-12)
 
 
 def warmup_cosine_scheduler(optimizer, total_steps, warmup_ratio):
@@ -370,7 +479,13 @@ def train_one_epoch(
     accumulation_steps = max(int(accumulation_steps), 1)
     num_batches = len(loader)
     optimizer.zero_grad(set_to_none=True)
-    for batch_index, (images, masks) in enumerate(loader):
+    for batch_index, batch in enumerate(loader):
+        if len(batch) == 3:
+            images, masks, sample_weights = batch
+            sample_weights = sample_weights.to(device)
+        else:
+            images, masks = batch
+            sample_weights = None
         images, masks = images.to(device), masks.to(device)
         device_type = torch.device(device).type
         with torch.autocast(
@@ -383,7 +498,9 @@ def train_one_epoch(
                 logits = F.interpolate(
                     logits, size=masks.shape[-2:], mode="bilinear", align_corners=False
                 )
-            loss = combined_loss(logits, masks, class_weights)
+            loss = combined_loss(
+                logits, masks, class_weights, sample_weights=sample_weights
+            )
         group_start = (batch_index // accumulation_steps) * accumulation_steps
         group_size = min(accumulation_steps, num_batches - group_start)
         scaled_loss = loss / group_size
@@ -414,10 +531,19 @@ def train_one_epoch(
     return total / n
 
 
-def evaluate(model, loader, device):
-    """Avalia todo o loader usando as métricas compartilhadas do projeto."""
+def evaluate(model, loader, device, target_loader=None):
+    """Avalia todo o loader usando as métricas compartilhadas do projeto.
+
+    ``target_loader`` permite rodar a rede numa resolução (ex.: 256) e
+    avaliar os logits na resolução do ground truth de referência (ex.: 512).
+    Assim, ablações de resolução compartilham o mesmo canvas e a mesma
+    tolerância física de tinta. Os dois loaders precisam ter a mesma ordem,
+    batch size e quantidade de lotes.
+    """
     import torch
 
+    if target_loader is not None and len(loader) != len(target_loader):
+        raise ValueError("loader de entrada e target_loader com tamanhos diferentes")
     model.eval()
     confusion = np.zeros((NUM_CLASSES, NUM_CLASSES), dtype=np.int64)
     supervised_px, ignored_px = 0, 0
@@ -425,8 +551,15 @@ def evaluate(model, loader, device):
         radius: {"pred_ink": 0, "gt_ink": 0, "matched_pred": 0, "matched_gt": 0}
         for radius in (2, 3)
     }
+    iterator = zip(loader, target_loader) if target_loader is not None else loader
     with torch.no_grad():
-        for images, masks in loader:
+        for batch in iterator:
+            if target_loader is not None:
+                (images, input_masks), (_, masks) = batch
+                if input_masks.shape[0] != masks.shape[0]:
+                    raise ValueError("batches de entrada e referência fora de ordem")
+            else:
+                images, masks = batch
             images = images.to(device)
             logits = model(pixel_values=images).logits
             if logits.shape[-2:] != masks.shape[-2:]:
@@ -531,6 +664,12 @@ def export_onnx(model, out_path, cfg):
         dynamo=False,
     )
     return out_path
+
+
+def onnx_delivery_status(report):
+    """Status de entrega: somente uma comparação executada e aprovada libera."""
+    status = report.get("status") if isinstance(report, dict) else None
+    return "validated" if status == "ok" else "blocked_onnx_validation"
 
 
 def validate_onnx(model, onnx_path, loader, device, cfg):
@@ -646,7 +785,7 @@ def smoke(smoke_dir):
             )
         empty_probe = torch.nn.Identity()
         assert _make_onnx_dummy(empty_probe, 8).device.type == "cpu"
-        target_t = torch.from_numpy(pred[None].astype(np.int64))
+        target_t = torch.from_numpy(ignored_target[None].astype(np.int64))
         logits = torch.zeros((1, NUM_CLASSES, 64, 64), dtype=torch.float32, requires_grad=True)
         weights_t = torch.tensor(weights, dtype=torch.float32)
         loss = combined_loss(logits, target_t, weights_t)
@@ -680,8 +819,8 @@ def smoke(smoke_dir):
 
         images_t = torch.zeros((1, 3, 64, 64), dtype=torch.float32)
         eval_metrics = evaluate(_FixedModel(), [(images_t, target_t)], "cpu")
-        assert eval_metrics["ink"]["iou"] == 1.0, eval_metrics["ink"]
-        assert eval_metrics["ink"]["support_px"] == 36, eval_metrics["ink"]
+        assert eval_metrics["iou"]["ink"] == 1.0, eval_metrics
+        assert eval_metrics["support_px"]["ink"] == 36, eval_metrics
         assert eval_metrics["supervised_px"] == 64 * 64 - ignored, eval_metrics
         assert eval_metrics["ignored_px"] == ignored, eval_metrics
         try:
@@ -712,6 +851,17 @@ def main(argv=None):
         help="Diretório opcional com images/ e masks/ para adicionar ao treino sintético; val/test continuam em --data-dir.",
     )
     parser.add_argument("--out-dir", default="out")
+    parser.add_argument(
+        "--allow-unverified-real-train",
+        action="store_true",
+        help="Autoriza propostas reais não revisadas com peso reduzido; val/test continuam fora delas.",
+    )
+    parser.add_argument(
+        "--real-loss-weight",
+        type=float,
+        default=None,
+        help="Peso por amostra real extra na loss (padrão: loss.unverified_real_sample_weight).",
+    )
     parser.add_argument("--smoke", action="store_true", help="Smoke test sem GPU, sem treino.")
     parser.add_argument("--smoke-dir", default="/tmp/draw-smoke")
     parser.add_argument("--epochs", type=int, default=None)
@@ -721,6 +871,32 @@ def main(argv=None):
     cfg = load_config(args.config)
     if args.smoke:
         return smoke(args.smoke_dir)
+
+    real_manifest = None
+    real_labels_unverified = False
+    if args.real_train_dir:
+        real_manifest_path = Path(args.real_train_dir) / "dataset_manifest.json"
+        if real_manifest_path.is_file():
+            real_manifest = json.loads(real_manifest_path.read_text(encoding="utf-8"))
+            review_text = " ".join(
+                str(real_manifest.get(key, ""))
+                for key in ("semantic_review_status", "label_status", "warning")
+            ).lower()
+            real_labels_unverified = (
+                "unverified" in review_text or "not ground truth" in review_text
+            )
+        if real_labels_unverified and not args.allow_unverified_real_train:
+            parser.error(
+                "o pacote real declara rótulos não revisados; revise as máscaras ou "
+                "passe --allow-unverified-real-train para usar peso reduzido"
+            )
+    real_loss_weight = (
+        args.real_loss_weight
+        if args.real_loss_weight is not None
+        else float(cfg["loss"].get("unverified_real_sample_weight", 0.25))
+    )
+    if not 0.0 < real_loss_weight <= 1.0:
+        parser.error("--real-loss-weight precisa estar em (0, 1]")
 
     import torch
     from torch.utils.data import DataLoader
@@ -736,6 +912,14 @@ def main(argv=None):
 
     out_dir = Path(args.out_dir)
     (out_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
+    split_manifest, split_manifest_path, split_validation = load_split_manifest(
+        args.data_dir
+    )
+    if split_manifest_path is not None:
+        print(
+            f"split manifest: {split_manifest_path} | famílias verificadas: "
+            f"{split_validation['checked_source_families']}"
+        )
     real_pairs = []
     if args.real_train_dir:
         real_root = Path(args.real_train_dir)
@@ -744,7 +928,13 @@ def main(argv=None):
         real_pairs = pair_images_masks(real_root)
     synthetic_train_pairs = pair_images_masks(Path(args.data_dir) / "train")
     train_ds = build_dataset(
-        args.data_dir, "train", cfg, augment=True, extra_pairs=real_pairs
+        args.data_dir,
+        "train",
+        cfg,
+        augment=True,
+        extra_pairs=real_pairs,
+        extra_sample_weight=real_loss_weight,
+        return_sample_weights=bool(real_pairs),
     )
     val_ds = build_dataset(args.data_dir, "val", cfg, augment=False)
     test_ds = build_dataset(args.data_dir, "test", cfg, augment=False)
@@ -760,6 +950,11 @@ def main(argv=None):
     print(f"pixels de treino por classe: {counts.tolist()}")
     print(f"pesos da config: {cfg['loss']['cross_entropy_class_weights']}")
     print(f"pesos calculados (referência): {[round(w, 2) for w in compute_class_weights(counts)]}")
+    if real_pairs:
+        print(
+            f"peso por amostra real na loss: {real_loss_weight} | "
+            f"não revisados: {real_labels_unverified}"
+        )
 
     model = build_model(cfg).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=tr["learning_rate"], weight_decay=tr["weight_decay"])
@@ -817,6 +1012,7 @@ def main(argv=None):
     final_metrics = evaluate(model, val_loader, device)
     final_metrics["test"] = evaluate(model, test_loader, device)
     final_metrics["onnx_validation"] = onnx_check
+    final_metrics["delivery_status"] = onnx_delivery_status(onnx_check)
     final_metrics["history"] = history
     final_metrics["train_pixel_counts"] = counts.tolist()
     final_metrics["train_source_counts"] = {
@@ -831,25 +1027,34 @@ def main(argv=None):
         "test_source": "synthetic --data-dir/test only; evaluated once after selecting best checkpoint",
         "mixed_precision_used": precision,
         "gradient_accumulation_steps": accumulation_steps,
+        "real_sample_loss_weight": real_loss_weight if real_pairs else None,
+        "real_labels_unverified": real_labels_unverified,
+        "real_dataset_manifest": real_manifest,
+        "split_manifest_validation": split_validation,
     }
 
     (out_dir / "classes.json").write_text(json.dumps(CLASSES, indent=2), encoding="utf-8")
     (out_dir / "metrics.json").write_text(json.dumps(final_metrics, indent=2), encoding="utf-8")
     (out_dir / "training_config.json").write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-    # split_manifest: cópia validada, se o gerador a forneceu.
-    manifest_src = Path(args.data_dir) / "split_manifest.json"
-    if manifest_src.exists():
-        split_manifest = json.loads(manifest_src.read_text(encoding="utf-8"))
-    else:
+    # split_manifest: cópia já validada no início, se o gerador a forneceu.
+    if split_manifest is None:
         split_manifest = {
-            "note": "split_manifest.json não fornecido pelo gerador; splits lidos das pastas train/val/test.",
+            "note": "manifesto não fornecido pelo gerador; splits lidos das pastas train/val/test sem certificação de fontes.",
             "splits": ["train", "val", "test"],
         }
+    split_manifest["validation"] = split_validation
     split_manifest["training_sources"] = cfg["data_sources"]
     (out_dir / "split_manifest.json").write_text(
         json.dumps(split_manifest, indent=2), encoding="utf-8"
     )
     print(f"ONNX: {onnx_path} | métricas: {out_dir / 'metrics.json'} | val_mean_iou: {final_metrics['mean_iou']:.4f}")
+    if final_metrics["delivery_status"] != "validated":
+        print(
+            f"ENTREGA BLOQUEADA: validação ONNX={onnx_check.get('status')}; "
+            "checkpoints e métricas foram preservados.",
+            file=sys.stderr,
+        )
+        return 3
     return 0
 
 

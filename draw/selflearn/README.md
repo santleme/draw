@@ -27,9 +27,11 @@ sessao ao vivo
      que a rede nao viu tambem vai para ignore
   -> [5 TREINO]   tools/selflearn/train_round.py: uma rodada com
      replay integral dos rotulados em todo batch, teacher EMA
-     (decay 0.999) rotulando a vista fraca, aluno na vista forte,
-     perda supervisionada BCE+Dice + consistencia mascarada pela
-     confianca. Exporta ONNX e metrics.json
+     (rampa inicial, teto 0.999) rotulando a vista fraca, aluno na
+     vista forte, perda supervisionada BCE+Dice + consistencia
+     mascarada pela confianca. Exige linhagem e holdout independente,
+     preserva warm start, avalia pagina inteira so ao final e exporta
+     ONNX + metrics.json + candidate_real.json. Ver docs/TREINO.md
 ```
 
 ## Modules
@@ -39,8 +41,9 @@ sessao ao vivo
 - `select.py` active learning queue with reasons per item (U2).
 - `teacher.py` temporal aggregation and pseudo-label with veto (U3).
 - `tools/selflearn/train_round.py` the training round (minimum U5).
-  `--smoke` proves the recipe on CPU with its own synthetic dataset:
-  supervised loss falls, EMA moves, ONNX exports.
+  `--smoke` exercises the recipe on CPU with its own synthetic dataset:
+  supervised loss falls, EMA moves, lineage/holdout guards run, and the
+  ONNX is checked against PyTorch. It is not real-world quality evidence.
 
 Tests: `tests/test_selflearn.py`.
 

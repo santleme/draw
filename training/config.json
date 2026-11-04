@@ -112,7 +112,9 @@
     ],
     "dice": "Dice multiclasse (média sobre as 4 classes, com smooth=1e-6). Dice complementa o CE porque mede sobreposição por classe, não só acerto por pixel, e é menos sensível ao domínio do fundo.",
     "formula": "loss = 0.5 * CrossEntropy_com_peso + 0.5 * DiceLoss_multiclasse",
-    "note": "Accuracy global NÃO é critério de parada nem de comparação: com fundo dominante, um modelo que só prevê fundo já teria accuracy alta e seria inútil."
+    "note": "Accuracy global NÃO é critério de parada nem de comparação: com fundo dominante, um modelo que só prevê fundo já teria accuracy alta e seria inútil.",
+    "unverified_real_sample_weight": 0.25,
+    "unverified_real_sample_weight_note": "Propostas reais não revisadas exigem --allow-unverified-real-train e entram com 0,25 do peso de uma amostra sintética supervisionada. O valor é conservador e registrado; não transforma pseudo-rótulo em ground truth nem substitui holdout real."
   },
   "metrics": {
     "fixed_scenarios": [

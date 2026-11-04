@@ -119,3 +119,44 @@ def test_two_hands_scene():
 def test_load_hands_empty_dir_returns_empty(tmp_path):
     assert gs.load_hands(tmp_path) == []
     assert gs.load_hands(None) == []
+
+
+def test_load_hands_uses_documented_jpeg_threshold(tmp_path):
+    (tmp_path / "rgb").mkdir()
+    (tmp_path / "mask").mkdir()
+    cv2.imwrite(str(tmp_path / "rgb" / "00000000.jpg"),
+                np.zeros((2, 6, 3), dtype=np.uint8))
+    values = np.array([[0, 1, 7, 126, 127, 128]], dtype=np.uint8)
+    cv2.imwrite(str(tmp_path / "mask" / "00000000.png"),
+                np.repeat(values, 2, axis=0))
+
+    hand = gs.load_hands(tmp_path)[0]
+
+    assert hand.mask[0].tolist() == [0, 0, 0, 0, 0, 255]
+    assert hand.base_id == "00000000"
+
+
+def test_freihand_variants_stay_in_the_same_split():
+    hands = []
+    for base in range(3):
+        for variant in range(4):
+            source_id = f"{base + variant * gs.FREIHAND_BASE_HAND_COUNT:08d}"
+            hands.append(gs.HandSource(
+                source_id,
+                np.zeros((2, 2, 3), dtype=np.uint8),
+                np.zeros((2, 2), dtype=np.uint8),
+                base_id=gs.freihand_base_id(source_id),
+            ))
+
+    variant_splits, base_splits = gs.split_hand_sources(hands, seed=42)
+    for base in range(3):
+        destinations = {
+            split for split, ids in variant_splits.items()
+            if f"{base:08d}" in ids
+        }
+        assert len(destinations) == 1
+        base_id = f"{base:08d}"
+        for variant in range(1, 4):
+            source_id = f"{base + variant * gs.FREIHAND_BASE_HAND_COUNT:08d}"
+            assert source_id in variant_splits[next(iter(destinations))]
+        assert base_id in base_splits[next(iter(destinations))]

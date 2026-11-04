@@ -126,12 +126,30 @@ def run_torch_model(model, dummy_input):
     return _as_logits_array(output)
 
 
+def _as_onnx_input(dummy_input):
+    """Converte ndarray ou tensor torch (CPU/CUDA) para NumPy em CPU.
+
+    A validação do treino roda o PyTorch no dispositivo do modelo, mas o
+    ONNX Runtime de referência roda em CPU. ``np.asarray(cuda_tensor)``
+    falha; o caminho correto é detach -> cpu -> numpy, sem alterar o
+    tensor usado pela execução PyTorch.
+    """
+    value = dummy_input
+    if hasattr(value, "detach"):
+        value = value.detach()
+    if hasattr(value, "cpu"):
+        value = value.cpu()
+    if hasattr(value, "numpy"):
+        value = value.numpy()
+    return np.asarray(value)
+
+
 def run_onnx_model(onnx_path, dummy_input):
     """Roda um modelo ONNX via ONNX Runtime e devolve ndarray.
 
-    ``dummy_input`` é um ndarray NumPy; o nome do input é lido do
-    próprio modelo (primeiro input da sessão). Levanta RuntimeError
-    claro se onnxruntime não estiver instalado.
+    ``dummy_input`` pode ser ndarray NumPy ou tensor torch em CPU/CUDA;
+    o nome do input é lido do próprio modelo (primeiro input da sessão).
+    Levanta RuntimeError claro se onnxruntime não estiver instalado.
     """
     try:
         import onnxruntime as ort
@@ -142,7 +160,7 @@ def run_onnx_model(onnx_path, dummy_input):
         ) from exc
     session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
     input_name = session.get_inputs()[0].name
-    outputs = session.run(None, {input_name: np.asarray(dummy_input)})
+    outputs = session.run(None, {input_name: _as_onnx_input(dummy_input)})
     return _as_logits_array(outputs[0])
 
 
