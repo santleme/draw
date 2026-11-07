@@ -473,7 +473,12 @@ def run(
 
     ink_worker = None
     if page_clean is not None:
-        ink_worker = _PageCleanWorker(page_clean).start()
+        ecc_hand_masker = (
+            hand_module.HandMasker(hand_model)
+            if not markers_mode and hand_module.hand_model_available(hand_model)
+            else None
+        )
+        ink_worker = _PageCleanWorker(page_clean, ecc_hand_masker).start()
         print(
             "Tinta em thread propria: o laco principal nao espera "
             "o modelo (passadas com cadencia de ~250 ms)."
