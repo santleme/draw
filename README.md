@@ -88,6 +88,7 @@ diagnostics, experiments, and custom models.
 | Flag | What it does |
 |---|---|
 | `--source N` or URL | Local webcam by index (default 0) or MJPEG stream by URL |
+| `--format a4\|a5\|a3\|carta\|caderno` | Portrait paper format, fixed for this session (`--format` > `DRAW_FORMAT` > `a4`) |
 | `--neural [model.onnx]` | Neural sheet detector with a custom model. Default: `models/draw_seg_v3_dyn.onnx` when present, else `DRAW_NEURAL_MODEL` |
 | `--page-clean [model.onnx]` | Page-clean ink model. Default: `models/page_clean_unet.onnx` when present, else `DRAW_PAGE_CLEAN_MODEL` |
 | `--legacy-ink` | The pre-neural ink stack (adaptive threshold heuristic, `--ink-model`, `--session-baseline`, `--hand-model`) instead of the page-clean model |
@@ -105,6 +106,33 @@ Keys inside the app:
 - `g` toggles automatic raw-frame capture (one frame every 10)
 - `c` sets a new session baseline (legacy stack, with `--session-baseline`)
 - `q` or `Esc` exits
+
+The default remains the incumbent **850×1200 A4** grid. Other formats
+use a 1200-pixel long edge and `round(1200 * width_mm / height_mm)`:
+A5 846×1200, A3 849×1200, Carta 929×1200, Caderno 873×1200.
+Only A4 is pinned; its legacy ratio/isotropy error is an explicit exception,
+not a relaxed tolerance for other formats. Pixel thresholds are unchanged:
+vertical density is about 4.04 px/mm for A4 and 4.30 px/mm for Carta (+6.5%).
+
+After 15 detected sheet quads, a one-time suggestion uses their
+corner-wise median and a pinhole homography (centered principal point,
+square pixels, zero skew). It reports a ratio class or abstains; it never
+changes the chosen format or estimates physical A-series size. Marker
+centers are not sheet-boundary quads, so marker mode explicitly abstains.
+Startup telemetry records format, grid and mm/px; `format_suggestion`
+is a separate event, including abstention reasons.
+
+For metric SVG/DXF export, pass the same format to the vector bridge:
+
+```bash
+python main.py --format carta
+python tools/export_vectors.py canvas.png --format carta --out-dir vector-out
+```
+
+The format-aware bridge reads its uniform mm/px from `draw.config`.
+Explicit `--paper-mm W H` remains a mutually exclusive legacy custom-size
+override. `tools/vectorize.py` is legacy and still has its own A4 constants;
+it is not format-aware and is unchanged.
 
 Environment variables set model paths (`DRAW_NEURAL_MODEL`,
 `DRAW_PAGE_CLEAN_MODEL`, `DRAW_INK_MODEL`, `DRAW_HAND_MODEL`) and

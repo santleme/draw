@@ -416,7 +416,7 @@ class InkAccumulator:
 
     def __init__(
         self,
-        shape=(config.PAPER_H, config.PAPER_W),
+        shape=None,
         window=15,
         enter=0.45,
         exit=0.20,
@@ -470,7 +470,9 @@ class InkAccumulator:
             self._exit_lut = None
         size = 2 * tolerance + 1
         self._kernel = np.ones((size, size), dtype=np.uint8)
-        self._shape = shape
+        self._shape = (
+            (config.PAPER_H, config.PAPER_W) if shape is None else shape
+        )
         self.reset()
 
     def reset(self):

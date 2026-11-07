@@ -42,6 +42,7 @@ import cv2
 import numpy as np
 
 from . import hand as hand_module
+from . import config
 from . import ink as ink_module
 try:
     from . import ink_model as ink_model_module
@@ -552,6 +553,18 @@ def run(
     telemetry = telemetry_module.SessionTelemetry(
         save_path / "telemetry.jsonl"
     ).start()
+    format_metadata = {
+        "paper_format": config.PAPER_FORMAT,
+        "page_grid": [config.PAPER_W, config.PAPER_H],
+        "mm_per_px": config.mm_per_px(),
+    }
+    telemetry.update(**format_metadata)
+    telemetry.event("session_open", **format_metadata)
+    print(
+        f"Formato da sessao: {config.PAPER_FORMAT}, "
+        f"grade {config.PAPER_W}x{config.PAPER_H}, "
+        f"{config.mm_per_px():.6f} mm/px."
+    )
     print(
         "Telemetria de sessao ligada: 1 registro/s em "
         f"{save_path / 'telemetry.jsonl'} (arquivo local e rotativo)."
@@ -575,6 +588,7 @@ def run(
         save_path / "session-reports",
         {
             "inicio_epoch": time.time(),
+            **format_metadata,
             "fonte": str(source),
             "modo_marcadores": bool(markers_mode),
             "modelo_folha": _model_header(
@@ -713,6 +727,7 @@ def run(
     last_view = None
     display_corners = None
     display_gray = None
+    format_suggester = paper_module.FormatSuggester()
     try:
         while True:
             item = frame_source.wait_next(last_seq)
@@ -765,6 +780,13 @@ def run(
                 warped, markers = paper_module.warp_paper(frame)
                 sheet_present = warped is not None
                 tel_sheet_present = sheet_present
+                if sheet_present:
+                    suggestion = format_suggester.observe(
+                        [markers[i] for i in config.MARKER_IDS], frame.shape,
+                        sheet_boundary=False,
+                    )
+                    if suggestion is not None:
+                        _report_format_suggestion(telemetry, suggestion)
             else:
                 markers = {}
                 det_result = detection_worker.poll(last_det_seq)
@@ -817,6 +839,12 @@ def run(
                 sheet_present = tracker.corners is not None
                 tel_sheet_present = sheet_present
                 warped = None
+                if ran_detection and sheet_present and detected_corners is not None:
+                    suggestion = format_suggester.observe(
+                        detected_corners, frame.shape
+                    )
+                    if suggestion is not None:
+                        _report_format_suggestion(telemetry, suggestion)
 
                 # Presenca de mao assincrona (T4): colhe o
                 # resultado mais novo da trabalhadora (o estado
@@ -1255,6 +1283,21 @@ def run(
         cv2.destroyAllWindows()
 
 
+def _report_format_suggestion(telemetry, suggestion):
+    telemetry.event("format_suggestion", **suggestion)
+    ratio = suggestion["ratio"]
+    ratio_text = "indisponivel" if ratio is None else f"{ratio:.4f}"
+    label = suggestion["suggestion"]
+    if label == "serie_a":
+        label = (
+            "serie A (proporcao 0,71) — tamanho nao estimado; "
+            "A4 assumido se nada for escolhido"
+        )
+    elif label is None:
+        label = f"abstencao ({suggestion['reason']})"
+    print(f"Sugestao de formato: proporcao {ratio_text}; {label}.")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Draw v0, papel para o digital")
     parser.add_argument(
@@ -1336,7 +1379,15 @@ def main():
         "Incompativel com --markers",
     )
     parser.add_argument("--save-dir", default="captures")
+    parser.add_argument(
+        "--format", choices=list(config.FORMATS), default=None,
+        help="formato da sessao em retrato (flag > DRAW_FORMAT > a4)",
+    )
     args = parser.parse_args()
+    try:
+        config.apply_format(args.format or os.environ.get("DRAW_FORMAT", "a4"))
+    except ValueError as error:
+        parser.error(str(error))
     if args.check:
         parsed = parse_source(args.source)
         sys.exit(run_check(parsed if isinstance(parsed, int) else 0))
