@@ -26,12 +26,10 @@ _BLANK_SHEET = None
 
 def _blank_sheet():
     global _BLANK_SHEET
-    if _BLANK_SHEET is None:
+    shape = (ink_module.config.PAPER_H, ink_module.config.PAPER_W)
+    if _BLANK_SHEET is None or _BLANK_SHEET.shape[:2] != shape:
         _BLANK_SHEET = ink_module.render_canvas(
-            np.zeros(
-                (ink_module.config.PAPER_H, ink_module.config.PAPER_W),
-                dtype=np.uint8,
-            )
+            np.zeros(shape, dtype=np.uint8)
         )
     return _BLANK_SHEET
 
@@ -120,4 +118,3 @@ def _dead_source_view(last_view):
 def _error_view(last_view, title, lines):
     """Quadro de aviso de falha do pipeline, no formato da vista."""
     return _message_view(last_view, title, lines)
-

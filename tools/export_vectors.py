@@ -24,12 +24,11 @@ Fonte da máscara (--mask):
 Uso:
   python tools/export_vectors.py pagina.png --out-dir saida/
       [--mask model|otsu] [--onnx page_clean_unet.onnx]
-      [--epsilon 1.5] [--paper-mm 210 297]
+      [--epsilon 1.5] [--format a4|a5|a3|carta|caderno]
 """
 
 import argparse
 import json
-import math
 import re
 import sys
 import time
@@ -37,6 +36,9 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from draw import config  # noqa: E402
 
 DEFAULT_ONNX = (
     Path.home()
@@ -315,11 +317,22 @@ def median_stroke_width(ink, skel):
 
 # -------------------------------------------------------------- escritas
 
+def _export_scale(img_w, img_h, paper_w_mm, paper_h_mm, scale=None):
+    if scale is not None:
+        return scale
+    for name, dimensions in config.FORMATS.items():
+        if dimensions == (paper_w_mm, paper_h_mm):
+            unit = config.mm_per_px(name)
+            return unit, unit
+    return paper_w_mm / img_w, paper_h_mm / img_h
+
+
 def write_svg(polylines, out_path, img_w, img_h, paper_w_mm, paper_h_mm,
-              stroke_w_mm):
+              stroke_w_mm, scale_mm_per_px=None):
     """SVG com <path> reais em mm (Y para baixo, como a imagem)."""
-    sx = paper_w_mm / img_w
-    sy = paper_h_mm / img_h
+    sx, sy = _export_scale(
+        img_w, img_h, paper_w_mm, paper_h_mm, scale_mm_per_px
+    )
     lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         "<!-- Draw vector bridge: polilinhas de centro do canvas, em mm -->",
@@ -349,10 +362,11 @@ def write_svg(polylines, out_path, img_w, img_h, paper_w_mm, paper_h_mm,
 
 
 def write_dxf(polylines, out_path, img_w, img_h, paper_w_mm, paper_h_mm,
-              stroke_w_mm):
+              stroke_w_mm, scale_mm_per_px=None):
     """DXF mínimo (AC1015) escrito à mão: LWPOLYLINE em mm, Y para cima."""
-    sx = paper_w_mm / img_w
-    sy = paper_h_mm / img_h
+    sx, sy = _export_scale(
+        img_w, img_h, paper_w_mm, paper_h_mm, scale_mm_per_px
+    )
 
     def conv(pts):
         return [(x * sx, paper_h_mm - y * sy) for x, y in pts]
@@ -463,11 +477,17 @@ def iou(a, b):
 # ------------------------------------------------------------------ core
 
 def export_vectors(bgr, mask_source="model", onnx_path=None, epsilon=1.5,
-                   paper_mm=(210.0, 297.0), min_area=4):
+                   paper_mm=None, min_area=4, paper_format="a4"):
     """Imagem na grade da página -> dict com polilinhas, SVG/DXF em memória
     (listas de linhas via writers) e estatísticas da vetorização."""
     img_h, img_w = bgr.shape[:2]
-    paper_w_mm, paper_h_mm = paper_mm
+    if paper_mm is None:
+        paper_w_mm, paper_h_mm = config.FORMATS[paper_format]
+        sx = sy = config.mm_per_px(paper_format)
+    else:
+        # --paper-mm explicito preserva a API anterior de dimensoes livres.
+        paper_w_mm, paper_h_mm = paper_mm
+        sx, sy = paper_w_mm / img_w, paper_h_mm / img_h
     if mask_source == "model":
         if onnx_path is None or not Path(onnx_path).exists():
             raise FileNotFoundError(
@@ -482,8 +502,6 @@ def export_vectors(bgr, mask_source="model", onnx_path=None, epsilon=1.5,
     raw = trace_polylines(skel)
     simplified = simplify_polylines(raw, epsilon)
     width_px = median_stroke_width(ink, skel)
-    sx = paper_w_mm / img_w
-    sy = paper_h_mm / img_h
 
     return {
         "ink": ink,
@@ -493,8 +511,8 @@ def export_vectors(bgr, mask_source="model", onnx_path=None, epsilon=1.5,
         "stroke_width_px": width_px,
         "stroke_width_mm": width_px * 0.5 * (sx + sy),
         "scale_mm_per_px": (sx, sy),
-        "points_raw": int(sum(len(l["points"]) for l in raw)),
-        "points_simplified": int(sum(len(l["points"]) for l in simplified)),
+        "points_raw": int(sum(len(line["points"]) for line in raw)),
+        "points_simplified": int(sum(len(line["points"]) for line in simplified)),
     }
 
 
@@ -516,9 +534,14 @@ def main(argv=None):
         "--epsilon", type=float, default=1.5,
         help="epsilon do Douglas-Peucker em px (padrao 1,5)",
     )
-    parser.add_argument(
-        "--paper-mm", type=float, nargs=2, default=[210.0, 297.0],
-        metavar=("W", "H"), help="tamanho físico da página em mm (padrao A4)",
+    size = parser.add_mutually_exclusive_group()
+    size.add_argument(
+        "--format", choices=list(config.FORMATS), default="a4",
+        help="formato da sessao; escala de draw.config (padrao: a4)",
+    )
+    size.add_argument(
+        "--paper-mm", type=float, nargs=2, default=None,
+        metavar=("W", "H"), help="dimensoes livres, API legada (sem --format)",
     )
     args = parser.parse_args(argv)
 
@@ -527,7 +550,9 @@ def main(argv=None):
         print(f"erro: nao foi possivel ler {args.input}", file=sys.stderr)
         return 1
     img_h, img_w = bgr.shape[:2]
-    paper_w_mm, paper_h_mm = args.paper_mm
+    paper_w_mm, paper_h_mm = (
+        config.FORMATS[args.format] if args.paper_mm is None else args.paper_mm
+    )
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = Path(args.input).stem
@@ -538,17 +563,20 @@ def main(argv=None):
         mask_source=args.mask,
         onnx_path=args.onnx,
         epsilon=args.epsilon,
-        paper_mm=(paper_w_mm, paper_h_mm),
+        paper_mm=args.paper_mm,
+        paper_format=args.format,
     )
     svg_path = out_dir / f"{stem}.svg"
     dxf_path = out_dir / f"{stem}.dxf"
     write_svg(
         result["polylines"], svg_path, img_w, img_h,
         paper_w_mm, paper_h_mm, result["stroke_width_mm"],
+        scale_mm_per_px=result["scale_mm_per_px"],
     )
     write_dxf(
         result["polylines"], dxf_path, img_w, img_h,
         paper_w_mm, paper_h_mm, result["stroke_width_mm"],
+        scale_mm_per_px=result["scale_mm_per_px"],
     )
 
     # Prova: relê os DOIS arquivos do disco, rasteriza e compara com a máscara.
@@ -582,6 +610,8 @@ def main(argv=None):
         ),
         "page_px": [img_w, img_h],
         "paper_mm": [paper_w_mm, paper_h_mm],
+        "paper_format": args.format if args.paper_mm is None else None,
+        "scale_mm_per_px": result["scale_mm_per_px"],
         "epsilon_px": args.epsilon,
         "ink_px": int(ink.sum()),
         "skeleton_px": int(result["skeleton"].sum()),

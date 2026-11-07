@@ -85,6 +85,92 @@ def _aspect_ratio(corners):
     return width / max(height, 1.0)
 
 
+def estimate_format(corners, image_shape):
+    """Sugere proporcao: principal no centro, pixels quadrados e skew zero."""
+    result = {"ratio": None, "suggestion": None, "reason": None}
+    try:
+        points = np.asarray(corners, dtype=np.float64).reshape(4, 2)
+    except (TypeError, ValueError):
+        return {**result, "reason": "degenerate_quad"}
+    if (not np.isfinite(points).all()
+            or not cv2.isContourConvex(points.astype(np.float32))):
+        return {**result, "reason": "degenerate_quad"}
+    height, width = image_shape[:2]
+    if width <= 0 or height <= 0:
+        return {**result, "reason": "degenerate_quad"}
+    centered = points - [width / 2, height / 2]
+    homogeneous = np.column_stack((centered, np.ones(4)))
+    tl, tr, br, bl = homogeneous
+    vp_w = np.cross(np.cross(tl, tr), np.cross(bl, br))
+    vp_h = np.cross(np.cross(tl, bl), np.cross(tr, br))
+
+    def at_infinity(vp):
+        length = np.hypot(vp[0], vp[1])
+        return length > 0 and abs(vp[2]) / length < 1 / (10 * width)
+
+    infinite_w, infinite_h = at_infinity(vp_w), at_infinity(vp_h)
+    if infinite_w and infinite_h:
+        edge_w = np.linalg.norm(points[[1, 2]] - points[[0, 3]], axis=1)
+        edge_h = np.linalg.norm(points[[3, 2]] - points[[0, 1]], axis=1)
+        ratio = float(edge_w.mean() / edge_h.mean())
+        result["regime"] = "near_frontal"
+    elif infinite_w or infinite_h:
+        return {**result, "reason": "single_vp_at_infinity"}
+    else:
+        if vp_w[2] == 0 or vp_h[2] == 0:
+            return {**result, "reason": "degenerate_quad"}
+        xy_w, xy_h = vp_w[:2] / vp_w[2], vp_h[:2] / vp_h[2]
+        focal_sq = -float(xy_w @ xy_h)
+        if (not np.isfinite(focal_sq) or focal_sq <= 0
+                or not (0.5 * width) ** 2 <= focal_sq <= (3 * width) ** 2):
+            return {**result, "reason": "invalid_focal_length"}
+        matrix = cv2.getPerspectiveTransform(
+            np.float32([[0, 0], [1, 0], [1, 1], [0, 1]]),
+            centered.astype(np.float32),
+        )
+        omega = np.diag([1 / focal_sq, 1 / focal_sq, 1])
+        h1, h2 = matrix[:, 0], matrix[:, 1]
+        ratio = float(np.sqrt((h1 @ omega @ h1) / (h2 @ omega @ h2)))
+        result["regime"] = "finite_vps"
+    if not np.isfinite(ratio) or ratio <= 0:
+        return {**result, "reason": "degenerate_quad"}
+    result["ratio"] = ratio
+    classes = {"serie_a": "a4", "caderno": "caderno", "carta": "carta"}
+    distances = sorted(
+        (abs(np.log(ratio) - np.log(config.FORMATS[name][0]
+                                  / config.FORMATS[name][1])), label)
+        for label, name in classes.items()
+    )
+    (d1, suggestion), (d2, _), _ = distances
+    if d1 > np.log(1.06) or d2 < 1.5 * d1:
+        return {**result, "reason": "ambiguous_ratio"}
+    return {**result, "suggestion": suggestion}
+
+
+class FormatSuggester:
+    """Uma sugestao na partida, pela mediana dos primeiros 15 quads."""
+
+    def __init__(self):
+        self._quads = []
+        self._done = False
+
+    def observe(self, corners, image_shape, sheet_boundary=True):
+        if self._done:
+            return None
+        self._quads.append(np.asarray(corners, dtype=np.float64).copy())
+        if len(self._quads) < 15:
+            return None
+        self._done = True
+        median = np.median(np.stack(self._quads), axis=0)
+        self._quads.clear()
+        if not sheet_boundary:
+            return {
+                "ratio": None, "suggestion": None,
+                "reason": "marker_centers_not_sheet_boundary",
+            }
+        return estimate_format(median, image_shape)
+
+
 def _sheet_candidate(contour, scale, small_frame_area):
     perimeter = cv2.arcLength(contour, True)
     for epsilon in _SHEET_EPSILON_LADDER:

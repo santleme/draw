@@ -21,6 +21,7 @@ O arquivo é local e rotativo: passou de max_bytes, ele vira
 import json
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 
@@ -33,6 +34,7 @@ class SessionTelemetry:
         self._max_bytes = int(max_bytes)
         self._lock = threading.Lock()
         self._latest = {}
+        self._events = deque()
         self._previous_counters = {}
         self._stopped = threading.Event()
         self._thread = threading.Thread(
@@ -49,6 +51,18 @@ class SessionTelemetry:
         """Guarda o retrato mais recente. Barato: um dict sob cadeado."""
         with self._lock:
             self._latest.update(fields)
+
+    def event(self, name, **fields):
+        """Enfileira um evento pontual; a escrita continua fora do laco."""
+        record = {**fields, "event": name, "t_epoch": round(time.time(), 3)}
+        with self._lock:
+            self._events.append(record)
+
+    def _take_events(self):
+        with self._lock:
+            records = list(self._events)
+            self._events.clear()
+        return records
 
     def _snapshot(self):
         with self._lock:
@@ -76,14 +90,22 @@ class SessionTelemetry:
 
     def _run(self):
         while not self._stopped.wait(self._interval):
-            record = self._snapshot()
-            try:
-                self._rotate_if_needed()
-                with self._path.open("a", encoding="utf-8") as handle:
-                    handle.write(json.dumps(record, sort_keys=True) + "\n")
-            except OSError as error:
-                self._error = error
+            if not self._write(self._take_events() + [self._snapshot()]):
                 return
+        self._write(self._take_events())
+
+    def _write(self, records):
+        if not records:
+            return True
+        try:
+            self._rotate_if_needed()
+            with self._path.open("a", encoding="utf-8") as handle:
+                for record in records:
+                    handle.write(json.dumps(record, sort_keys=True) + "\n")
+        except OSError as error:
+            self._error = error
+            return False
+        return True
 
     @property
     def error(self):
