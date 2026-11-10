@@ -511,7 +511,7 @@ def _edge_line(side, start, end, centroid, fallback=None, pixel_scale=1.0):
     return (direction, start + offset * normal), True, False
 
 
-def _refit_corners(contour, quad, frame_shape, fallback_lines=None, pixel_scale=1.0):
+def _refit_corners(contour, quad, frame_shape, fallback_lines=None, scale=(1.0, 1.0)):
     """Reajusta os cantos como interseções das retas das arestas.
 
     Cada ponto do contorno é atribuído à aresta mais próxima. Pontos
@@ -531,6 +531,9 @@ def _refit_corners(contour, quad, frame_shape, fallback_lines=None, pixel_scale=
     reajuste inteiro é abandonado.
     """
     frame_h, frame_w = frame_shape
+    # Resíduos usam limites conservadores; deslocamentos dos quatro cantos
+    # usam a métrica exata do frame, inclusive quando scale_x != scale_y.
+    pixel_scale = 1.0 / max(scale)
     points = contour.reshape(-1, 2).astype(np.float64)
     distances = np.stack(
         [_segment_distances(points, quad[i], quad[(i + 1) % 4]) for i in range(4)],
@@ -614,7 +617,7 @@ def _refit_corners(contour, quad, frame_shape, fallback_lines=None, pixel_scale=
             continue
         if locked[i - 1] or locked[i]:
             refined[i] = corner
-        elif np.linalg.norm(corner - quad[i]) <= _FIT_MAX_DISPLACE_PX * pixel_scale:
+        elif np.linalg.norm((corner - quad[i]) * scale) <= _FIT_MAX_DISPLACE_PX:
             refined[i] = corner
     refined = _order_corners(refined)
     if not cv2.isContourConvex(refined.reshape(4, 1, 2).astype(np.float32)):
@@ -659,10 +662,8 @@ def _fit_quad_impl(mask_bin, frame, fallback_lines, scale_x=1.0, scale_y=1.0):
     quad = _approx_quad(contour)
     if quad is None:
         return _min_area_quad(contour) * scale, None, None
-    # Limites em pixels do frame viram limites conservadores na grade nativa.
-    pixel_scale = 1.0 / max(scale_x, scale_y)
     quad, lines, trusted = _refit_corners(
-        contour, quad, mask_bin.shape[:2], fallback_lines, pixel_scale
+        contour, quad, mask_bin.shape[:2], fallback_lines, scale
     )
     quad = quad * scale
     if frame is not None:

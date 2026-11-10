@@ -97,9 +97,10 @@ def test_only_quad_is_scaled_before_full_resolution_refinement(monkeypatch):
         calls.append("approx")
         return approx(contour, *args)
 
-    def refit(contour, candidate, shape, fallback, pixel_scale):
+    def refit(contour, candidate, shape, fallback, corner_scale):
         assert contour.max() < 384
         assert shape == (384, 384)
+        np.testing.assert_array_equal(corner_scale, scale)
         return quad, None, None
 
     def refine(image, corners):
@@ -290,3 +291,33 @@ def test_real_onnx_keeps_four_class_output_and_native_resolution(tmp_path, size)
     presence, mask = detector.predict(frame, native=True)
     assert mask.shape == (size, size) and mask.dtype == np.uint8
     assert presence in (1.0, -10.0)
+
+
+@pytest.mark.parametrize("portrait", [False, True])
+@pytest.mark.parametrize("clipped_y", [-35, -50, -70])
+def test_cropped_corner_displacement_uses_original_frame_metric(portrait, clipped_y):
+    quad = np.float32([[85, clipped_y], [300, 80], [325, 340], [55, 330]])
+    scale = np.float32([1280 / 384, 720 / 384])
+    if portrait:
+        quad = quad[:, ::-1].copy()
+        scale = scale[::-1].copy()
+    mask = _mask(quad)
+    contour = neural._largest_contour(mask)
+    approximate = neural._approx_quad(contour)
+    actual, lines, trusted = neural._refit_corners(
+        contour, approximate, mask.shape, scale=scale
+    )
+    assert all(trusted)
+    projected = neural._intersect(lines[-1], lines[0])
+    frame_displacement = np.linalg.norm((projected - approximate[0]) * scale)
+    # A projeção ultrapassa o antigo teto nativo conservador em todos os casos.
+    assert np.linalg.norm(projected - approximate[0]) > 100 / max(scale)
+    if clipped_y == -70:
+        assert frame_displacement > neural._FIT_MAX_DISPLACE_PX
+        np.testing.assert_array_equal(actual[0], approximate[0])
+    else:
+        assert frame_displacement < neural._FIT_MAX_DISPLACE_PX
+        np.testing.assert_allclose(actual[0], projected, atol=1e-5)
+        scaled = neural.fit_quad(mask, scale_x=scale[0], scale_y=scale[1])
+        expected = paper._order_corners(quad * scale)
+        assert np.linalg.norm(scaled[0] - expected[0]) <= 4.0
