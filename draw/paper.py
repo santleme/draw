@@ -67,9 +67,7 @@ def _order_corners(points):
     """Ordena quatro pontos como TL, TR, BR e BL."""
     ordered = np.asarray(points, dtype=np.float32).reshape(4, 2)
     center = ordered.mean(axis=0)
-    angles = np.arctan2(
-        ordered[:, 1] - center[1], ordered[:, 0] - center[0]
-    )
+    angles = np.arctan2(ordered[:, 1] - center[1], ordered[:, 0] - center[0])
     ordered = ordered[np.argsort(angles)]
     start = int(np.argmin(ordered.sum(axis=1)))
     return np.roll(ordered, -start, axis=0).astype(np.float32)
@@ -92,8 +90,9 @@ def estimate_format(corners, image_shape):
         points = np.asarray(corners, dtype=np.float64).reshape(4, 2)
     except (TypeError, ValueError):
         return {**result, "reason": "degenerate_quad"}
-    if (not np.isfinite(points).all()
-            or not cv2.isContourConvex(points.astype(np.float32))):
+    if not np.isfinite(points).all() or not cv2.isContourConvex(
+        points.astype(np.float32)
+    ):
         return {**result, "reason": "degenerate_quad"}
     height, width = image_shape[:2]
     if width <= 0 or height <= 0:
@@ -121,8 +120,11 @@ def estimate_format(corners, image_shape):
             return {**result, "reason": "degenerate_quad"}
         xy_w, xy_h = vp_w[:2] / vp_w[2], vp_h[:2] / vp_h[2]
         focal_sq = -float(xy_w @ xy_h)
-        if (not np.isfinite(focal_sq) or focal_sq <= 0
-                or not (0.5 * width) ** 2 <= focal_sq <= (3 * width) ** 2):
+        if (
+            not np.isfinite(focal_sq)
+            or focal_sq <= 0
+            or not (0.5 * width) ** 2 <= focal_sq <= (3 * width) ** 2
+        ):
             return {**result, "reason": "invalid_focal_length"}
         matrix = cv2.getPerspectiveTransform(
             np.float32([[0, 0], [1, 0], [1, 1], [0, 1]]),
@@ -137,8 +139,13 @@ def estimate_format(corners, image_shape):
     result["ratio"] = ratio
     classes = {"serie_a": "a4", "caderno": "caderno", "carta": "carta"}
     distances = sorted(
-        (abs(np.log(ratio) - np.log(config.FORMATS[name][0]
-                                  / config.FORMATS[name][1])), label)
+        (
+            abs(
+                np.log(ratio)
+                - np.log(config.FORMATS[name][0] / config.FORMATS[name][1])
+            ),
+            label,
+        )
         for label, name in classes.items()
     )
     (d1, suggestion), (d2, _), _ = distances
@@ -165,7 +172,8 @@ class FormatSuggester:
         self._quads.clear()
         if not sheet_boundary:
             return {
-                "ratio": None, "suggestion": None,
+                "ratio": None,
+                "suggestion": None,
                 "reason": "marker_centers_not_sheet_boundary",
             }
         return estimate_format(median, image_shape)
@@ -199,9 +207,7 @@ def _refine_corners(frame, corners):
     # não muda.
     pad = 12
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    padded = cv2.copyMakeBorder(
-        gray, pad, pad, pad, pad, cv2.BORDER_REPLICATE
-    )
+    padded = cv2.copyMakeBorder(gray, pad, pad, pad, pad, cv2.BORDER_REPLICATE)
     refined = (corners + pad).reshape(-1, 1, 2).astype(np.float32)
     criteria = (
         cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
@@ -209,7 +215,7 @@ def _refine_corners(frame, corners):
         0.01,
     )
     cv2.cornerSubPix(padded, refined, (10, 10), (-1, -1), criteria)
-    return (refined.reshape(4, 2) - pad).astype(np.float32)
+    return (refined.reshape(-1, 2) - pad).astype(np.float32)
 
 
 _TEXTURE_ERODE_KERNEL = np.ones((9, 9), np.uint8)
@@ -261,9 +267,7 @@ def _candidate_interior_roi(frame_shape, corners):
     """Recorta e erode a máscara do interior apenas na bounding box."""
     fh, fw = frame_shape[:2]
     center = corners.mean(axis=0)
-    shrunk = (
-        center + (corners - center) * _TEXTURE_INTERIOR_SHRINK
-    ).astype(np.int32)
+    shrunk = (center + (corners - center) * _TEXTURE_INTERIOR_SHRINK).astype(np.int32)
     pad = 6
     x0 = max(0, int(shrunk[:, 0].min()) - pad)
     y0 = max(0, int(shrunk[:, 1].min()) - pad)
@@ -308,11 +312,7 @@ def _texture_verdict(frame, corners, maps=None):
     if laplacian_variance >= _TEXTURE_HIGH_LAPLACIAN_VARIANCE:
         return "paper"
     edge_density = float(np.mean(maps["edges"][ys, xs][selected] > 0))
-    return (
-        "paper"
-        if edge_density >= _TEXTURE_MIN_EDGE_DENSITY
-        else "blank_maybe"
-    )
+    return "paper" if edge_density >= _TEXTURE_MIN_EDGE_DENSITY else "blank_maybe"
 
 
 def detect_sheet(frame):
@@ -357,9 +357,7 @@ def detect_sheet_with_confidence(frame):
     closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
     # RETR_TREE: o contorno da folha pode ser interno na hierarquia, como
     # a volta de um caderno dentro de um borrão maior fundido na cena.
-    contours, _ = cv2.findContours(
-        closed, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
-    )
+    contours, _ = cv2.findContours(closed, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
     small_frame_area = float(small.shape[0] * small.shape[1])
     min_area = small_frame_area * _SHEET_MIN_AREA_RATIO
@@ -428,9 +426,7 @@ def warp_points(points, corners, destination=None):
 def warp_sheet(frame, corners, destination=None):
     """Retifica a folha a partir de quatro cantos explícitos."""
     matrix = perspective_matrix(corners, destination=destination)
-    return cv2.warpPerspective(
-        frame, matrix, (config.PAPER_W, config.PAPER_H)
-    )
+    return cv2.warpPerspective(frame, matrix, (config.PAPER_W, config.PAPER_H))
 
 
 def warp_paper(frame):
