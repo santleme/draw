@@ -177,7 +177,10 @@ class RAMPairBuffer:
                 raise FileNotFoundError(f"change ilegível: {row['change']}")
             change = cv2.resize(change, (size, size),
                                 interpolation=cv2.INTER_NEAREST)
-            ia.append(a); ma.append(m_a); ib.append(b); mb.append(m_b)
+            ia.append(a)
+            ma.append(m_a)
+            ib.append(b)
+            mb.append(m_b)
             ch.append((change > 0).astype(np.uint8))
         return cls(_stack_images(ia), _stack_masks(ma), _stack_images(ib),
                    _stack_masks(mb), _stack_masks(ch))

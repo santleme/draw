@@ -87,7 +87,6 @@ def interpolate(base: dict, target: dict, alpha: float) -> dict:
 
 def argmax_iou_check(model, onnx_path: Path, cfg: dict) -> float:
     """IoU de argmax entre o modelo PyTorch (caminho de exportação) e o ONNX."""
-    import numpy as np
     import onnxruntime as ort
     import torch
 

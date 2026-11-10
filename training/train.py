@@ -1939,10 +1939,16 @@ def train_steps(
                 imgs, msks, wts, pres = [], [], [], []
                 if batch_replay > 0:
                     i, m, w, p = replay_buffer.sample(batch_replay, device)
-                    imgs.append(i); msks.append(m); wts.append(w); pres.append(p)
+                    imgs.append(i)
+                    msks.append(m)
+                    wts.append(w)
+                    pres.append(p)
                 if pool_buffer is not None and batch_pool > 0:
                     i, m, w, p = pool_buffer.sample(batch_pool, device)
-                    imgs.append(i); msks.append(m); wts.append(w); pres.append(p)
+                    imgs.append(i)
+                    msks.append(m)
+                    wts.append(w)
+                    pres.append(p)
                 main_batch = (
                     torch.cat(imgs), torch.cat(msks), torch.cat(wts),
                     torch.cat(pres),
