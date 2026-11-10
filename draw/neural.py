@@ -58,6 +58,7 @@ DRAW_NEURAL_MODEL.
 """
 
 import os
+import time
 from pathlib import Path
 from typing import NamedTuple, Tuple
 
@@ -121,6 +122,8 @@ _INK_CLASS = 3
 _SEGMENTATION_PRESENCE_MIN_RATIO = 0.01
 _SEGMENTATION_ABSENT_LOGIT = -10.0
 _SEGMENTATION_PRESENT_LOGIT = 1.0
+_TIMING_PHASES = ("preprocess", "session_run", "postprocess")
+_TIMING_LOG_EVERY = 100
 
 # Portão do caminho clássico (medido em 2026-10-30 no laboratório,
 # draw-lab/fp-gate-2026-10-30/): com um modelo neural carregado, um
@@ -724,6 +727,40 @@ class NeuralSheetDetector:
         self._memory_mask = None
         self._memory_geometry = None
         self.last_presence_logit = None
+        self._timing_enabled = os.environ.get("DRAW_TIMING") == "1"
+        self._timing_stats = {
+            phase: {"count": 0, "sum_ms": 0.0, "max_ms": 0.0}
+            for phase in _TIMING_PHASES
+        }
+
+    def get_timing_stats(self):
+        """Snapshot em ms das previsões completas com DRAW_TIMING=1.
+
+        Ative a variável antes de construir o detector. Carga da sessão,
+        leitura do contrato e fit_quad não entram nas três fases.
+        """
+        return {
+            phase: {
+                **stats,
+                "mean_ms": stats["sum_ms"] / stats["count"] if stats["count"] else 0.0,
+            }
+            for phase, stats in self._timing_stats.items()
+        }
+
+    def _record_timing(self, durations):
+        for phase, seconds in zip(_TIMING_PHASES, durations):
+            stats = self._timing_stats[phase]
+            milliseconds = seconds * 1000.0
+            stats["count"] += 1
+            stats["sum_ms"] += milliseconds
+            stats["max_ms"] = max(stats["max_ms"], milliseconds)
+        count = self._timing_stats["session_run"]["count"]
+        if count % _TIMING_LOG_EVERY == 0:
+            summary = " | ".join(
+                f"{phase}: mean={stats['mean_ms']:.3f} ms max={stats['max_ms']:.3f} ms"
+                for phase, stats in self.get_timing_stats().items()
+            )
+            print(f"DRAW_TIMING frames={count} | {summary}")
 
     def _get_session(self):
         if self._session is None:
@@ -814,10 +851,16 @@ class NeuralSheetDetector:
         """
         session = self._get_session()
         contract = self.contract()
+        preprocess_start = time.perf_counter() if self._timing_enabled else None
         frame_h, frame_w = frame.shape[:2]
         tensor = _frame_to_tensor(frame, contract.size)
         output_names = list(contract.outputs)
-        outputs = session.run(output_names, {contract.input_name: tensor})
+        feed = {contract.input_name: tensor}
+        if self._timing_enabled:
+            preprocess_end = time.perf_counter()
+        outputs = session.run(output_names, feed)
+        if self._timing_enabled:
+            inference_end = time.perf_counter()
         by_name = dict(zip(output_names, outputs))
 
         if "mask_logits" in by_name and "presence_logit" in by_name:
@@ -877,6 +920,15 @@ class NeuralSheetDetector:
         mask = mask_small * 255
         if not native:
             mask = cv2.resize(mask, (frame_w, frame_h), interpolation=cv2.INTER_NEAREST)
+        if self._timing_enabled:
+            postprocess_end = time.perf_counter()
+            self._record_timing(
+                (
+                    preprocess_end - preprocess_start,
+                    inference_end - preprocess_end,
+                    postprocess_end - inference_end,
+                )
+            )
         return self.last_presence_logit, mask
 
     def __call__(self, frame, *, return_mask=True):

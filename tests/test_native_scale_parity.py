@@ -134,9 +134,21 @@ def _detector(mask, kind="semantic", presence=2.0):
 
 @pytest.mark.parametrize("kind", ["semantic", "hybrid", "legacy"])
 @pytest.mark.parametrize("present", [True, False])
+@pytest.mark.parametrize("timing", [True, False])
 def test_app_path_never_upsamples_mask_and_debug_keeps_contract(
-    monkeypatch, kind, present
+    monkeypatch, kind, present, timing
 ):
+    if timing:
+        monkeypatch.setenv("DRAW_TIMING", "1")
+    else:
+        monkeypatch.delenv("DRAW_TIMING", raising=False)
+    ticks = iter(range(16))
+
+    def clock():
+        assert timing
+        return next(ticks)
+
+    monkeypatch.setattr(neural.time, "perf_counter", clock)
     native = _mask(np.float32(_QUADS[0])) if present else np.zeros((384, 384), np.uint8)
     detector = _detector(native, kind, presence=2.0 if present else -2.0)
     frame = _frame((720, 1280), np.float32(_QUADS[0]) * [1280 / 384, 720 / 384])
@@ -166,6 +178,15 @@ def test_app_path_never_upsamples_mask_and_debug_keeps_contract(
     np.testing.assert_array_equal(debug_mask, expected)
     np.testing.assert_array_equal(call_mask, expected)
     assert len(nearest) == 2
+    for stats in detector.get_timing_stats().values():
+        assert stats == pytest.approx(
+            {
+                "count": 4 if timing else 0,
+                "sum_ms": 4000.0 if timing else 0.0,
+                "max_ms": 1000.0 if timing else 0.0,
+                "mean_ms": 1000.0 if timing else 0.0,
+            }
+        )
 
 
 def test_min_area_fallback_is_scaled_without_subpixel_refinement(monkeypatch):
