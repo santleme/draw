@@ -58,6 +58,7 @@ def judge_candidate(
     min_pages=MIN_HOLDOUT_PAGES,
     promote_margin=0.0,
     worst_group_tolerance=0.0,
+    accepted_drift=None,
 ):
     """Julga um candidato contra o incumbente no replay real.
 
@@ -70,7 +71,11 @@ def judge_candidate(
 
     Devolve dict com verdict (PROMOTE/REJECT/INCONCLUSIVE),
     reasons, n atual e n exigido, e o bloco dibco_diagnostic
-    marcado como incapaz de promover.
+    marcado como incapaz de promover. accepted_drift: o status do
+    monitor de deriva dos aceitos da rodada (drift.py, OK/ATTENTION/
+    DRIFT/INSUFFICIENT/NO_REFERENCE) - sinal para a revisao humana,
+    que nao muda o veredito: deriva nao e prova de piora, e so o
+    holdout selado mede ganho.
     """
     _check_real(candidate_real, "candidato")
     _check_real(baseline_real, "incumbente")
@@ -101,7 +106,21 @@ def judge_candidate(
             "baseline_worst_group": baseline_real["worst_group"],
         },
         "dibco_diagnostic": diagnostic,
+        "judgment_signals": None,
     }
+    if accepted_drift is not None:
+        flagged = accepted_drift in ("ATTENTION", "DRIFT")
+        result["judgment_signals"] = {
+            "accepted_drift": accepted_drift,
+            "human_review_required": flagged,
+            "changes_verdict": False,
+        }
+        if flagged:
+            result["reasons"].append(
+                f"monitor de deriva dos aceitos: {accepted_drift} - a "
+                "revisao humana confere o que o loop passou a aceitar "
+                "antes do teste ao vivo (sinal, nao muda o veredito)"
+            )
 
     if sessions < min_sessions or pages < min_pages:
         result["verdict"] = INCONCLUSIVE
@@ -355,6 +374,11 @@ def format_verdict(result):
     diagnostic = result.get("dibco_diagnostic")
     if diagnostic is not None:
         lines.append(f"DIBCO (so diagnostico, nao promove): IoU {diagnostic['iou']}")
+    signals = result.get("judgment_signals")
+    if signals is not None:
+        lines.append(
+            f"deriva dos aceitos (sinal ao juizo): {signals['accepted_drift']}"
+        )
     for reason in result["reasons"]:
         lines.append(f"- {reason}")
     return "\n".join(lines)

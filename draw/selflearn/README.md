@@ -42,6 +42,22 @@ live session
 - `collect.py` example recorder in dataset format (U1).
 - `select.py` active learning queue with reasons per item (U2).
 - `teacher.py` temporal aggregation and pseudo-label with veto (U3).
+- `drift.py` accepted-set drift monitor (v2 item 2): per-class PSI/KS of
+  what each round accepted against a reference profile
+  (`--accepted-reference`). Pre-registered thresholds: PSI >= 0.10
+  ATTENTION, >= 0.25 DRIFT; KS p < 0.01 only raises to ATTENTION; small
+  samples are INSUFFICIENT. A signal to the gate's human review, never a
+  verdict change.
+- `conformal.py` per-class (Mondrian) split conformal judge (v2 item 4),
+  calibrated on independent labels from `--calibration-dir` (sessions
+  that neither train nor belong to the sealed holdout). A pixel enters
+  the consistency loss only if its set is a singleton agreeing with the
+  pseudo-label.
+- `review.py` + `tools/selflearn/review_holdout.py` sealed-holdout review:
+  `status`, `mark` (requires `--accept-draft` or a corrected `--label`)
+  and `export` (complete sessions only, in `--holdout-dir` format).
+- clDice/ROI (v2 item 3) live with the other metrics in
+  `tools/seg_metrics.py`; experimental, read by no gate.
 - `tools/selflearn/train_round.py` the training round (minimum U5).
   `--smoke` exercises the recipe on CPU with its own synthetic dataset:
   supervised loss falls, EMA moves, lineage/holdout guards run, and

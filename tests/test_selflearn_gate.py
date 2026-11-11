@@ -249,3 +249,53 @@ def test_stop_decision_text_stamps_preregistration():
     text = format_stop_decision(result)
     assert "parada: SIM" in text
     assert "bootstrap por sessao" in text
+
+
+def test_accepted_drift_is_signal_that_never_changes_verdict():
+    from draw.selflearn import gate as g
+
+    cand = {
+        "primary": 0.8,
+        "worst_group": 0.7,
+        "holdout_sessions": 5,
+        "holdout_pages": 25,
+    }
+    base = {"primary": 0.7, "worst_group": 0.7}
+    plain = g.judge_candidate(cand, base)
+    for status in ("OK", "ATTENTION", "DRIFT", "INSUFFICIENT", "NO_REFERENCE"):
+        result = g.judge_candidate(cand, base, accepted_drift=status)
+        assert result["verdict"] == plain["verdict"]
+        assert result["judgment_signals"]["changes_verdict"] is False
+        assert result["judgment_signals"]["human_review_required"] == (
+            status in ("ATTENTION", "DRIFT")
+        )
+    assert "deriva dos aceitos" in g.format_verdict(
+        g.judge_candidate(cand, base, accepted_drift="DRIFT")
+    )
+    assert plain["judgment_signals"] is None
+
+
+def test_cli_accepted_drift_reaches_the_gate_as_signal(tmp_path):
+    candidate = tmp_path / "candidate.json"
+    baseline = tmp_path / "baseline.json"
+    report = tmp_path / "accepted_drift.json"
+    candidate.write_text(json.dumps(_real(0.30, 0.20)))
+    baseline.write_text(json.dumps(_real(0.45, 0.35)))
+    report.write_text(json.dumps({"status": "DRIFT"}))
+    run = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "tools/selflearn/judge_gate.py"),
+            "--candidate",
+            str(candidate),
+            "--baseline",
+            str(baseline),
+            "--accepted-drift",
+            str(report),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert run.returncode == 1  # veredito inalterado
+    assert "deriva dos aceitos (sinal ao juizo): DRIFT" in run.stdout

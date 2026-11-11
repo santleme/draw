@@ -1233,6 +1233,14 @@ abstenção delas encolhe o canvas pré-puxão (2.032 contra 6.686 px
 sem a flag); na composição com arbitragem+mediana o efeito não
 aparece. Contratos em `tests/test_anchor_follow.py`.
 
+**Réguas experimentais e o selado (2026-11-11).** `tools/seg_metrics.py`
+ganhou clDice (`ink_cldice`, conectividade do traço — o F-02 partido
+perde Tsens com IoU alta) e avaliação restrita a ROI
+(`evaluate_in_roi`, `stroke_roi`, `interior_roi`), como diagnóstico ao
+lado da IoU: nenhum portão as lê e nenhum limiar F-xx mudou. A
+medição real segue presa ao holdout selado; a revisão dele agora tem
+ferramenta (`tools/selflearn/review_holdout.py`), mas a revisão é humana.
+
 Amarração com a bancada: o mapa ID → régua acima é a referência que o
 `JULGAMENTO.md` pode citar; nenhuma régua da bancada foi alterada por
 este documento. A guarda automática desta página é

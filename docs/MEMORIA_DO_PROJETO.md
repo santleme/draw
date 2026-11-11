@@ -348,6 +348,44 @@ história:
   distribuição dos aceitos (PSI/KS) → (3) experimentos clDice/ROI →
   (4) conformal por último. Quem gera não julga: juízo triplo
   (conformal por classe, veto clássico, correção humana).
+- **Itens 2–4 do v2 e a revisão do selado (2026-11-11, o "vai"
+  dele).** Entraram na ordem dele, sem tocar na regra de parada e
+  sem promover nada. (2) **Monitor dos aceitos**
+  (`draw/selflearn/drift.py`): cada rodada de
+  `tools/selflearn/train_round.py` grava `accepted_profile.json`
+  (confiança do professor e fração aceita, por classe tinta/fundo) e
+  `accepted_drift.json` contra a referência dada em
+  `--accepted-reference` (a 1ª rodada ou um conjunto base). Limiares
+  pré-registrados: PSI ≥ 0,10 atenção, ≥ 0,25 deriva; KS (p < 0,01)
+  só sobe para atenção; amostra abaixo do mínimo é INSUFFICIENT,
+  nunca OK. Achado de desenho: com 60 itens e 10 faixas o PSI de
+  duas amostras iguais já dá ~0,3 — deriva fantasma —, então as
+  faixas encolhem com o n (viés nulo ≤ 0,025). O status vai ao portão
+  como sinal (`judge_candidate(accepted_drift=…)`): atenção/deriva
+  pedem revisão humana e **não mudam o veredito**. Observar não
+  consome RNG nem muda alvo/peso. (3) **clDice e ROI**
+  (`tools/seg_metrics.py`): `cldice_binary`/`ink_cldice` (esqueleto
+  Zhang-Suen em NumPy, idêntico ao OpenCV longe da borda; traço
+  partido perde Tsens com IoU alta) e `evaluate_in_roi` com
+  `stroke_roi`/`interior_roi` — régua experimental ao lado da IoU,
+  nenhum portão lê. (4) **Conformal por classe**
+  (`draw/selflearn/conformal.py`): quantil Mondrian por classe
+  calibrado em rótulo independente de `--calibration-dir` (sessões
+  que não treinam e não são do selado — a rodada recusa as duas), no
+  professor inicial; o pixel só entra na consistência se o conjunto
+  for singleton e concordar com o pseudo-rótulo — conformal e veto
+  clássico só retiram, nunca acrescentam. Garantia é marginal sobre
+  pixels permutáveis: meta, não certificado. **Selado:**
+  `tools/selflearn/review_holdout.py` (`status` mostra
+  revisadas/pendentes por sessão e o n do portão; `mark` exige prova
+  explícita — `--accept-draft` ou `--label` corrigido — e grava
+  `label_reviewed.png`, que o reprocessamento não sobrescreve, mais a
+  trilha `reviews_log.jsonl`; `export` escreve só sessões inteiras
+  revisadas no formato de `--holdout-dir`). **O que continua com
+  ele:** olhar e corrigir as 25 páginas, desenhar sessões reais (as
+  atuais são majoritariamente teste de câmera) e o teste ao vivo —
+  código nenhum substitui isso, e promover segue exigindo holdout
+  selado + teste ao vivo.
 - **Negativos reais v1 (2026-11-06).** A régua de ausência já tinha
   consumido **todos** os 187 clips sem papel do corpus de escrita
   do Kinetics — reusar qualquer um contaminaria a régua. Mineradas
@@ -390,10 +428,13 @@ história:
   injeta oclusão nos pixels e não cura o recall F-11 sem mão.
 - **Holdout selado:** 5 sessões × 25 páginas em rascunho, 0
   revisadas — a revisão e as próximas sessões reais de desenho são
-  o caminho curto para destravar decisões de modelo.
+  o caminho curto para destravar decisões de modelo. (2026-11-11: a
+  ferramenta de revisão existe, `tools/selflearn/review_holdout.py`;
+  a revisão em si segue com ele — ver §8.)
 - **Frentes paradas por ordem dele:** implementação da issue #36
   (programa temporal) e os itens 2–4 do self-learning v2, até o
-  "vai" dele. A ideia do **modelo único** (folha + tinta + mão)
+  "vai" dele. (2026-11-11: o "vai" veio e os itens 2–4 entraram —
+  ver §8; a issue #36 segue parada.) A ideia do **modelo único** (folha + tinta + mão)
   entrou em avaliação no lugar da direção de modelos separados.
 
 ---
