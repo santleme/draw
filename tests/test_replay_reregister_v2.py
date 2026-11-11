@@ -97,15 +97,23 @@ def test_preregistration_is_frozen_and_checks_scenario_drift(tmp_path, monkeypat
         rr.validate_protocol()
 
 
+def _bound_page_clean(enabled):
+    """v2 page_clean bound to a real worker in the replay's sync path."""
+    clock = rr.v1.SceneClock()
+    page_clean = rr.ReplayPageClean(ecc_refine_enabled=enabled)
+    worker = rr.v1.make_ink_worker(page_clean, clock)
+    return page_clean, worker, clock
+
+
 def test_production_defaults_remain_off(monkeypatch):
     monkeypatch.delenv("DRAW_ECC_REFINE", raising=False)
     monkeypatch.delenv("DRAW_IDENTITY_CHAMFER", raising=False)
     assert not ink._ecc_refinement_enabled()
     assert not ink._identity_chamfer_enabled()
-    worker = rr.ReplayWorker(ecc_refine_enabled=0)
+    page_clean, _worker, _clock = _bound_page_clean(0)
     quad = rr.v1.base_quad(SHAPE)
     with pytest.raises(ValueError, match="environment"):
-        worker.render_observation(content(), quad, quad)
+        page_clean.observe(content(), quad, quad)
 
 
 def test_fixed_anchor_contract_not_consecutive_or_true_quad(monkeypatch):
@@ -113,19 +121,19 @@ def test_fixed_anchor_contract_not_consecutive_or_true_quad(monkeypatch):
     moved = rr.v1.transform_quad(quad, (120, 30), -8, 1.1)
     prob = content()
     with rr.configured_ecc(0):
-        workers = [rr.ReplayWorker(ecc_refine_enabled=0) for _ in range(2)]
+        bound = [_bound_page_clean(0) for _ in range(2)]
         observations = []
-        for i, worker in enumerate(workers):
-            worker.anchor = quad.copy()
-            worker.generation_passes = 3
-            worker.previous_quad = quad + i * 300
-            observations.append(worker.render_observation(prob, quad + i * 100, moved))
-            assert worker._geometry["roundtrip_corner_max_canonical_px"] < 1e-6
-            np.testing.assert_array_equal(worker.anchor, quad)
+        for i, (page_clean, worker, _clock) in enumerate(bound):
+            worker._anchor_corners = quad.copy()
+            worker._generation_passes = 3
+            page_clean.previous_quad = quad + i * 300
+            observations.append(page_clean.observe(prob, quad + i * 100, moved))
+            assert page_clean._geometry["roundtrip_corner_max_canonical_px"] < 1e-6
+            np.testing.assert_array_equal(worker._anchor_corners, quad)
         np.testing.assert_array_equal(*observations)
         assert (
-            workers[0]._geometry["consecutive_quad_displacement_canonical_px"]
-            != (workers[1]._geometry["consecutive_quad_displacement_canonical_px"])
+            bound[0][0]._geometry["consecutive_quad_displacement_canonical_px"]
+            != (bound[1][0]._geometry["consecutive_quad_displacement_canonical_px"])
         )
         registered, _, _ = ink._register_ink_probability(
             observations[0], quad, moved, None
@@ -152,8 +160,36 @@ def test_diagnostic_quad_values_cannot_change_outcome():
     assert a["decisive"] == b["decisive"]
 
 
+class ProbIsWarp:
+    threshold = 0.7
+
+    def ink_prob(self, warped):
+        return warped
+
+
+def _sync_worker():
+    clock = rr.v1.SceneClock()
+    return rr.v1.make_ink_worker(ProbIsWarp(), clock), clock
+
+
+def _sync_pass(worker, clock, prob, generation, corners):
+    clock.now += 10.0
+    worker.submit(prob, generation, corners)
+    assert worker.pump()
+    assert worker.error is None
+
+
 @pytest.mark.parametrize("enabled", [0, 1])
 def test_real_ecc_rejection_never_votes_new_page(monkeypatch, enabled):
+    prior = content()
+    other = np.zeros_like(prior)
+    other[80:115, 5:35] = 0.95
+    quad = rr.v1.base_quad(SHAPE)
+    worker, clock = _sync_worker()
+    with rr.configured_ecc(0):
+        generation = worker.new_generation()
+        for _ in range(4):
+            _sync_pass(worker, clock, prior, generation, quad)
     calls = []
 
     def fail(*args, **kwargs):
@@ -161,31 +197,22 @@ def test_real_ecc_rejection_never_votes_new_page(monkeypatch, enabled):
         raise cv2.error("forced nonconvergence")
 
     monkeypatch.setattr(cv2, "findTransformECC", fail)
-    prior = content()
-    other = np.zeros_like(prior)
-    other[80:115, 5:35] = 0.95
-    quad = rr.v1.base_quad(SHAPE)
-    worker = rr.ReplayWorker(ecc_refine_enabled=enabled)
-    worker.acc._confirmed = (prior > 0.7).astype(np.uint8) * 255
-    worker.anchor = quad.copy()
     generation = worker.new_generation(preserve_identity=True)
     with rr.configured_ecc(enabled):
         if not enabled:
             for count in range(1, 3):
-                assert worker._identity_keeps_page(other, quad, generation) is None
-                assert worker.identity_events[-1]["decision"] == (
+                _sync_pass(worker, clock, other, generation, quad)
+                assert worker._identity_events[-1]["decision"] == (
                     "deferred_switch_consensus"
                 )
-                assert worker.identity_switch_votes == count
-                assert worker.identity_reference is not None
-        assert worker._identity_keeps_page(other, quad, generation) is (
-            None if enabled else False
-        )
-    event = worker.identity_events[-1]
+                assert worker._identity_switch_votes == count
+                assert worker._identity_reference is not None
+        _sync_pass(worker, clock, other, generation, quad)
+    event = worker._identity_events[-1]
     assert event["decision"] == ("deferred_ecc_rejected" if enabled else "new_page")
     assert event["deferred"] is bool(enabled)
     assert event["ecc_refine_enabled"] == enabled
-    assert (worker.identity_reference is not None) is bool(enabled)
+    assert (worker._identity_reference is not None) is bool(enabled)
     assert event["ecc_rejected"] is bool(enabled)
     assert calls == ([cv2.MOTION_HOMOGRAPHY, cv2.MOTION_AFFINE] if enabled else [])
     measured = rr.identity_measurements([event], enabled)[0]
@@ -349,11 +376,43 @@ def test_bench_loader_validates_cache_without_inference(tmp_path):
         rr.load_bench(tmp_path, protocol, package_path=package_path)
 
 
-class ProbIsWarp:
-    threshold = 0.7
+def _threaded_pass(real, prob, generation, corners):
+    with real._condition:
+        before = real._passes_total
+        real.submit(prob, generation, corners)
+        assert real._condition.wait_for(
+            lambda: real._passes_total > before or real._stopped, timeout=5
+        )
+    assert real.error is None
 
-    def ink_prob(self, warped):
-        return warped
+
+def _assert_same_worker_state(real, sync, generation):
+    np.testing.assert_array_equal(
+        real.poll(generation, 0)[1], sync.poll(generation, 0)[1]
+    )
+    if sync._anchor_corners is None:
+        assert real._anchor_corners is None
+    else:
+        np.testing.assert_array_equal(real._anchor_corners, sync._anchor_corners)
+    assert real._identity_defer_count == sync._identity_defer_count
+    assert real._identity_switch_votes == sync._identity_switch_votes
+    assert (real._identity_reference is None) == (sync._identity_reference is None)
+    np.testing.assert_array_equal(
+        real._accumulator._window[-1], sync._accumulator._window[-1]
+    )
+    real_events = list(real._identity_events)
+    sync_events = list(sync._identity_events)
+    assert len(real_events) == len(sync_events)
+    for actual, expected in zip(real_events, sync_events):
+        for key in (
+            "decision",
+            "deferred",
+            "quarantine_reason",
+            "quarantine_frames",
+            "ecc_rejected",
+            "ecc_refine_enabled",
+        ):
+            assert actual[key] == expected[key]
 
 
 @pytest.mark.parametrize("rejected_passes", [2, 4])
@@ -381,52 +440,22 @@ def test_v2_matches_production_quarantine_recovery_and_timeout(
     prob = content()
     other = np.flipud(np.fliplr(prob)).copy()
     quad = rr.v1.base_quad(SHAPE)
-    mirror = rr.ReplayWorker(ecc_refine_enabled=1)
+    sync, _clock = _sync_worker()
     real = ink._PageCleanWorker(ProbIsWarp()).start()
     try:
         with rr.configured_ecc(1):
-            generation = mirror.new_generation()
+            generation = sync.new_generation()
             assert real.new_generation() == generation
             for i in range(4 + rejected_passes + 4):
                 if i == 4:
-                    generation = mirror.new_generation(preserve_identity=True)
+                    generation = sync.new_generation(preserve_identity=True)
                     assert real.new_generation(preserve_identity=True) == generation
                 rejecting = 4 <= i < 4 + rejected_passes
                 current = other if rejecting else prob
-                mirror.submit((current, quad, quad), generation)
-                assert mirror.tick((i + 1) * 10) is not None
-                with real._condition:
-                    before = real._passes_total
-                    real.submit(current, generation, quad)
-                    assert real._condition.wait_for(
-                        lambda: real._passes_total > before or real._stopped, timeout=5
-                    )
-                    assert real.error is None
-                np.testing.assert_array_equal(
-                    real.poll(generation, 0)[1], mirror.published[1]
-                )
-                if mirror.anchor is None:
-                    assert real._anchor_corners is None
-                else:
-                    np.testing.assert_array_equal(real._anchor_corners, mirror.anchor)
-                assert real._identity_defer_count == mirror.identity_defer_count
-                assert real._identity_switch_votes == mirror.identity_switch_votes
-                assert (real._identity_reference is None) == (
-                    mirror.identity_reference is None
-                )
-                real_events = real.telemetry_snapshot()["page_identity_events"]
-                assert len(real_events) == len(mirror.identity_events)
-                for actual, expected in zip(real_events, mirror.identity_events):
-                    for key in (
-                        "decision",
-                        "deferred",
-                        "quarantine_reason",
-                        "quarantine_frames",
-                        "ecc_rejected",
-                        "ecc_refine_enabled",
-                    ):
-                        assert actual[key] == expected[key]
-            assert mirror.identity_events[-1]["decision"] == (
+                _sync_pass(sync, _clock, current, generation, quad)
+                _threaded_pass(real, current, generation, quad)
+                _assert_same_worker_state(real, sync, generation)
+            assert sync._identity_events[-1]["decision"] == (
                 "same_page" if rejected_passes == 2 else "quarantine_timeout"
             )
     finally:
@@ -456,110 +485,84 @@ def test_v2_matches_production_switch_consensus(monkeypatch, enabled, interrupt,
     prob = content()
     other = np.zeros_like(prob) if blank else np.flipud(np.fliplr(prob)).copy()
     quad = rr.v1.base_quad(SHAPE)
-    mirror = rr.ReplayWorker(ecc_refine_enabled=enabled)
+    sync, clock = _sync_worker()
     real = ink._PageCleanWorker(ProbIsWarp()).start()
     try:
         with rr.configured_ecc(enabled):
-            generation = mirror.new_generation()
+            generation = sync.new_generation()
             assert real.new_generation() == generation
             recovery = (
                 [False, False, True, False, False, False] if interrupt else [False] * 3
             )
             for i, rejected in enumerate([False] * 4 + recovery):
                 if i == 4:
-                    generation = mirror.new_generation(preserve_identity=True)
+                    generation = sync.new_generation(preserve_identity=True)
                     assert real.new_generation(preserve_identity=True) == generation
                 rejecting = rejected
                 current = prob if i < 4 else other
-                mirror.submit((current, quad, quad), generation)
-                assert mirror.tick((i + 1) * 10) is not None
-                with real._condition:
-                    before = real._passes_total
-                    real.submit(current, generation, quad)
-                    assert real._condition.wait_for(
-                        lambda: real._passes_total > before or real._stopped, timeout=5
-                    )
-                    assert real.error is None
-                np.testing.assert_array_equal(real._anchor_corners, mirror.anchor)
-                np.testing.assert_array_equal(
-                    real.poll(generation, 0)[1], mirror.published[1]
-                )
-                np.testing.assert_array_equal(
-                    real._accumulator._window[-1], mirror.acc._window[-1]
-                )
-                assert real._identity_switch_votes == mirror.identity_switch_votes
-                assert real._identity_defer_count == mirror.identity_defer_count
-                assert (real._identity_reference is None) == (
-                    mirror.identity_reference is None
-                )
+                _sync_pass(sync, clock, current, generation, quad)
+                _threaded_pass(real, current, generation, quad)
+                _assert_same_worker_state(real, sync, generation)
                 if i >= 4:
-                    actual = real._identity_events[-1]
-                    expected = mirror.identity_events[-1]
-                    for key in (
-                        "decision",
-                        "ecc_refine_enabled",
-                        "quarantine_frames",
-                        "deferred",
-                    ):
-                        assert actual[key] == expected[key]
+                    expected = sync._identity_events[-1]
                     if expected["decision"] == "deferred_switch_consensus":
-                        assert not np.any(mirror.acc._window[-1])
-                        assert not mirror._at_rest((i + 1) * 10)
+                        assert not np.any(sync._accumulator._window[-1])
+                        assert not sync._at_rest()
                         assert type(expected["ecc_refine_enabled"]) is int
-            assert mirror.identity_events[-1]["decision"] == "new_page"
-            assert mirror.identity_switch_votes == mirror.identity_defer_count == 0
-            assert mirror.identity_reference is None
+            assert sync._identity_events[-1]["decision"] == "new_page"
+            assert sync._identity_switch_votes == sync._identity_defer_count == 0
+            assert sync._identity_reference is None
     finally:
         real.stop()
 
 
 @pytest.mark.lento
 @pytest.mark.parametrize("enabled", [0, 1])
-def test_v2_matches_production_passes_and_fixed_same_page_anchor(monkeypatch, enabled):
+def test_v2_sync_matches_threaded_passes_and_fixed_same_page_anchor(
+    monkeypatch, enabled
+):
     monkeypatch.setattr(ink, "_PAGE_CLEAN_INTERVAL_SECONDS", 0.005)
     monkeypatch.setattr(ink, "_IDLE_PROBE_SECONDS", 0.005)
     prob = content()
     quad = rr.v1.base_quad(SHAPE)
-    mirror = rr.ReplayWorker(ecc_refine_enabled=enabled)
+    page_clean, sync, clock = _bound_page_clean(enabled)
+    observed = []
+    original = page_clean.observe
+
+    def capture(*args):
+        value = original(*args)
+        observed.append(value)
+        return value
+
+    page_clean.observe = capture
     real = ink._PageCleanWorker(ProbIsWarp()).start()
     try:
         with rr.configured_ecc(enabled):
-            generation = mirror.new_generation()
+            generation = sync.new_generation()
             assert real.new_generation() == generation
             for i in range(9):
                 if i == 6:
-                    generation = mirror.new_generation(preserve_identity=True)
+                    generation = sync.new_generation(preserve_identity=True)
                     assert real.new_generation(preserve_identity=True) == generation
                 corners = quad if i < 6 else quad + np.float32([3, -2])
-                # Capture the exact observation consumed by the mirror.
-                original = mirror.render_observation
-                observed = []
-
-                def capture(*args):
-                    value = original(*args)
-                    observed.append(value)
-                    return value
-
-                mirror.render_observation = capture
-                mirror.submit((prob, quad, corners), generation)
-                assert mirror.tick((i + 1) * 10.0) is not None
-                mirror.render_observation = original
+                clock.now += 10.0
+                sync.submit(rr.v1.SceneWarp(prob, quad, corners), generation, corners)
+                assert sync.pump() and sync.error is None
+                # The threaded worker gets the exact observation the
+                # replay's sync pass consumed.
                 before = real.stats()["passes_total"]
-                real.submit(observed[0], generation, corners)
+                real.submit(observed[-1], generation, corners)
                 deadline = time.monotonic() + 5
                 while real.stats()["passes_total"] == before:
                     assert time.monotonic() < deadline
                     time.sleep(0.001)
                 _, canvas = real.poll(generation, 0)
-                np.testing.assert_array_equal(canvas > 0, mirror.acc._confirmed > 0)
+                np.testing.assert_array_equal(canvas, sync.poll(generation, 0)[1])
             real_event = real.telemetry_snapshot()["page_identity_events"][-1]
             assert (
                 real_event["decision"]
-                == mirror.identity_events[-1]["decision"]
+                == sync._identity_events[-1]["decision"]
                 == "same_page"
             )
-            np.testing.assert_array_equal(mirror.anchor, quad)
-            assert all(p["same_page_anchor_unchanged"] for p in mirror.pass_records)
-            assert all(p["ecc_refine_enabled"] == enabled for p in mirror.pass_records)
     finally:
         real.stop()

@@ -2,33 +2,34 @@
 
 Mede, sem corrigir nada, se o laço do app distingue "a folha andou"
 de "a folha trocou". Até 87f52e4 os dois eram o mesmo evento: `drop`
-do `_SheetTracker` e a reabertura chamavam `new_generation()` em
-`draw/app.py` (`--app-logic legacy`). Na main (`--app-logic main`,
-padrão) o drop só deixa a identidade pendente e a reabertura chama
+do `_SheetTracker` e a reabertura chamavam `new_generation()`. Na
+main o drop só deixa a identidade pendente e a reabertura chama
 `new_generation(preserve_identity=True)`: a primeira passada mantém o
 canvas se o recall da tinta registrada for ≥
 `_PAGE_IDENTITY_MIN_RECALL`. O gatilho de cobertura (`_INK_TURN_*`)
 está desligado por padrão desde o hotfix de 2026-11-01.
 
-O replay roda em contagem de passadas, sem ONNX e sem threads, no
-mesmo padrão de `tools/replay_orchestration.py`, mas dirige a
-orquestração inteira e não só o acumulador:
+O replay roda em contagem de passadas, sem ONNX e sem threads, e
+dirige o CÓDIGO REAL do laço — `draw.loop.SheetInkLoop`, o mesmo
+objeto que `draw.app.run` monta — com as dependências simuladas:
 
-- uma câmera simulada: a página (mapa de probabilidade na grade da
-  página) está num quad VERDADEIRO na câmera; o detector devolve
-  esse quad com ruído (ou o quad balançando, ou nada);
-- o `_SheetTracker` real, com relógio de cena e a trabalhadora de
-  detecção espelhada sem thread: latência configurável
-  (`--detect-ms`, padrão 36,7 ms medidos no Ryzen), um quadro em
-  voo e fila latest-wins de tamanho 1, como `_SheetDetectionWorker`;
-- a lógica de geração do laço do app, espelhada linha a linha: drop
-  (identidade pendente, ou `new_generation()` em legacy), reabertura
-  → `new_generation(preserve_identity=...)`, mediana de
-  `_INK_CORNER_HISTORY` cantos, congelamento sem mão, evento de
-  virada atrás da flag;
-- a trabalhadora de tinta espelhada sem thread: cadência,
-  descanso total, registro na âncora (`_registration_matrix`) e o
-  `_LayeredInkAccumulator` reais.
+- uma câmera de cena: a página (mapa de probabilidade na grade da
+  página) está num quad VERDADEIRO na câmera; cada quadro declara o
+  quad que o detector devolve (com ruído, balançando, ou nada);
+- um detector falso com latência de cena (`SceneDetectionWorker`,
+  protocolo de `_SheetDetectionWorker`: `--detect-ms`, padrão
+  36,7 ms medidos no Ryzen, um quadro em voo e fila latest-wins de
+  tamanho 1) e uma presença de mão falsa (`SceneHandPresence`);
+- um relógio de cena determinístico, o mesmo para o laço e para a
+  trabalhadora;
+- a `_PageCleanWorker` real executada por `pump()` (sem thread) logo
+  depois de cada quadro do laço, com um page_clean falso que
+  re-warpa o mapa da página pelo quad que o laço usou.
+
+Drop, reabertura, mediana de `_INK_CORNER_HISTORY` cantos,
+congelamento sem mão, evento de virada atrás da flag, registro na
+âncora e acumulador são os do app: mudar o laço muda a régua, sem
+espelho a manter.
 
 Cada passada re-projeta o mapa da página pelo quad que o app usou
 (`cv2.warpPerspective` do mapa: o modelo não é re-rodado no quadro
@@ -64,12 +65,14 @@ Uso:
 """
 
 import argparse
+import contextlib
 import copy
 import importlib.util
 import json
+import os
 import sys
+import threading
 import zlib
-from collections import deque
 from pathlib import Path
 
 import cv2
@@ -77,12 +80,9 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from draw.app import (  # noqa: E402
-    _INK_CORNER_HISTORY,
-    _LayeredInkAccumulator,
-    _SheetTracker,
-)
 from draw import ink_layers as _ink  # noqa: E402
+from draw.ink_layers import _LayeredInkAccumulator, _PageCleanWorker  # noqa: E402
+from draw.loop import SheetInkLoop  # noqa: E402
 
 HOME = Path.home()
 LAB = HOME / "workspace/draw-lab"
@@ -100,10 +100,11 @@ CAMERA_W, CAMERA_H = 1280, 720
 DETECTOR_NOISE_PX = 1.0
 # Duração de uma detecção de folha no Ryzen (draw/sheet_track.py).
 DETECT_MS = 36.7
-# Lógica do laço espelhada: "main" é a recuperação de identidade
-# (87f52e4: drop guarda a geração, a reabertura decide pela tinta);
-# "legacy" é a anterior (drop → new_generation()).
-APP_LOGICS = ("main", "legacy")
+# Lógica do laço: a de draw/loop.py, dirigida de verdade. Desde
+# 87f52e4 é a recuperação de identidade (drop guarda a geração, a
+# reabertura decide pela tinta); a lógica anterior ("legacy", drop →
+# new_generation()) não existe mais no app e saiu da régua junto com
+# o espelho que a reproduzia.
 APP_LOGIC = "main"
 SETTLE_FRAMES = 5 * FPS
 SWAY_FRAMES = 60 * FPS
@@ -301,357 +302,118 @@ def render_pass(page, true_quad, warp_corners):
 
 
 # --------------------------------------------------------------------
-# Trabalhadora de tinta espelhada (sem thread)
+# Dependências simuladas do laço real (draw/loop.py)
 # --------------------------------------------------------------------
 
 
-class ReplayWorker:
-    """Espelho de _PageCleanWorker._work com relógio de cena.
+class SceneClock:
+    """Relógio de cena: o mesmo instante para o laço e as trabalhadoras."""
 
-    Mesma cadência (_pass_interval), mesmo descanso total
-    (_at_rest), mesma âncora e registro, mesmo acumulador. A passada
-    é instantânea; o mapa da passada é renderizado só quando a
-    passada roda, a partir do quadro submetido (latest-wins).
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+
+class SceneWarp:
+    """O "warp" que a câmera de cena entrega ao laço.
+
+    Carrega a página, o quad verdadeiro e o quad com que o laço
+    retificou; o mapa só é renderizado quando a passada da
+    trabalhadora roda (latest-wins: warps substituídos nunca custam).
     """
 
-    def __init__(self, turn_event_enabled=False):
-        self.turn_event_enabled = turn_event_enabled
-        self.acc = _LayeredInkAccumulator(threshold=THRESHOLD)
-        self.generation = 0
-        self.worker_generation = -1
-        self.anchor = None
-        self.pending = None
-        self.last_pass_start = None
-        self.published = None
-        self.turn_event = None
-        self.hand_state = None
-        self.confirm_once = False
-        self.still_passes = 0
-        self.generation_passes = 0
-        self.quiet_passes = 0
-        self.hand_motion_at = None
-        self.passes_total = 0
-        self.coverage_turn_signals = 0
-        self.publish_seq = 0
-        self.identity_reference = None
-        self.identity_reference_corners = None
-        self.identity_recovery_requested = False
-        self.identity_defer_count = 0
-        self.identity_switch_votes = 0
-        self._identity_deferred = False
-        self._identity_timed_out = False
-        self._identity_switch_pending = False
-        self.identity_events = []
-        self.ecc_records = []
-        self._identity_candidate = None
-        self._identity_ecc = None
+    __slots__ = ("page", "true_quad", "corners")
 
-    def new_generation(self, preserve_identity=False):
-        self.identity_recovery_requested = bool(preserve_identity)
-        self.identity_defer_count = 0
-        self.identity_switch_votes = 0
-        if preserve_identity:
-            reference = self.acc._confirmed
-            self.identity_reference = None if reference is None else reference.copy()
-            self.identity_reference_corners = (
-                None if self.anchor is None else self.anchor.copy()
-            )
-        else:
-            self.identity_reference = None
-            self.identity_reference_corners = None
-        self.generation += 1
-        self.still_passes = 0
-        self.generation_passes = 0
-        self.quiet_passes = 0
-        self.pending = None
-        self.published = None
-        self.turn_event = None
-        return self.generation
+    def __init__(self, page, true_quad, corners):
+        self.page = page
+        self.true_quad = true_quad
+        self.corners = corners
 
-    def submit(self, job, generation):
-        if generation == self.generation:
-            self.pending = (job, generation)
 
-    def set_hand_presence(self, present, moved, now):
-        if present is False and self.hand_state is not False:
-            self.confirm_once = True
-        if present is not None:
-            self.still_passes = 0
-        if present is not None and (moved or present != self.hand_state):
-            self.hand_motion_at = now
-        self.hand_state = present
+class ScenePageClean:
+    """page_clean falso: o mapa de probabilidade é o da cena re-warpado."""
 
-    def _at_rest(self, now):
-        if self.identity_recovery_requested and self.identity_reference is not None:
-            return False
-        if (
-            self.generation_passes < _ink._REST_MIN_GENERATION_PASSES
-            or self.quiet_passes < _ink._REST_QUIET_PASSES
-        ):
-            return False
-        if self.hand_state is False:
-            return not self.confirm_once
-        if self.hand_state is True:
-            return (
-                self.hand_motion_at is not None
-                and now - self.hand_motion_at >= _ink._HAND_REST_STILL_SECONDS
-            )
-        return False
+    threshold = THRESHOLD
 
-    def _interval(self, now):
-        if self._at_rest(now):
-            return None
-        if self.hand_state is False and not self.confirm_once:
-            return _ink._IDLE_PROBE_SECONDS
-        if (
-            self.hand_state is None
-            and self.still_passes >= _ink._NO_HAND_REST_AFTER_STILL_PASSES
-        ):
-            return _ink._IDLE_PROBE_SECONDS
-        return _ink._PAGE_CLEAN_INTERVAL_SECONDS
+    def __init__(self):
+        self.worker = None
 
-    def tick(self, now):
-        """Roda a passada se a cadência e o descanso deixarem."""
-        if self.pending is None:
-            return None
-        if self.last_pass_start is not None:
-            interval = self._interval(now)
-            if interval is None or now - self.last_pass_start < interval - 1e-9:
-                return None
-        (page, true_quad, corners), generation = self.pending
-        self.pending = None
-        self.last_pass_start = now
-        if self.confirm_once:
-            self.confirm_once = False
-        prob = self.render_observation(page, true_quad, corners)
-        first_pass = generation != self.worker_generation
-        identity_pending = (
-            self.identity_recovery_requested and self.identity_reference is not None
-        )
-        self._identity_deferred = False
-        self._identity_timed_out = False
-        self._identity_switch_pending = False
-        if first_pass:
-            self.worker_generation = generation
-            self.generation_passes = 0
-            self.quiet_passes = 0
-        identity_new_page = (first_pass or identity_pending) and (
-            self._identity_keeps_page(prob, corners, generation) is False
-        )
-        if identity_new_page:
-            self.acc.reset()
-            self.anchor = corners
-        if (first_pass or identity_pending) and self._identity_candidate is not None:
-            prob = self._identity_candidate
-            ecc_info = self._identity_ecc
-        else:
-            if (first_pass or identity_pending) and self._identity_ecc is not None:
-                ecc_info = self._identity_ecc
-            else:
-                confirmed = self.acc._confirmed
-                prob, _visible, ecc_info = _ink._register_ink_probability(
-                    prob,
-                    self.anchor,
-                    corners,
-                    None if confirmed is None else confirmed.astype(np.float32) / 255.0,
-                )
-        ecc_info = {
-            **ecc_info,
-            "ecc_refine_enabled": int(_ink._ecc_refinement_enabled()),
-        }
-        self.ecc_records.append(ecc_info)
-        result = self.acc.add(
-            prob,
-            np.zeros(prob.shape, dtype=bool)
-            if self._identity_deferred or self._identity_switch_pending
-            else None,
-        )
-        if (
-            result["confirmed_changed"]
-            or result["provisional_changed"]
-            or result["turn"]
-        ):
-            self.still_passes = 0
-        else:
-            self.still_passes += 1
-        self.generation_passes += 1
-        if result["confirmed_changed"] or result["turn"]:
-            self.quiet_passes = 0
-        else:
-            self.quiet_passes += 1
-        self.passes_total += 1
-        if result["turn"]:
-            self.coverage_turn_signals += 1
-            if self.turn_event_enabled and self.turn_event is None:
-                self.turn_event = (generation, result["confirmed"])
-        if (
-            first_pass
-            or self._identity_timed_out
-            or identity_new_page
-            or result["confirmed_changed"]
-        ):
-            self.published = (generation, result["confirmed"])
-            self.publish_seq += 1
-        return result
+    def bind(self, worker):
+        self.worker = worker
 
-    def render_observation(self, page, true_quad, corners):
+    def ink_prob(self, warped):
+        return self.observe(warped.page, warped.true_quad, warped.corners)
+
+    def observe(self, page, true_quad, corners):
         return render_pass(page, true_quad, corners)
 
-    def _identity_keeps_page(self, prob, corners, generation):
-        """True/False decide; None adia, como no worker de ink_layers."""
-        reference = self.identity_reference
-        reference_corners = self.identity_reference_corners
-        requested = self.identity_recovery_requested
-        keep_page = False
-        recall = None
-        containment = None
-        seen = prior = None
-        self._identity_candidate = None
-        self._identity_ecc = None
-        self._identity_deferred = False
-        self._identity_timed_out = False
-        self._identity_switch_pending = False
-        enabled = int(_ink._ecc_refinement_enabled())
-        quarantine_frames = 0
-        if reference is not None:
-            confirmed = self.acc._confirmed
-            candidate, _visible, self._identity_ecc = _ink._register_ink_probability(
-                prob,
-                reference_corners,
-                corners,
-                None if confirmed is None else confirmed.astype(np.float32) / 255.0,
-            )
-            prior = reference > 0
-            prior_px = int(np.count_nonzero(prior))
-            seen = candidate > self.acc.threshold
-            if prior_px == 0:
-                keep_page = not np.any(seen)
-                recall = 1.0 if keep_page else 0.0
-                containment = 1.0 if keep_page else 0.0
-            else:
-                kernel = np.ones((_ink._IDENTITY_DILATION_KERNEL,) * 2, np.uint8)
-                seen_d = cv2.dilate(seen.astype(np.uint8), kernel) > 0
-                prior_d = cv2.dilate(prior.astype(np.uint8), kernel) > 0
-                recall = np.count_nonzero(prior & seen_d) / prior_px
-                seen_px = int(np.count_nonzero(seen))
-                containment = (
-                    0.0 if seen_px == 0 else np.count_nonzero(seen & prior_d) / seen_px
-                )
-                keep_page = (
-                    recall >= _ink._PAGE_IDENTITY_MIN_RECALL
-                    and containment >= _ink._PAGE_IDENTITY_MIN_CONTAINMENT
-                )
-            self._identity_deferred = bool(
-                enabled and self._identity_ecc.get("ecc_rejected")
-            )
-            if self._identity_deferred:
-                self.identity_defer_count += 1
-                quarantine_frames = self.identity_defer_count
-                self._identity_timed_out = (
-                    quarantine_frames > _ink._PAGE_IDENTITY_MAX_DEFERRALS
-                )
-        if self._identity_deferred:
-            self.identity_switch_votes = 0
-        elif reference is not None and not keep_page:
-            self.identity_switch_votes += 1
-            self._identity_switch_pending = (
-                self.identity_switch_votes < _ink._PAGE_IDENTITY_SWITCH_CONSENSUS_FRAMES
-            )
-        else:
-            self.identity_switch_votes = 0
-        if reference is not None and (
-            keep_page or self._identity_deferred or self._identity_switch_pending
-        ):
-            self._identity_candidate = candidate
-        decision = (
-            "quarantine_timeout"
-            if self._identity_timed_out
-            else "deferred_ecc_rejected"
-            if self._identity_deferred
-            else "deferred_switch_consensus"
-            if self._identity_switch_pending
-            else "same_page"
-            if keep_page
-            else "new_page"
-        )
-        if requested:
-            chamfer = (
-                _ink._identity_chamfer_fields(
-                    seen,
-                    prior,
-                    decision,
-                    self._identity_ecc or {},
-                )
-                if _ink._identity_chamfer_enabled()
-                else {}
-            )
-            self.identity_events.append(
-                {
-                    "generation": generation,
-                    "decision": decision,
-                    "recall": None if recall is None else round(float(recall), 4),
-                    "containment": (
-                        None if containment is None else round(float(containment), 4)
-                    ),
-                    **(self._identity_ecc or {}),
-                    **chamfer,
-                    "ecc_refine_enabled": enabled,
-                    "ecc_rejected": bool(
-                        (self._identity_ecc or {}).get("ecc_rejected")
-                    ),
-                    "deferred": self._identity_deferred,
-                    "quarantine_frames": quarantine_frames,
-                    "quarantine_reason": "ecc_rejected"
-                    if self._identity_deferred
-                    else None,
-                }
-            )
-        if not (
-            (self._identity_deferred and not self._identity_timed_out)
-            or self._identity_switch_pending
-        ):
-            self.identity_reference = None
-            self.identity_reference_corners = None
-            self.identity_recovery_requested = False
-            self.identity_defer_count = 0
-            self.identity_switch_votes = 0
-        if self._identity_timed_out:
-            self.acc.reset()
-            self.anchor = None
-            self.worker_generation = -1
-            self.generation_passes = 0
-            self.quiet_passes = 0
-            self.still_passes = 0
-        return (
-            None
-            if self._identity_deferred or self._identity_switch_pending
-            else bool(keep_page)
-        )
 
-    def take_turn_event(self, generation):
-        if self.turn_event is None or self.turn_event[0] != generation:
-            return None
-        event, self.turn_event = self.turn_event, None
-        return event[1]
+class CountingAccumulator(_LayeredInkAccumulator):
+    """O acumulador real; só conta os sinais de virada e guarda o resultado."""
+
+    def __init__(self, threshold=0.7):
+        super().__init__(threshold)
+        self.turn_signals = 0
+        self.last_result = None
+
+    def add(self, prob, visible=None):
+        result = super().add(prob, visible)
+        if result["turn"]:
+            self.turn_signals += 1
+        self.last_result = result
+        return result
 
 
-# --------------------------------------------------------------------
-# Laço do app espelhado (folha + geração + tinta)
-# --------------------------------------------------------------------
+class ReplayInkWorker(_PageCleanWorker):
+    """A trabalhadora real, dirigida por pump() (sem thread).
 
-
-class ReplayDetector:
-    """`_SheetDetectionWorker` sem thread, em relógio de cena.
-
-    Uma detecção em voo por vez, que termina `latency` segundos
-    depois de começar; um quadro submetido com a trabalhadora
-    ocupada espera numa fila de tamanho 1 e é substituído pelo
-    próximo (latest-wins). poll() devolve só o resultado mais novo,
-    com o carimbo de captura do quadro detectado.
+    Só acrescenta cópia profunda (os cenários partem de uma cópia do
+    app assentado); nenhum comportamento é sobrescrito — o teste
+    tests/test_replay_reregister.py cobra isso.
     """
 
-    def __init__(self, latency):
+    def __deepcopy__(self, memo):
+        clone = type(self).__new__(type(self))
+        memo[id(self)] = clone
+        for key, value in self.__dict__.items():
+            if key in ("_condition", "_thread"):
+                continue
+            setattr(clone, key, copy.deepcopy(value, memo))
+        clone._condition = threading.Condition()
+        clone._thread = threading.Thread(
+            target=clone._work, name="draw-page-clean", daemon=True
+        )
+        return clone
+
+
+def make_ink_worker(page_clean, clock):
+    """`_PageCleanWorker` real em modo síncrono, com histórico completo."""
+    worker = ReplayInkWorker(page_clean, clock=clock, history=(None, None))
+    worker._accumulator = CountingAccumulator(
+        threshold=getattr(page_clean, "threshold", 0.7)
+    )
+    bind = getattr(page_clean, "bind", None)
+    if bind is not None:
+        bind(worker)
+    return worker
+
+
+class SceneDetectionWorker:
+    """Detector de folha falso com a latência de cena.
+
+    O protocolo é o de `_SheetDetectionWorker` (submit/poll/error/
+    take_traces), que o laço real consome: uma detecção em voo por
+    vez, que termina `latency` segundos depois de começar; um quadro
+    submetido com a detecção ocupada espera numa fila de tamanho 1 e
+    é substituído pelo próximo (latest-wins). A "detecção" devolve o
+    quad que a cena declara para o quadro (`Frame.detected`).
+    """
+
+    def __init__(self, latency, clock):
         self.latency = latency
+        self.clock = clock
         self.inflight = None
         self.pending = None
         self.result = None
@@ -659,6 +421,21 @@ class ReplayDetector:
         self.submitted = 0
         self.completed = 0
         self.replaced = 0
+        self.error = None
+
+    @staticmethod
+    def _detect(frame):
+        corners = (
+            None
+            if frame.detected is None
+            else np.asarray(frame.detected, np.float32).copy()
+        )
+        return corners, frame.verdict
+
+    def _start(self, job, start):
+        frame, captured_at = job
+        corners, verdict = self._detect(frame)
+        self.inflight = (corners, verdict, captured_at, start + self.latency)
 
     def _advance(self, now):
         while self.inflight is not None and self.inflight[3] <= now + 1e-9:
@@ -666,36 +443,87 @@ class ReplayDetector:
             self.inflight = None
             self.seq += 1
             self.completed += 1
-            self.result = (self.seq, corners, verdict, captured_at)
+            self.result = (
+                self.seq,
+                corners,
+                verdict,
+                captured_at,
+                round(self.latency * 1000.0, 1),
+            )
             if self.pending is not None:
-                corners, verdict, captured_at = self.pending
-                self.pending = None
-                self.inflight = (
-                    corners,
-                    verdict,
-                    captured_at,
-                    max(done_at, captured_at) + self.latency,
-                )
+                job, self.pending = self.pending, None
+                self._start(job, max(done_at, job[1]))
 
-    def poll(self, now, after_seq):
-        self._advance(now)
+    def poll(self, after_seq):
+        self._advance(self.clock())
         if self.result is None or self.result[0] <= after_seq:
             return None
         return self.result
 
-    def submit(self, corners, verdict, now):
+    def submit(self, frame, captured_at, frame_index=None):
+        now = self.clock()
         self._advance(now)
         self.submitted += 1
         if self.inflight is None:
-            self.inflight = (corners, verdict, now, now + self.latency)
+            self._start((frame, captured_at), now)
             return
         if self.pending is not None:
             self.replaced += 1
-        self.pending = (corners, verdict, now)
+        self.pending = (frame, captured_at)
+
+    def take_traces(self, upto_result_seq=None):
+        return []
+
+
+class SceneHandPresence:
+    """Presença de mão falsa: o sinal que a cena declara para o quadro.
+
+    Protocolo de `_HandPresenceWorker` (submit/poll/error): o
+    resultado da amostra submetida num quadro é colhido pelo laço no
+    poll do quadro seguinte, como a amostragem assíncrona real.
+    """
+
+    def __init__(self):
+        self.seq = 0
+        self.result = None
+        self.error = None
+
+    def submit(self, frame, _captured_ms):
+        present, moved = frame.hand
+        self.seq += 1
+        self.result = (self.seq, present, moved)
+
+    def poll(self, after_seq):
+        if self.result is None or self.result[0] <= after_seq:
+            return None
+        return self.result
+
+    def stop(self):
+        pass
+
+
+def _no_gray(_frame):
+    return None
+
+
+def _no_display_track(*_args):
+    return None
+
+
+def _no_display_render(*_args, **_kwargs):
+    # O painel da janela fica fora da régua: a grade da página da
+    # cena não é a do formato do app (render_canvas exige a dele).
+    return None
+
+
+def _log_stderr(*args):
+    print(*args, file=sys.stderr)
 
 
 class Frame:
-    """O que a cena entrega num quadro."""
+    """O que a câmera de cena entrega num quadro."""
+
+    shape = (CAMERA_H, CAMERA_W, 3)
 
     def __init__(self, page, true_quad, detected, verdict="paper", hand=(None, False)):
         self.page = page
@@ -706,10 +534,14 @@ class Frame:
 
 
 class ReplayApp:
-    """Espelho do caminho page-clean do laço de draw/app.py::run.
+    """O laço real de draw/app.py (`SheetInkLoop`) em relógio de cena.
 
-    Só o que decide geometria, sessão e geração: o resto do laço
-    (exibição, gravação, telemetria) não toca o canvas confirmado.
+    Dependências injetadas: câmera de cena (os quadros que step()
+    recebe), detector falso com latência de cena, presença de mão
+    falsa, relógio determinístico e a trabalhadora de tinta real
+    executada por pump() logo depois de cada quadro do laço. A
+    decisão de geometria, sessão e geração é a do app, não um
+    espelho dela.
     """
 
     def __init__(
@@ -717,118 +549,99 @@ class ReplayApp:
         hand_state,
         turn_event_enabled=False,
         detect_ms=None,
-        app_logic=None,
-        worker_factory=ReplayWorker,
+        page_clean_factory=ScenePageClean,
     ):
         self.hand_state = hand_state
-        self.app_logic = APP_LOGIC if app_logic is None else app_logic
-        if self.app_logic not in APP_LOGICS:
-            raise ValueError(f"app_logic desconhecida: {self.app_logic}")
-        self.recovery_pending = False
-        self.mask_cleared = False
-        self.mask_cleared_at_seq = 0
-        self.tracker = _SheetTracker()
-        self.detector = ReplayDetector(
-            (DETECT_MS if detect_ms is None else detect_ms) / 1000.0
+        self.turn_event_enabled = bool(turn_event_enabled)
+        self.clock = SceneClock()
+        self.worker = make_ink_worker(page_clean_factory(), self.clock)
+        self.detector = SceneDetectionWorker(
+            (DETECT_MS if detect_ms is None else detect_ms) / 1000.0, self.clock
         )
-        self.last_det_seq = 0
-        self.worker = worker_factory(turn_event_enabled)
-        self.corner_history = deque(maxlen=_INK_CORNER_HISTORY)
-        self.ink_session_open = False
-        self.clean_generation = 0
-        self.frame_number = 0
-        self.frame_index = 0
-        self.events = {"drop": 0, "reopen": 0, "turn": 0}
         self.last_warp_corners = None
-
-    def _new_generation(self, reason, preserve_identity=False):
-        self.events[reason] += 1
-        self.clean_generation = self.worker.new_generation(
-            preserve_identity=preserve_identity
+        self._page_shape_hint = None
+        self.loop = SheetInkLoop(
+            detection_worker=self.detector,
+            ink_worker=self.worker,
+            hand_presence_worker=None if hand_state is None else SceneHandPresence(),
+            clock=self.clock,
+            warp_sheet=self._warp_sheet,
+            to_gray=_no_gray,
+            track_display=_no_display_track,
+            render_display=_no_display_render,
+            log=_log_stderr,
         )
+        self.frame_index = 0
+
+    def _warp_sheet(self, frame, corners):
+        self.last_warp_corners = np.asarray(corners, np.float32).copy()
+        page = (
+            frame.page
+            if frame.page is not None
+            else np.zeros_like(self._page_shape_hint)
+        )
+        return SceneWarp(page, frame.true_quad, self.last_warp_corners)
+
+    # Leituras do estado real (para os relatórios).
+    @property
+    def clean_generation(self):
+        return self.loop.clean_generation
+
+    @property
+    def events(self):
+        return dict(self.loop.generation_events)
 
     def canvas(self):
-        """O canvas dos consumidores (clean_mask do app).
+        """O canvas dos consumidores (clean_mask do laço)."""
+        return self.loop.clean_mask
 
-        O drop zera clean_mask no app nas duas lógicas; ele só volta
-        quando a trabalhadora publica de novo.
-        """
-        published = self.worker.published
-        if published is None or published[0] != self.clean_generation:
-            return None
-        if self.mask_cleared:
-            if self.worker.publish_seq == self.mask_cleared_at_seq:
-                return None
-            self.mask_cleared = False
-        return published[1]
+    def passes_total(self):
+        return self.worker._passes_total
+
+    def anchor(self):
+        return self.worker._anchor_corners
+
+    def identity_events(self):
+        return list(self.worker._identity_events)
+
+    def ecc_records(self):
+        return list(self.worker._telemetry_records)
+
+    def coverage_turn_signals(self):
+        return self.worker._accumulator.turn_signals
+
+    def pump_ink(self):
+        return self.worker.pump()
 
     def step(self, frame):
-        now = self.frame_index * DT
-        det_result = self.detector.poll(now, self.last_det_seq)
-        if det_result is not None:
-            self.last_det_seq, detected, verdict, captured_at = det_result
-            ran_detection = True
-        else:
-            detected, verdict, captured_at = None, None, None
-            ran_detection = False
-        if self.tracker.should_detect(self.frame_number):
-            corners = (
-                None
-                if frame.detected is None
-                else np.asarray(frame.detected, np.float32).copy()
-            )
-            self.detector.submit(corners, frame.verdict, now)
-        event = self.tracker.update(
-            detected,
-            verdict,
-            ran_detection,
-            captured_at if ran_detection else now,
-        )
-        if event == "drop":
-            self.ink_session_open = False
-            self.mask_cleared = True
-            self.mask_cleared_at_seq = self.worker.publish_seq
-            if self.app_logic == "legacy":
-                self._new_generation("drop")
-            else:
-                # 87f52e4: a queda não prova página nova; a primeira
-                # passada da reabertura decide pela tinta.
-                self.events["drop"] += 1
-                self.recovery_pending = True
-        self.frame_number += 1
-        hand_present = None
-        if self.hand_state is not None:
-            hand_present, moved = frame.hand
-            if ran_detection and self.tracker.corners is not None:
-                self.worker.set_hand_presence(hand_present, moved, now)
-            hand_present = self.worker.hand_state
-        if ran_detection and self.tracker.corners is not None:
-            if not self.ink_session_open:
-                self._new_generation("reopen", preserve_identity=self.recovery_pending)
-                self.recovery_pending = False
-                self.corner_history.clear()
-                self.ink_session_open = True
-            if hand_present is not False or not self.corner_history:
-                self.corner_history.append(self.tracker.corners.copy())
-            ink_corners = np.median(np.stack(self.corner_history), axis=0).astype(
-                np.float32
-            )
-            self.last_warp_corners = ink_corners
-            page = (
-                frame.page
-                if frame.page is not None
-                else np.zeros_like(self._page_shape_hint)
-            )
-            self.worker.submit(
-                (page, frame.true_quad, ink_corners), self.clean_generation
-            )
+        self.clock.now = self.frame_index * DT
         if frame.page is not None:
             self._page_shape_hint = frame.page
-        result = self.worker.tick(now)
-        if self.worker.take_turn_event(self.clean_generation) is not None:
-            self._new_generation("turn")
+        with _scoped_env(_ink._ENV_TURN_EVENT_VAR, "1" if self.turn_event_enabled else "0"):
+            outcome = self.loop.step(frame, self.clock.now * 1000.0)
+            ran = self.pump_ink()
+            if ran and outcome is None:
+                # O consumidor colhe a passada no mesmo quadro (o
+                # mesmo código do fim de step()): o canvas e a
+                # contagem de passadas do relatório andam juntos.
+                outcome = self.loop.collect_ink()
+        if outcome is not None or self.worker.error is not None:
+            raise RuntimeError("a trabalhadora de tinta falhou") from self.worker.error
         self.frame_index += 1
-        return result
+        return ran
+
+
+@contextlib.contextmanager
+def _scoped_env(name, value):
+    previous = os.environ.get(name)
+    os.environ[name] = value
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = previous
 
 
 def _hand(config, moving):
@@ -998,8 +811,8 @@ def settle_drawing(
     drawing_hand = (None, False) if hand_config[0] is None else (True, True)
     target = PASSES_PER_WARP * len(drawing)
     guard = 0
-    while app.worker.passes_total < target:
-        passes = app.worker.passes_total
+    while app.passes_total() < target:
+        passes = app.passes_total()
         stage = drawing[min(passes // PASSES_PER_WARP, len(drawing) - 1)]
         app.step(
             Frame(
@@ -1061,13 +874,13 @@ class Episode:
         self.app = app
         self.before = None if app.canvas() is None else app.canvas().copy()
         self.anchor_before = (
-            None if app.worker.anchor is None else app.worker.anchor.copy()
+            None if app.anchor() is None else app.anchor().copy()
         )
         self.warp_before = app.last_warp_corners.copy()
         self.events_before = dict(app.events)
-        self.passes_before = app.worker.passes_total
-        self.turns_before = app.worker.coverage_turn_signals
-        self.identity_before = len(app.worker.identity_events)
+        self.passes_before = app.passes_total()
+        self.turns_before = app.coverage_turn_signals()
+        self.identity_before = len(app.identity_events())
         self.det_before = (app.detector.completed, app.detector.replaced)
         self.generation_before = app.clean_generation
         self.frames = 0
@@ -1095,13 +908,13 @@ class Episode:
 
     def mark(self):
         """Fim da perturbação (o resto é assentamento)."""
-        self.passes_during = self.app.worker.passes_total - self.passes_before
+        self.passes_during = self.app.passes_total() - self.passes_before
 
     def report(self, true_before, true_after, identity_true_class=None):
         app = self.app
         shape = (self.before if self.before is not None else app.canvas()).shape
         events = {k: app.events[k] - self.events_before[k] for k in app.events}
-        anchor_after = app.worker.anchor
+        anchor_after = app.anchor()
         candidates = [("identity", np.eye(3))]
         if self.anchor_before is not None and anchor_after is not None:
             pa1 = _page_matrix(self.anchor_before, shape)
@@ -1133,12 +946,12 @@ class Episode:
             )
         comparison = compare_canvases(self.before, app.canvas(), candidates)
         generations = app.clean_generation - self.generation_before
-        passes = app.worker.passes_total - self.passes_before
+        passes = app.passes_total() - self.passes_before
         geometry_error = float(
             np.max(np.linalg.norm(app.last_warp_corners - true_after, axis=1))
         )
-        identity = app.worker.identity_events[self.identity_before :]
-        ecc_records = app.worker.ecc_records[self.passes_before :]
+        identity = app.identity_events()[self.identity_before :]
+        ecc_records = app.ecc_records()[self.passes_before :]
         ecc_ms = [record["ecc_ms"] for record in ecc_records]
         same_page = sum(1 for e in identity if e["decision"] == "same_page")
         chamfer = {}
@@ -1157,7 +970,9 @@ class Episode:
             "generations_created": generations,
             # Reabertura que a identidade reconheceu como a mesma
             # página não é virada: a geração sobe, o canvas fica.
-            "false_page_turns": events["reopen"] - same_page + events["turn"],
+            "false_page_turns": (
+                events["reopen"] - same_page + events["turn"] + events["split"]
+            ),
             "identity_decisions": [e["decision"] for e in identity],
             "identity_recalls": [e["recall"] for e in identity],
             "identity_containments": [e.get("containment") for e in identity],
@@ -1165,7 +980,7 @@ class Episode:
             "reopens": events["reopen"],
             "coverage_turns_applied": events["turn"],
             "coverage_turn_signals": (
-                app.worker.coverage_turn_signals - self.turns_before
+                app.coverage_turn_signals() - self.turns_before
             ),
             "canvas_zeroed": self.min_px == 0,
             "min_confirmed_px_during": self.min_px,
@@ -1284,7 +1099,7 @@ def run_drop(base, settled, hand_config, lost_frames, mode, return_pages=None):
     )
     out["return_kind"] = "turn" if return_pages is not None else "same"
     # Sobreviver = o acumulador não foi zerado: nenhuma reabertura
-    # como página nova (legacy sempre zera; main zera quando a
+    # como página nova (zera quando a
     # identidade decide new_page). canvas_zeroed diz se o consumidor
     # ficou sem canvas durante a perda (o drop zera clean_mask nas
     # duas lógicas); canvas_identical_after_move compara o fim.
@@ -1450,7 +1265,7 @@ def run_all(drawing, settled, source):
         app = bases[False][0]
         results["settled_drawing"][hand_name] = {
             "confirmed_px": int(np.count_nonzero(app.canvas())),
-            "passes_total": app.worker.passes_total,
+            "passes_total": app.passes_total(),
             "generations": app.clean_generation,
         }
         results["control_static"][hand_name] = run_control(
@@ -1540,7 +1355,7 @@ def run_all(drawing, settled, source):
 
 
 def main():
-    global DETECT_MS, APP_LOGIC
+    global DETECT_MS
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", default=None)
     parser.add_argument(
@@ -1555,19 +1370,12 @@ def main():
         help="duracao simulada de uma deteccao de folha (ms)",
     )
     parser.add_argument(
-        "--app-logic",
-        choices=APP_LOGICS,
-        default=APP_LOGIC,
-        help="main = recuperacao de identidade; legacy = drop zera",
-    )
-    parser.add_argument(
         "--strict",
         action="store_true",
         help="sai com 1 se um portao (moveu/balanco padrao) reprovar",
     )
     args = parser.parse_args()
     DETECT_MS = args.detect_ms
-    APP_LOGIC = args.app_logic
     if not args.synthetic and (RULER / "prob_cache.py").exists():
         drawing, settled = real_pages()
         source = "real"

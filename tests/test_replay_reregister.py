@@ -1,14 +1,17 @@
 """Régua de re-registro (tools/replay_reregister.py).
 
-A régua só vale se o espelho do laço for fiel ao código que ela
-mede e se o comparador "a menos de re-warp" não inventar nem
-esconder diferença. Estes testes cobram as duas coisas, sem o
-draw-lab e em escala reduzida; o veredito da régua (que hoje
+A régua só vale se medir o código do app e se o comparador "a menos
+de re-warp" não inventar nem esconder diferença. Estes testes cobram
+que o replay dirige o laço real (`draw.loop.SheetInkLoop`) e a
+`_PageCleanWorker` real, que o caminho síncrono (`pump()`) dá o mesmo
+resultado da thread, e o comparador — sem o draw-lab e em escala
+reduzida; o veredito da régua (que hoje
 reprova o comportamento do app) NÃO é cobrado aqui — ele é a
 baseline documentada em docs/FALHAS.md, e a correção futura muda
 os números sem quebrar este arquivo.
 """
 
+import copy
 import importlib.util
 import sys
 import time
@@ -23,6 +26,7 @@ sys.path.insert(0, str(REPO))
 
 from draw import app as app_module  # noqa: E402
 from draw import ink_layers as ink_layers_module  # noqa: E402
+from draw import loop as loop_module  # noqa: E402
 
 
 def _load_tool():
@@ -47,8 +51,45 @@ class _ProbIsWarp:
         return warped
 
 
+def _drive_threaded(sequence, recover_at=None, extra=()):
+    """A trabalhadora em thread, como no app: uma passada por submit."""
+    real = app_module._PageCleanWorker(_ProbIsWarp()).start()
+    try:
+        generation = real.new_generation()
+        for i, (prob, corners) in enumerate(list(sequence) + list(extra)):
+            if i == recover_at:
+                generation = real.new_generation(preserve_identity=True)
+            before = real.stats()["passes_total"]
+            real.submit(prob, generation, corners)
+            deadline = time.monotonic() + 5.0
+            while real.stats()["passes_total"] <= before:
+                assert time.monotonic() < deadline, "passada nao rodou"
+                time.sleep(0.001)
+        _version, canvas = real.poll(generation, 0)
+        events = real.telemetry_snapshot()["page_identity_events"]
+    finally:
+        real.stop()
+    return canvas, events
+
+
+def _drive_sync(sequence, recover_at=None, extra=()):
+    """A mesma trabalhadora no caminho do replay: pump() em relógio de cena."""
+    clock = rr.SceneClock()
+    worker = rr.make_ink_worker(_ProbIsWarp(), clock)
+    generation = worker.new_generation()
+    for i, (prob, corners) in enumerate(list(sequence) + list(extra)):
+        if i == recover_at:
+            generation = worker.new_generation(preserve_identity=True)
+        clock.now += 10.0
+        worker.submit(prob, generation, corners)
+        assert worker.pump(), "passada nao rodou"
+        assert worker.error is None
+    _version, canvas = worker.poll(generation, 0)
+    return canvas, list(worker._identity_events)
+
+
 @pytest.mark.lento
-def test_worker_mirror_matches_real_worker(monkeypatch):
+def test_sync_pump_matches_threaded_worker(monkeypatch):
     monkeypatch.setattr(ink_layers_module, "_PAGE_CLEAN_INTERVAL_SECONDS", 0.005)
     monkeypatch.setattr(ink_layers_module, "_IDLE_PROBE_SECONDS", 0.005)
     drawing, settled = rr.synthetic_pages(SHAPE, stages=3, seed=3)
@@ -59,33 +100,12 @@ def test_worker_mirror_matches_real_worker(monkeypatch):
         for k in range(4):
             corners = (base + rng.normal(0, 2.0, size=(4, 2))).astype(np.float32)
             sequence.append((stage[k % len(stage)], corners))
-
-    real = app_module._PageCleanWorker(_ProbIsWarp()).start()
-    try:
-        generation = real.new_generation()
-        for prob, corners in sequence:
-            before = real.stats()["passes_total"]
-            real.submit(prob, generation, corners)
-            deadline = time.monotonic() + 5.0
-            while real.stats()["passes_total"] <= before:
-                assert time.monotonic() < deadline, "passada nao rodou"
-                time.sleep(0.001)
-        _version, real_canvas = real.poll(generation, 0)
-    finally:
-        real.stop()
-
-    mirror = rr.ReplayWorker()
-    generation = mirror.new_generation()
-    now = 0.0
-    for prob, corners in sequence:
-        # true_quad == corners: a passada recebe o mapa intacto.
-        mirror.submit((prob, corners, corners), generation)
-        now += 10.0
-        assert mirror.tick(now) is not None
-    assert np.array_equal(mirror.published[1] > 0, real_canvas > 0)
+    real_canvas, _ = _drive_threaded(sequence)
+    sync_canvas, _ = _drive_sync(sequence)
+    assert np.array_equal(sync_canvas, real_canvas)
 
 
-def test_worker_mirror_ecc_uses_only_confirmed_canvas(monkeypatch):
+def test_replay_worker_ecc_uses_only_confirmed_canvas(monkeypatch):
     monkeypatch.setenv("DRAW_ECC_REFINE", "1")
     references = []
 
@@ -103,47 +123,31 @@ def test_worker_mirror_ecc_uses_only_confirmed_canvas(monkeypatch):
         )
 
     monkeypatch.setattr(ink_layers_module, "_refine_ink_ecc", refine)
-    mirror = rr.ReplayWorker()
-    generation = mirror.new_generation()
+    clock = rr.SceneClock()
+    worker = rr.make_ink_worker(_ProbIsWarp(), clock)
+    generation = worker.new_generation()
     corners = rr.base_quad(SHAPE)
     prob = np.full(SHAPE, 0.8, dtype=np.float32)
+    expected_refs = []
     for index in range(4):
-        confirmed = mirror.acc._confirmed
-        expected = None if confirmed is None else confirmed.astype(np.float32) / 255.0
-        mirror.submit((prob, corners, corners), generation)
-        assert mirror.tick((index + 1) * 10.0) is not None
-        if expected is None:
-            assert references[-1] is None
-        else:
-            np.testing.assert_array_equal(references[-1], expected)
-            assert references[-1].dtype == np.float32
+        confirmed = worker._accumulator._confirmed
+        expected_refs.append(
+            None if confirmed is None else confirmed.astype(np.float32) / 255.0
+        )
+        clock.now = (index + 1) * 10.0
+        worker.submit(prob, generation, corners)
+        assert worker.pump()
+    assert len(references) == len(expected_refs)
+    assert references[0] is None and expected_refs[0] is None
+    for got, expected in zip(references[1:], expected_refs[1:]):
+        np.testing.assert_array_equal(got, expected)
+        assert got.dtype == np.float32
     assert not references[1].any()
     assert np.all(references[-1] == 1.0)
-    assert not hasattr(mirror, "ecc_reference")
-
-
-def _drive_real_identity(sequence, returned):
-    real = app_module._PageCleanWorker(_ProbIsWarp()).start()
-    try:
-        generation = real.new_generation()
-        for i, (prob, corners) in enumerate(sequence + [returned] * 3):
-            if i == len(sequence):
-                generation = real.new_generation(preserve_identity=True)
-            before = real.stats()["passes_total"]
-            real.submit(prob, generation, corners)
-            deadline = time.monotonic() + 5.0
-            while real.stats()["passes_total"] <= before:
-                assert time.monotonic() < deadline, "passada nao rodou"
-                time.sleep(0.001)
-        _version, canvas = real.poll(generation, 0)
-        decision = real.telemetry_snapshot()["page_identity_events"][-1]["decision"]
-    finally:
-        real.stop()
-    return canvas, decision
 
 
 @pytest.mark.lento
-def test_worker_mirror_matches_real_identity_recovery(monkeypatch):
+def test_sync_pump_matches_threaded_identity_recovery(monkeypatch):
     monkeypatch.setattr(ink_layers_module, "_PAGE_CLEAN_INTERVAL_SECONDS", 0.005)
     monkeypatch.setattr(ink_layers_module, "_IDLE_PROBE_SECONDS", 0.005)
     drawing, settled = rr.synthetic_pages(SHAPE, stages=3, seed=4)
@@ -157,20 +161,59 @@ def test_worker_mirror_matches_real_identity_recovery(monkeypatch):
     same = (rr.render_pass(settled[0], base, moved), moved)
     other = (np.flipud(settled[0]).copy(), base.copy())
     for returned, expected in ((same, "same_page"), (other, "new_page")):
-        real_canvas, decision = _drive_real_identity(sequence, returned)
-        assert decision == expected
+        args = (sequence, len(sequence), [returned] * 3)
+        real_canvas, real_events = _drive_threaded(*args)
+        sync_canvas, sync_events = _drive_sync(*args)
+        assert real_events[-1]["decision"] == sync_events[-1]["decision"] == expected
+        assert [e["decision"] for e in real_events] == [
+            e["decision"] for e in sync_events
+        ]
+        assert np.array_equal(sync_canvas, real_canvas)
 
-        mirror = rr.ReplayWorker()
-        generation = mirror.new_generation()
-        now = 0.0
-        for i, (prob, corners) in enumerate(sequence + [returned] * 3):
-            if i == len(sequence):
-                generation = mirror.new_generation(preserve_identity=True)
-            mirror.submit((prob, corners, corners), generation)
-            now += 10.0
-            assert mirror.tick(now) is not None
-        assert mirror.identity_events[-1]["decision"] == expected
-        assert np.array_equal(mirror.published[1] > 0, real_canvas > 0)
+
+def test_replay_drives_the_app_loop_and_the_real_worker():
+    app = rr.ReplayApp(True)
+    assert type(app.loop) is loop_module.SheetInkLoop
+    assert isinstance(app.worker, app_module._PageCleanWorker)
+    assert app.loop.ink_worker is app.worker
+    assert app.loop.detection_worker is app.detector
+    assert app.loop.tracker.__class__ is app_module._SheetTracker
+
+
+def test_replay_doubles_override_no_production_behavior():
+    """O replay não volta a espelhar: subclasses só acrescentam cópia/contagem."""
+    assert set(vars(rr.ReplayInkWorker)) - {
+        "__module__",
+        "__doc__",
+        "__qualname__",
+    } <= {
+        "__deepcopy__",
+        "__firstlineno__",
+        "__static_attributes__",
+    }
+    assert set(vars(rr.CountingAccumulator)) - {
+        "__module__",
+        "__doc__",
+        "__qualname__",
+        "__firstlineno__",
+        "__static_attributes__",
+    } == {"__init__", "add"}
+
+
+def test_replay_app_deepcopy_is_independent():
+    drawing, settled = rr.synthetic_pages(SHAPE, stages=2, seed=6)
+    app, quad = rr.settle_drawing(drawing, settled, (True, "always"), False)
+    clone = copy.deepcopy(app)
+    assert clone.worker is not app.worker
+    assert clone.loop.ink_worker is clone.worker
+    assert clone.worker._clock is clone.clock
+    assert clone.loop._warp_sheet.__self__ is clone
+    passes = app.passes_total()
+    rng = np.random.default_rng(1)
+    for i in range(30):
+        clone.step(rr.Frame(settled[i % 3], quad, rr._noisy(quad, rng)))
+    assert app.passes_total() == passes
+    assert clone.passes_total() > passes
 
 
 def test_render_pass_is_identity_when_warp_matches_page():
@@ -300,6 +343,25 @@ def test_replay_ecc_rejection_defers_production(
     chamfer_flag,
     decision,
 ):
+    reference = np.zeros(SHAPE, dtype=np.uint8)
+    reference[10:40, 10:40] = 255
+    candidate = reference.astype(np.float32) / 255.0 * 0.95
+    if decision == "new_page":
+        candidate = np.flipud(candidate).copy()
+    clock = rr.SceneClock()
+    worker = rr.make_ink_worker(_ProbIsWarp(), clock)
+    corners = rr.base_quad(SHAPE)
+    # Estado real da pagina anterior: passadas da trabalhadora, nao
+    # campos privados escritos a mao.
+    monkeypatch.setenv("DRAW_ECC_REFINE", "0")
+    generation = worker.new_generation()
+    for _ in range(4):
+        clock.now += 10.0
+        worker.submit(reference.astype(np.float32) / 255.0 * 0.95, generation, corners)
+        assert worker.pump()
+    prior = worker._accumulator._confirmed.copy()
+    assert np.array_equal(prior > 0, reference > 0)
+
     monkeypatch.setenv("DRAW_ECC_REFINE", ecc_enabled)
     monkeypatch.setenv("DRAW_IDENTITY_CHAMFER", chamfer_flag)
     calls = []
@@ -309,20 +371,13 @@ def test_replay_ecc_rejection_defers_production(
         raise cv2.error("sem convergencia")
 
     monkeypatch.setattr(cv2, "findTransformECC", reject)
-    reference = np.zeros(SHAPE, dtype=np.uint8)
-    reference[10:40, 10:40] = 255
-    candidate = reference.astype(np.float32) / 255.0 * 0.95
-    if decision == "new_page":
-        candidate = np.flipud(candidate).copy()
-    mirror = rr.ReplayWorker()
-    mirror.acc._confirmed = reference.copy()
-    mirror.identity_reference = reference.copy()
-    corners = rr.base_quad(SHAPE)
-    mirror.identity_reference_corners = corners.copy()
-    mirror.identity_recovery_requested = True
-    kept = mirror._identity_keeps_page(candidate, corners, 2)
-    assert kept is (None if ecc_enabled == "1" or decision == "new_page" else True)
-    event = mirror.identity_events[-1]
+    generation = worker.new_generation(preserve_identity=True)
+    clock.now += 10.0
+    worker.submit(candidate, generation, corners)
+    assert worker.pump() and worker.error is None
+    pending = worker._identity_reference is not None
+    assert pending is (ecc_enabled == "1" or decision == "new_page")
+    event = worker._identity_events[-1]
     expected_decision = (
         "deferred_ecc_rejected"
         if ecc_enabled == "1"
@@ -361,7 +416,7 @@ def test_episode_chamfer_uses_ground_truth_not_decision_and_separates_ecc(monkey
         monkeypatch.setenv("DRAW_ECC_REFINE", str(enabled))
         prior = settled[0] > 0.7
         seen = np.roll(prior, enabled + 1, axis=0)
-        app.worker.identity_events.append(
+        app.worker._identity_events.append(
             {
                 "decision": "new_page",
                 "recall": 0.0,
@@ -383,25 +438,33 @@ def test_episode_chamfer_uses_ground_truth_not_decision_and_separates_ecc(monkey
         assert metric["values"] == [report["identity_events"][enabled][key]]
 
 
-def test_detector_mirror_latency_and_latest_wins():
+def test_scene_detector_latency_and_latest_wins():
     dt = rr.DT
-    fast = rr.ReplayDetector(0.02)
-    fast.submit("a", "paper", 0.0)
-    assert fast.poll(0.0, 0) is None
-    assert fast.poll(dt, 0)[1:] == ("a", "paper", 0.0)
+    clock = rr.SceneClock()
+
+    def frame(tag):
+        return rr.Frame(None, None, np.full((4, 2), tag, np.float32))
+
+    fast = rr.SceneDetectionWorker(0.02, clock)
+    fast.submit(frame(1), 0.0)
+    assert fast.poll(0) is None
+    clock.now = dt
+    got = fast.poll(0)
+    assert got[1][0, 0] == 1 and got[2:4] == ("paper", 0.0)
 
     # 100 ms em 30 FPS: a detecção do quadro 0 sai no quadro 3; os
     # quadros 1 e 2 disputam a fila de tamanho 1 e só o 2 roda.
-    slow = rr.ReplayDetector(0.1)
+    clock.now = 0.0
+    slow = rr.SceneDetectionWorker(0.1, clock)
     results = []
     seq = 0
     for k in range(8):
-        now = k * dt
-        got = slow.poll(now, seq)
+        clock.now = k * dt
+        got = slow.poll(seq)
         if got is not None:
             seq = got[0]
-            results.append((k, got[1], got[3]))
-        slow.submit(k, "paper", now)
+            results.append((k, int(got[1][0, 0]), got[3]))
+        slow.submit(frame(k), clock.now)
     assert results[0] == (3, 0, 0.0)
     assert results[1][1] == 2 and results[1][2] == 2 * dt
     assert slow.replaced >= 1

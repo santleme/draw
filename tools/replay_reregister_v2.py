@@ -3,6 +3,10 @@
 Cached maps are anchor-basis fixtures, not physical camera textures. The
 observation is expressed in the current pass basis before the unmodified
 production registration. Consecutive quads are diagnostic only.
+
+Same path as v1: the real app loop (`draw.loop.SheetInkLoop`) and the real
+`_PageCleanWorker` (synchronous `pump()`, scene clock); only the page_clean
+observation and the per-pass diagnostic record are v2-specific.
 """
 
 import argparse
@@ -159,21 +163,27 @@ def diagnostic_consecutive(previous, current, shape):
     return corner_displacements(matrix, shape)
 
 
-class ReplayWorker(v1.ReplayWorker):
-    def __init__(self, turn_event_enabled=False, *, ecc_refine_enabled):
-        if turn_event_enabled:
-            raise ValueError("v2 R1 does not enable the experimental turn flag")
-        super().__init__(False)
-        self.ecc_refine_enabled = require_ecc(ecc_refine_enabled)
-        self.pass_records = []
-        self.previous_quad = None
+class ReplayPageClean(v1.ScenePageClean):
+    """Observation in the current pass basis, read from the real worker.
 
-    def render_observation(self, page, true_quad, corners):
+    The anchor is the production worker's own state at pass time:
+    the identity reference on the first pass of a generation, the
+    generation anchor otherwise.
+    """
+
+    def __init__(self, *, ecc_refine_enabled):
+        super().__init__()
+        self.ecc_refine_enabled = require_ecc(ecc_refine_enabled)
+        self.previous_quad = None
+        self._geometry = None
+
+    def observe(self, page, true_quad, corners):
         if os.environ.get("DRAW_ECC_REFINE") != str(self.ecc_refine_enabled):
             raise ValueError("ECC environment does not match explicit arm")
-        first_pass = self.generation_passes == 0
-        anchor = (self.identity_reference_corners if first_pass
-                  else self.anchor)
+        worker = self.worker
+        first_pass = worker._generation_passes == 0
+        anchor = (worker._identity_reference_corners if first_pass
+                  else worker._anchor_corners)
         if anchor is None:
             anchor = corners
         registration = ink._registration_matrix(anchor, corners, page.shape)
@@ -193,31 +203,44 @@ class ReplayWorker(v1.ReplayWorker):
         return cv2.warpPerspective(page, observation, (page.shape[1], page.shape[0]),
                                    flags=cv2.INTER_LINEAR, borderValue=0.0)
 
-    def tick(self, now):
-        identity_before = len(self.identity_events)
-        anchor_before = None if self.anchor is None else self.anchor.copy()
-        result = super().tick(now)
-        if result is not None:
-            identity = self.identity_events[identity_before:]
-            self.pass_records.append({
-                "pass_seq": self.passes_total,
-                "ecc_refine_enabled": self.ecc_refine_enabled,
-                "DRAW_ECC_REFINE": str(self.ecc_refine_enabled),
-                **self.ecc_records[-1], **self._geometry,
-                "identity": identity_measurements(identity, self.ecc_refine_enabled),
-                "same_page_anchor_unchanged": (
-                    not any(e["decision"] == "same_page" for e in identity)
-                    or (anchor_before is not None and np.array_equal(anchor_before, self.anchor))
-                ),
-            })
-        return result
+
+def _ecc_fields(record):
+    return {key: value for key, value in record.items() if key.startswith("ecc_")}
 
 
 class ReplayApp(v1.ReplayApp):
+    """The real loop (v1.ReplayApp) with one diagnostic record per pass."""
+
     def __init__(self, hand_state, turn_event_enabled=False, *, ecc_refine_enabled):
-        super().__init__(hand_state, turn_event_enabled, app_logic="main",
-                         worker_factory=partial(ReplayWorker,
-                             ecc_refine_enabled=require_ecc(ecc_refine_enabled)))
+        if turn_event_enabled:
+            raise ValueError("v2 R1 does not enable the experimental turn flag")
+        self.ecc_refine_enabled = require_ecc(ecc_refine_enabled)
+        self.pass_records = []
+        super().__init__(hand_state, False, page_clean_factory=partial(
+            ReplayPageClean, ecc_refine_enabled=self.ecc_refine_enabled))
+
+    def pump_ink(self):
+        identity_before = len(self.worker._identity_events)
+        anchor = self.worker._anchor_corners
+        anchor_before = None if anchor is None else anchor.copy()
+        ran = super().pump_ink()
+        if ran:
+            identity = list(self.worker._identity_events)[identity_before:]
+            anchor_after = self.worker._anchor_corners
+            self.pass_records.append({
+                "pass_seq": self.worker._passes_total,
+                "ecc_refine_enabled": self.ecc_refine_enabled,
+                "DRAW_ECC_REFINE": str(self.ecc_refine_enabled),
+                **_ecc_fields(self.worker._telemetry_records[-1]),
+                **self.worker._page_clean._geometry,
+                "identity": identity_measurements(identity, self.ecc_refine_enabled),
+                "same_page_anchor_unchanged": (
+                    not any(e["decision"] == "same_page" for e in identity)
+                    or (anchor_before is not None and anchor_after is not None
+                        and np.array_equal(anchor_before, anchor_after))
+                ),
+            })
+        return ran
 
 
 def identity_measurements(events, ecc_refine_enabled):
@@ -263,20 +286,20 @@ def finalize_episode(record):
 
 class Episode(v1.Episode):
     def report(self, true_before, true_after, identity_true_class=None):
-        worker = self.app.worker
-        after = self.app.canvas()
+        app = self.app
+        after = app.canvas()
         shape = (self.before if self.before is not None else after).shape
         before = np.zeros(shape, bool) if self.before is None else self.before > 0
         after_mask = np.zeros(shape, bool) if after is None else after > 0
         kernel = np.ones((2 * v1.BOUNDARY_TOL_PX + 1,) * 2, np.uint8)
         new_px, lost_px = v1._mismatch(before, after_mask, np.eye(3), kernel)
         generations = self.app.clean_generation - self.generation_before
-        identities = identity_measurements(worker.identity_events[self.identity_before:],
-                                           worker.ecc_refine_enabled)
-        passes = worker.pass_records[self.passes_before:]
+        identities = identity_measurements(app.identity_events()[self.identity_before:],
+                                           app.ecc_refine_enabled)
+        passes = app.pass_records[self.passes_before:]
         return {
-            "ecc_refine_enabled": worker.ecc_refine_enabled,
-            "DRAW_ECC_REFINE": str(worker.ecc_refine_enabled),
+            "ecc_refine_enabled": app.ecc_refine_enabled,
+            "DRAW_ECC_REFINE": str(app.ecc_refine_enabled),
             "vacuous": not passes, "passes_total": len(passes),
             "frames_total": self.frames,
             "passes_during_perturbation": self.passes_during,
@@ -288,7 +311,7 @@ class Episode(v1.Episode):
             "identity_decisions": [e["decision"] for e in identities],
             "diagnostics": {
                 "baseline_rejections": sum(p["ecc_rejected"] for p in
-                                           worker.pass_records[:self.passes_before]),
+                                           app.pass_records[:self.passes_before]),
                 "baseline_passes": self.passes_before,
                 "passes": passes, "identity": identities,
                 "production_generations_created": generations,
@@ -337,7 +360,7 @@ def _run_page(drawing, settled, provenance, enabled, protocol):
     for hand, config in v1.HAND_CONFIGS.items():
         base = v1.settle_drawing(drawing, settled, config, False,
                                 app_factory=partial(ReplayApp, ecc_refine_enabled=enabled))
-        baselines[hand] = base[0].worker.pass_records
+        baselines[hand] = base[0].pass_records
         cases = [("control_static", "static", v1.run_control, ())]
         cases += [("move_same_canvas", name, v1.run_move, (spec,))
                   for name, spec in v1.MOVES.items()]
@@ -370,7 +393,7 @@ def _run_page(drawing, settled, provenance, enabled, protocol):
                                                         baselines.values() for p in records)},
         "limitations": ["one physical page; other three pool pages unavailable",
                         "anchor-basis map contract, not raw-camera replay",
-                        "legacy replay has no live occlusion deferral; no hand mask simulated",
+                        "no live occlusion: no hand mask simulated (visible=None)",
                         "no ECC flag recommendation"],
     }
 
