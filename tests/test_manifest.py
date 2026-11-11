@@ -244,6 +244,7 @@ def test_page_clean_loader_refuses_unregistered_model_by_default(
 
 
 def test_hand_masker_refuses_unregistered_model_by_default(tmp_path, default_policy):
+    pytest.importorskip("cv2")
     from draw import hand
 
     model = _model(tmp_path, "mao_qualquer.task", b"stub")
@@ -252,6 +253,7 @@ def test_hand_masker_refuses_unregistered_model_by_default(tmp_path, default_pol
 
 
 def test_check_models_fails_on_unregistered_file(tmp_path, monkeypatch, capsys):
+    pytest.importorskip("cv2")
     from draw import app
 
     monkeypatch.delenv("DRAW_MODEL_STRICT", raising=False)
@@ -266,6 +268,7 @@ def test_check_models_fails_on_unregistered_file(tmp_path, monkeypatch, capsys):
 def test_check_models_fails_on_unregistered_file_without_manifest_entries(
     tmp_path, monkeypatch, capsys
 ):
+    pytest.importorskip("cv2")
     from draw import app
 
     monkeypatch.delenv("DRAW_MODEL_STRICT", raising=False)
