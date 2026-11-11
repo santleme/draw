@@ -1,9 +1,16 @@
 # Dependências de desenvolvimento e de teste. Não são necessárias
 # para rodar o app.
 -r requirements.txt
-pytest>=8
+pytest==9.2.0
 ruff==0.17.4
 # Gera os modelos ONNX minúsculos dos testes de contrato
 # (tests/onnx_fixtures.py). Sem ele, esses testes saem como skip;
 # o onnxruntime, que executa os modelos, vem de requirements.txt.
-onnx>=1.16
+onnx==1.23.2
+# Pinos de dev/CI das dependencias de runtime (requirements.txt fica
+# com faixas para quem instala o app). numpy 2.5 nao publica roda
+# para 3.11, versao da matriz noturna do CI.
+numpy==2.5.4; python_version >= "3.12"
+numpy==2.4.4; python_version < "3.12"
+opencv-contrib-python==5.0.0.93
+onnxruntime==1.31.1

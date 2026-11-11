@@ -36,6 +36,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from .manifest import verify_model
+
 _ENV_MODEL_VAR = "DRAW_HAND_MODEL"
 # O caminho convencional e resolvido a partir da RAIZ DO REPO, como
 # o do detector neural e o do pagina->limpa; era relativo ao CWD e
@@ -119,6 +121,11 @@ class HandMasker:
 
     def __init__(self, model_path=None):
         self._requested_path = model_path
+        resolved = _resolve_model_path(model_path)
+        if resolved is not None:
+            # Estrito por padrao: divergente ou nao registrado levanta
+            # aqui, antes de o MediaPipe abrir o arquivo.
+            verify_model(resolved)
         self._landmarker = None
         self._video_landmarker = None
         self._unavailable = False

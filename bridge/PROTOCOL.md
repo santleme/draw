@@ -30,13 +30,53 @@ to make that measurement possible (see "Step 0", below).
   and WSL **connects**. The helper is resident and outlives the app;
   the WSL side restarts frequently during development,
   so it is the one that initiates the connection.
-- In WSL2, the Windows host IP is the `nameserver` of
-  `/etc/resolv.conf`, as in the current bridge.
-- The Windows firewall must allow the port on private networks, as
-  already happens with the ffmpeg bridge.
-- No TLS and no authentication in v1: the channel is local (Windows host ↔
-  WSL on the same PC) and the design assumes this perimeter. Do not expose the
-  port outside the machine.
+- The helper binds to **`127.0.0.1` by default**. With WSL2 in
+  *mirrored* networking mode, WSL reaches it as `127.0.0.1`. In the
+  default *NAT* mode, bind the helper to the Windows-side IP of the
+  `vEthernet (WSL)` adapter (`--host <ip>`); from WSL that IP is the
+  `nameserver` of `/etc/resolv.conf`. A specific interface IP needs no
+  extra flag.
+- Binding to every interface (`0.0.0.0` / `::`) is refused unless the
+  helper is started with `--allow-all-interfaces`, and then it prints
+  a security warning. Do not expose the port outside the machine.
+- The Windows firewall must allow the port only on the interface in
+  use, as already happens with the ffmpeg bridge.
+- No TLS in v1: the channel is local (Windows host ↔ WSL on the same
+  PC). Every connection must pass the token handshake below before
+  any frame is sent.
+
+## Authentication handshake
+
+Immediately after the TCP connection opens, and before the helper
+sends any frame record, the WSL side sends a HELLO followed by the
+shared token. All integers are little-endian.
+
+| Offset | Size | Type   | Field       | Value |
+|-------:|-----:|--------|-------------|-------|
+| 0      | 4    | bytes  | `magic`     | `DRAH` (0x44 0x52 0x41 0x48) |
+| 4      | 2    | uint16 | `version`   | 1 |
+| 6      | 2    | uint16 | `token_len` | 16..256 |
+| 8      | `token_len` | bytes | token | UTF-8 shared secret |
+
+In Python, the HELLO is `struct.Struct("<4sHH")`, 8 bytes.
+
+- The helper compares the token in constant time
+  (`hmac.compare_digest`). On success it answers exactly the 4 bytes
+  `DROK` and then starts the frame stream. On any failure (wrong
+  magic or version, `token_len` out of range, wrong token, or no
+  complete HELLO within 5 s) it closes the connection **without
+  answering**, and keeps listening.
+- The receiver treats anything other than `DROK` (including an
+  early close) as an authentication error and reads no frames.
+- The token comes from the `DRAW_HELPER_TOKEN` environment variable
+  or from `--token-file` on both sides, and is never logged by the
+  receiver. If the helper starts without one, it generates a random
+  token (`secrets.token_urlsafe(32)`) and prints it once on its own
+  console so the operator can copy it to WSL.
+- The token authenticates the peer; it does not encrypt the stream.
+  Frames still travel in clear, which is why the bind stays local.
+- The handshake belongs to the socket only. Recorded files (below)
+  start directly at the first frame record.
 
 ## Frame record
 
@@ -66,6 +106,14 @@ Stream rules:
   ends at `FF D9`). Resolution and quality are helper configuration,
   out of band in v1; the receiver discovers the resolution
   by decoding the JPEG.
+- `payload_len` must be in `1..16 MiB`. The receiver checks it
+  **before** reading or allocating the payload and fails with a
+  protocol error otherwise, so a corrupt or hostile header cannot make
+  it allocate an arbitrary buffer.
+- A payload that does not start at `FF D8` and end at `FF D9`, whose
+  SOF header is missing or truncated, whose dimensions exceed
+  8192 px per side or 40 MP, or that the decoder rejects, is decoded
+  as `None` by `decode_jpeg`; it never raises.
 - There is no checksum in v1: TCP already guarantees integrity and order in
   transport, and the recorded file (below) is written and read on the same
   machine. A payload with an invalid `magic` in the following record

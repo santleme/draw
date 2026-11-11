@@ -13,18 +13,26 @@ Uso:
     python tools/fetch_models.py --check   # só confere, não baixa
 
 A base do download pode ser trocada pela variável de ambiente
-DRAW_MODELS_BASE_URL (espelho ou teste local).
+DRAW_MODELS_BASE_URL (espelho ou teste local). Rede (draw/net_policy):
+só HTTPS; redirects só para hosts da Release do GitHub ou para o host
+da base escolhida; o download para no tamanho registrado no
+manifesto, e o manifesto é lido pelo mesmo leitor validado da carga
+(draw/manifest.load_manifest).
 """
 
 import argparse
 import hashlib
-import json
 import os
 import sys
-import urllib.request
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from draw import net_policy  # noqa: E402
+from draw.manifest import load_manifest  # noqa: E402
+
 MODELS_DIR = REPO_ROOT / "models"
 MANIFEST_PATH = MODELS_DIR / "MANIFEST.json"
 RELEASE_TAG = "models-2026-11-06"
@@ -47,9 +55,8 @@ def load_entries(manifest_path=MANIFEST_PATH):
     o manifesto estiver ilegível — sem registro não há o que baixar
     com conferência, e baixar sem conferir é o que este script existe
     para não fazer."""
-    data = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
-    models = data.get("models")
-    if not isinstance(models, dict) or not models:
+    _path, models = load_manifest(manifest_path)
+    if not models:
         raise RuntimeError(f"manifesto sem modelos registrados: {manifest_path}")
     return models
 
@@ -64,9 +71,15 @@ def matches(path, entry):
     return sha256_of(path) == str(entry.get("sha256", "")).strip().lower()
 
 
-def _open(url):
-    request = urllib.request.Request(url, headers={"User-Agent": "draw-fetch-models"})
-    return urllib.request.urlopen(request)
+def allowed_hosts_for(base_url):
+    """Hosts da Release do GitHub mais o host da base (espelho)."""
+    return (*net_policy.GITHUB_RELEASE_HOSTS, net_policy.host_of(base_url))
+
+
+def _open(url, allowed_hosts=net_policy.GITHUB_RELEASE_HOSTS):
+    return net_policy.open_url(
+        url, allowed_hosts, headers={"User-Agent": "draw-fetch-models"}
+    )
 
 
 def ensure_model(
@@ -79,13 +92,30 @@ def ensure_model(
     target = Path(models_dir) / name
     if matches(target, entry):
         return "ok"
+    if Path(name).name != name:
+        raise RuntimeError(f"nome de modelo com caminho recusado: {name!r}")
     url = base_url.rstrip("/") + "/" + name
-    open_fn = opener if opener is not None else _open
+    allowed = allowed_hosts_for(base_url)
+    net_policy.check_url(url, allowed)
+    if opener is not None:
+        open_fn = opener
+    else:
+
+        def open_fn(target_url):
+            return _open(target_url, allowed)
+
+    limit = entry.get("bytes")
     partial = target.with_name(target.name + ".part")
     Path(models_dir).mkdir(parents=True, exist_ok=True)
     try:
         with open_fn(url) as response, open(partial, "wb") as handle:
+            written = 0
             for chunk in iter(lambda: response.read(_CHUNK), b""):
+                written += len(chunk)
+                if isinstance(limit, int) and written > limit:
+                    raise RuntimeError(
+                        f"download de {url} passou de {limit} bytes registrados"
+                    )
                 handle.write(chunk)
     except Exception:
         partial.unlink(missing_ok=True)

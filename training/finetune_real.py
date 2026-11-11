@@ -235,11 +235,37 @@ def _unfold_to_unet(fold):
     return unf
 
 
+_DOWNLOAD_HOSTS = (
+    "github.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+)
+
+
+def _check_download_url(url):
+    import urllib.parse
+
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme != "https" or (parts.hostname or "") not in _DOWNLOAD_HOSTS:
+        raise RuntimeError(f"download fora da allowlist HTTPS recusado: {url}")
+    return url
+
+
 def _download(url, dest):
+    """Baixa só por HTTPS de hosts da Release; cada redirect é conferido."""
+    import shutil
     import urllib.request
 
+    class _Redirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            _check_download_url(newurl)
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    _check_download_url(url)
     log(f"baixando {url}")
-    urllib.request.urlretrieve(url, dest)
+    opener = urllib.request.build_opener(_Redirect())
+    with opener.open(url, timeout=120) as response, open(dest, "wb") as handle:
+        shutil.copyfileobj(response, handle)
     return dest
 
 
@@ -255,7 +281,7 @@ def build_init_model(input_bases, work_dir):
         onnx_hits += glob.glob(f"{base}/**/page_clean_student_w8.onnx", recursive=True)
         onnx_hits += glob.glob(f"{base}/**/page_clean_unet.onnx", recursive=True)
     if pt_hits:
-        sd = torch.load(pt_hits[0], map_location="cpu")
+        sd = torch.load(pt_hits[0], map_location="cpu", weights_only=True)
         missing, unexpected = model.load_state_dict(sd, strict=False)
         assert not missing and not unexpected, (
             f"state_dict do w8 nao casa strict: {missing} {unexpected}"
@@ -759,7 +785,9 @@ def main():
     # export: melhor (se houve val) senao o ultimo; BN dobrado pro
     # contrato do app (grafo Conv+Relu como o do w8)
     if os.path.exists(f"{work}/best.pt"):
-        model.load_state_dict(torch.load(f"{work}/best.pt", map_location="cpu"))
+        model.load_state_dict(
+            torch.load(f"{work}/best.pt", map_location="cpu", weights_only=True)
+        )
     model = model.to(dev).eval()
     fold = _fold_from_unet(model)
     onnx_out = f"{work}/page_clean_finetune_real_v1.onnx"

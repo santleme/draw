@@ -7,13 +7,18 @@ Cada frame sai como a tupla (frame_id, capture_ts_us, jpeg_bytes);
 capture_ts_us é o relógio monotônico do ajudante, ancorado na
 captura, e só serve para diferenças dentro da mesma sessão.
 
+Toda conexão começa pelo handshake de token (PROTOCOL.md,
+"Authentication handshake"): o token vem de DRAW_HELPER_TOKEN ou de
+--token-file e nunca é impresso. O leitor limita payload_len antes
+de alocar e decode_jpeg devolve None para JPEG malformado.
+
 Uso (a partir da raiz do repositório):
   python tools/helper_receiver.py --selfcheck
-  python tools/helper_receiver.py --record --host 192.168.0.10 \
-      --out sessao.drawcap [--max-frames 600]
+  DRAW_HELPER_TOKEN=... python tools/helper_receiver.py --record \
+      --host 192.168.0.10 --out sessao.drawcap [--max-frames 600]
   python tools/helper_receiver.py --dump sessao.drawcap
-  python tools/helper_receiver.py --dump --host 192.168.0.10 \
-      --max-frames 5
+  DRAW_HELPER_TOKEN=... python tools/helper_receiver.py --dump \
+      --host 192.168.0.10 --max-frames 5
 
 Como biblioteca:
   from tools.helper_receiver import frames_from_file, frames_from_socket
@@ -22,11 +27,19 @@ Como biblioteca:
 """
 
 import argparse
+import hmac
+import os
 import socket
 import struct
 import sys
 import threading
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from draw.safe_io import decode_image, image_format  # noqa: E402
 
 MAGIC = b"DRAW"
 VERSION = 1
@@ -35,9 +48,102 @@ HEADER = struct.Struct("<4sHHQqI")
 HEADER_SIZE = HEADER.size  # 28 bytes
 DEFAULT_PORT = 8765
 
+# Teto de payload_len: conferido ANTES de ler/alocar o payload. Um
+# JPEG 4K de qualidade alta fica bem abaixo disso.
+MAX_PAYLOAD_LEN = 16 << 20
+MAX_FRAME_SIDE = 8192
+MAX_FRAME_PIXELS = 40_000_000
+
+# Handshake de autenticação (PROTOCOL.md): o cliente envia
+# HELLO(magic, versão, len) + token; o ajudante responde ACCEPT ou fecha.
+HELLO_MAGIC = b"DRAH"
+HELLO_VERSION = 1
+HELLO = struct.Struct("<4sHH")
+ACCEPT = b"DROK"
+TOKEN_ENV = "DRAW_HELPER_TOKEN"
+TOKEN_MIN_LEN = 16
+TOKEN_MAX_LEN = 256
+HANDSHAKE_TIMEOUT_S = 5.0
+
 
 class ProtocolError(Exception):
     """O fluxo violou bridge/PROTOCOL.md (magic, versão ou truncamento)."""
+
+
+class AuthenticationError(ProtocolError):
+    """Token ausente, inválido ou recusado pelo ajudante."""
+
+
+def resolve_token(token=None, token_file=None):
+    """Token como bytes: argumento, depois --token-file, depois o ambiente."""
+    if token is None and token_file:
+        token = Path(token_file).read_text(encoding="utf-8").strip()
+    if token is None:
+        token = os.environ.get(TOKEN_ENV, "")
+    if isinstance(token, str):
+        token = token.encode("utf-8")
+    if not TOKEN_MIN_LEN <= len(token) <= TOKEN_MAX_LEN:
+        raise AuthenticationError(
+            f"token do ajudante ausente ou fora de {TOKEN_MIN_LEN}..{TOKEN_MAX_LEN} "
+            f"bytes; defina {TOKEN_ENV} ou use --token-file"
+        )
+    return token
+
+
+def client_handshake(sock, token):
+    """Lado WSL: envia o token e exige ACCEPT antes de qualquer frame."""
+    token = resolve_token(token)
+    sock.sendall(HELLO.pack(HELLO_MAGIC, HELLO_VERSION, len(token)) + token)
+    try:
+        reply = _read_exact(sock.recv, len(ACCEPT))
+    except (ProtocolError, OSError) as error:
+        raise AuthenticationError(f"ajudante fechou o handshake: {error}") from error
+    if reply != ACCEPT:
+        raise AuthenticationError("ajudante recusou o token (handshake sem ACCEPT)")
+
+
+def server_handshake(conn, token, timeout=HANDSHAKE_TIMEOUT_S):
+    """Lado ajudante: True e ACCEPT enviado se o token confere.
+
+    Espelha bridge/windows_helper.authenticate_client (usado no
+    selfcheck e nos testes). Qualquer falha devolve False sem
+    responder; quem chamou fecha a conexão.
+    """
+    expected = resolve_token(token)
+    previous = conn.gettimeout()
+    conn.settimeout(timeout)
+    try:
+        hello = _read_exact(conn.recv, HELLO.size)
+        if hello is None:
+            return False
+        magic, version, length = HELLO.unpack(hello)
+        if magic != HELLO_MAGIC or version != HELLO_VERSION:
+            return False
+        if not TOKEN_MIN_LEN <= length <= TOKEN_MAX_LEN:
+            return False
+        offered = _read_exact(conn.recv, length)
+        if offered is None or not hmac.compare_digest(offered, expected):
+            return False
+        conn.sendall(ACCEPT)
+        return True
+    except (ProtocolError, OSError):
+        return False
+    finally:
+        conn.settimeout(previous)
+
+
+def _connect(host, port, token, timeout):
+    token = resolve_token(token)
+    sock = socket.create_connection(
+        (host, port), timeout=timeout if timeout is not None else HANDSHAKE_TIMEOUT_S
+    )
+    try:
+        client_handshake(sock, token)
+        sock.settimeout(timeout)
+    except BaseException:
+        sock.close()
+        raise
+    return sock
 
 
 def pack_record(frame_id, capture_ts_us, payload):
@@ -66,11 +172,13 @@ def _read_exact(read, size):
     return b"".join(chunks)
 
 
-def _iter_records(read):
+def _iter_records(read, max_payload=MAX_PAYLOAD_LEN):
     """Itera registros sobre uma função read(n) -> bytes.
 
     Produz (frame_id, capture_ts_us, payload, bruto), onde bruto é o
     registro byte a byte como chegou (o que o gravador escreve).
+    payload_len fora de 1..max_payload é erro de protocolo antes de
+    qualquer leitura do payload.
     """
     while True:
         header = _read_exact(read, HEADER_SIZE)
@@ -86,6 +194,11 @@ def _iter_records(read):
             )
         if version != VERSION:
             raise ProtocolError(f"versao {version} nao suportada (esperada {VERSION})")
+        if payload_len == 0 or payload_len > max_payload:
+            raise ProtocolError(
+                f"payload_len {payload_len} fora de 1..{max_payload} "
+                f"(frame_id {frame_id}); fluxo corrompido ou hostil"
+            )
         payload = _read_exact(read, payload_len)
         if payload is None:
             raise ProtocolError(
@@ -95,26 +208,43 @@ def _iter_records(read):
         yield frame_id, capture_ts_us, payload, header + payload
 
 
-def frames_from_file(path):
+def frames_from_file(path, max_payload=MAX_PAYLOAD_LEN):
     """Itera (frame_id, capture_ts_us, jpeg_bytes) de um arquivo gravado."""
     with open(path, "rb") as handle:
-        for frame_id, capture_ts_us, payload, _raw in _iter_records(handle.read):
+        for frame_id, capture_ts_us, payload, _raw in _iter_records(
+            handle.read, max_payload
+        ):
             yield frame_id, capture_ts_us, payload
 
 
-def frames_from_socket(host, port=DEFAULT_PORT, timeout=None):
-    """Itera (frame_id, capture_ts_us, jpeg_bytes) do ajudante via TCP."""
-    with socket.create_connection((host, port), timeout=timeout) as sock:
-        for frame_id, capture_ts_us, payload, _raw in _iter_records(sock.recv):
+def frames_from_socket(
+    host, port=DEFAULT_PORT, timeout=None, token=None, max_payload=MAX_PAYLOAD_LEN
+):
+    """Itera (frame_id, capture_ts_us, jpeg_bytes) do ajudante via TCP.
+
+    Autentica com o token (argumento ou DRAW_HELPER_TOKEN) antes de ler.
+    """
+    with _connect(host, port, token, timeout) as sock:
+        for frame_id, capture_ts_us, payload, _raw in _iter_records(
+            sock.recv, max_payload
+        ):
             yield frame_id, capture_ts_us, payload
 
 
-def record(host, port, out_path, max_frames=None, timeout=None):
+def record(
+    host,
+    port,
+    out_path,
+    max_frames=None,
+    timeout=None,
+    token=None,
+    max_payload=MAX_PAYLOAD_LEN,
+):
     """Grava o fluxo do socket byte a byte num arquivo. Retorna n."""
     count = 0
-    with socket.create_connection((host, port), timeout=timeout) as sock:
+    with _connect(host, port, token, timeout) as sock:
         with open(out_path, "wb") as handle:
-            for _fid, _ts, _payload, raw in _iter_records(sock.recv):
+            for _fid, _ts, _payload, raw in _iter_records(sock.recv, max_payload):
                 handle.write(raw)
                 count += 1
                 if max_frames is not None and count >= max_frames:
@@ -122,12 +252,32 @@ def record(host, port, out_path, max_frames=None, timeout=None):
     return count
 
 
-def decode_jpeg(jpeg_bytes):
-    """Decodifica um payload em imagem BGR (numpy) ou None se inválido."""
-    import cv2
-    import numpy as np
+def is_complete_jpeg(payload):
+    """True se o payload começa em FF D8 e termina em FF D9."""
+    return (
+        len(payload) >= 4
+        and image_format(payload) == "jpeg"
+        and bytes(payload[-2:]) == b"\xff\xd9"
+    )
 
-    return cv2.imdecode(np.frombuffer(jpeg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+
+def decode_jpeg(jpeg_bytes, max_side=MAX_FRAME_SIDE, max_pixels=MAX_FRAME_PIXELS):
+    """Decodifica um payload em imagem BGR (numpy) ou None se inválido.
+
+    Payload truncado, sem cabeçalho SOF, com dimensões acima do teto
+    ou que o decoder recuse devolve None; nunca levanta.
+    """
+    import cv2
+
+    if not is_complete_jpeg(jpeg_bytes):
+        return None
+    return decode_image(
+        bytes(jpeg_bytes),
+        cv2.IMREAD_COLOR,
+        max_bytes=MAX_PAYLOAD_LEN,
+        max_side=max_side,
+        max_pixels=max_pixels,
+    )
 
 
 def _synthetic_frames(n, base_id=1000, base_ts_us=5_000_000):
@@ -175,6 +325,7 @@ def _check_roundtrip(expected, received, label):
 
 
 def _selfcheck():
+    import secrets
     import tempfile
 
     n = 64
@@ -215,23 +366,35 @@ def _selfcheck():
                     f"arquivo truncado: {seen} frames antes do erro, esperados {n}"
                 )
 
-    # Caminho de socket: servidor loopback efêmero numa thread.
+    # Caminho de socket: servidor loopback efêmero numa thread, com
+    # handshake de token. A primeira conexão usa um token errado e
+    # precisa ser recusada; a segunda autentica e recebe os frames.
+    token = secrets.token_urlsafe(32)
     server = socket.socket()
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind(("127.0.0.1", 0))
-    server.listen(1)
+    server.listen(2)
     port = server.getsockname()[1]
 
     def serve():
-        conn, _addr = server.accept()
-        with conn:
-            for frame_id, capture_ts_us, payload in expected:
-                conn.sendall(pack_record(frame_id, capture_ts_us, payload))
+        for _attempt in range(2):
+            conn, _addr = server.accept()
+            with conn:
+                if not server_handshake(conn, token):
+                    continue
+                for frame_id, capture_ts_us, payload in expected:
+                    conn.sendall(pack_record(frame_id, capture_ts_us, payload))
         server.close()
 
     thread = threading.Thread(target=serve, daemon=True)
     thread.start()
-    received = list(frames_from_socket("127.0.0.1", port, timeout=10))
+    try:
+        list(frames_from_socket("127.0.0.1", port, timeout=10, token="x" * 32))
+        failures.append("socket: token errado foi aceito")
+        print("FAIL socket: token errado foi aceito")
+    except AuthenticationError:
+        print("PASS socket: token errado recusado no handshake")
+    received = list(frames_from_socket("127.0.0.1", port, timeout=10, token=token))
     thread.join(timeout=10)
     ok, message = _check_roundtrip(expected, received, "socket (loopback)")
     print(("PASS " if ok else "FAIL ") + message)
@@ -273,6 +436,11 @@ def main():
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--out", default=None, help="arquivo de saida")
     parser.add_argument("--max-frames", type=int, default=None)
+    parser.add_argument(
+        "--token-file",
+        default=None,
+        help=f"arquivo com o token do ajudante (padrao: ${TOKEN_ENV})",
+    )
     args = parser.parse_args()
 
     if args.selfcheck:
@@ -281,7 +449,10 @@ def main():
     if args.record:
         if not args.host or not args.out:
             parser.error("--record exige --host e --out")
-        count = record(args.host, args.port, args.out, max_frames=args.max_frames)
+        token = resolve_token(token_file=args.token_file)
+        count = record(
+            args.host, args.port, args.out, max_frames=args.max_frames, token=token
+        )
         print(f"Gravados {count} frames em {args.out}.")
         return 0
 
@@ -289,7 +460,9 @@ def main():
         if args.dump:
             frames = frames_from_file(args.dump)
         elif args.host:
-            frames = frames_from_socket(args.host, args.port)
+            frames = frames_from_socket(
+                args.host, args.port, token=resolve_token(token_file=args.token_file)
+            )
         else:
             parser.error("--dump sem arquivo exige --host")
         count = 0

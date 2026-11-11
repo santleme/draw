@@ -280,7 +280,9 @@ def _export_and_grade(run_cfg, data_dir, out_dir):
     out_dir = Path(out_dir)
     model = _build_model_t7(cfg, run_cfg["decoder"])
     model.load_state_dict(
-        torch.load(out_dir / "checkpoints" / "best.pt", map_location="cpu")
+        torch.load(
+            out_dir / "checkpoints" / "best.pt", map_location="cpu", weights_only=True
+        )
     )
     model = model.to("cpu")
     val_ds = T.build_dataset(data_dir, "val", cfg, augment=False)

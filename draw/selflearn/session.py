@@ -59,6 +59,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from ..safe_io import ensure_private_dir
+
 _SCHEMA = 1
 _DRAIN_SECONDS = 5.0
 
@@ -329,6 +331,7 @@ class SessionRecorder:
                 if item[0] == "image":
                     _tag, generation, kind, image = item
                     folder = self._generation_dir(generation)
+                    ensure_private_dir(self.session_dir)
                     folder.mkdir(parents=True, exist_ok=True)
                     if not cv2.imwrite(str(folder / f"{kind}.png"), image):
                         raise RuntimeError(f"imwrite devolveu False para {kind}")
@@ -362,6 +365,7 @@ class SessionRecorder:
                     return
                 self._raw_bytes += len(data)
             folder = self.session_dir / "raw"
+            ensure_private_dir(self.session_dir)
             folder.mkdir(parents=True, exist_ok=True)
             name = f"frame_{entry['frame_index']:06d}.png"
             (folder / name).write_bytes(data)
@@ -380,6 +384,7 @@ class SessionRecorder:
 
     def _write_acquisition(self, record):
         if self._acq_handle is None:
+            ensure_private_dir(self.session_dir)
             self.session_dir.mkdir(parents=True, exist_ok=True)
             self._acq_handle = open(
                 self.session_dir / "acquisitions.jsonl", "a", encoding="utf-8"
@@ -393,6 +398,7 @@ class SessionRecorder:
             self._acq_handle = None
 
     def _write_manifest(self, manifest):
+        ensure_private_dir(self.session_dir)
         self.session_dir.mkdir(parents=True, exist_ok=True)
         generations = []
         for folder in sorted(self.session_dir.glob("gen_*")):
