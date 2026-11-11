@@ -273,3 +273,29 @@ def test_accepted_drift_is_signal_that_never_changes_verdict():
         g.judge_candidate(cand, base, accepted_drift="DRIFT")
     )
     assert plain["judgment_signals"] is None
+
+
+def test_cli_accepted_drift_reaches_the_gate_as_signal(tmp_path):
+    candidate = tmp_path / "candidate.json"
+    baseline = tmp_path / "baseline.json"
+    report = tmp_path / "accepted_drift.json"
+    candidate.write_text(json.dumps(_real(0.30, 0.20)))
+    baseline.write_text(json.dumps(_real(0.45, 0.35)))
+    report.write_text(json.dumps({"status": "DRIFT"}))
+    run = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "tools/selflearn/judge_gate.py"),
+            "--candidate",
+            str(candidate),
+            "--baseline",
+            str(baseline),
+            "--accepted-drift",
+            str(report),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert run.returncode == 1  # veredito inalterado
+    assert "deriva dos aceitos (sinal ao juizo): DRIFT" in run.stdout
