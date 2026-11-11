@@ -283,6 +283,14 @@ def test_calibration_guard_rejects_holdout_and_training_sessions():
     with pytest.raises(ValueError, match="treina"):
         tr._guard_calibration([_lineage_page(tr, "train")], labeled, set())
     assert tr._guard_calibration([_lineage_page(tr, "cal")], labeled, set()) == ["cal"]
+    with pytest.raises(ValueError, match="treina"):
+        tr._guard_calibration(
+            [_lineage_page(tr, "pool")], labeled, set(), [_lineage_page(tr, "pool")]
+        )
+    pseudo = _lineage_page(tr, "cal")
+    pseudo.origin = "pseudo_teacher"
+    with pytest.raises(ValueError, match="pseudo"):
+        tr._guard_calibration([pseudo], labeled, set())
 
 
 def test_run_round_writes_accepted_profile_drift_and_conformal(tmp_path, monkeypatch):

@@ -56,6 +56,7 @@ from draw.selflearn.split import (  # noqa: E402
     guard_holdout_example,
     guard_pseudo_labeling,
     guard_train_example,
+    is_pseudo_origin,
 )
 from draw.selflearn.teacher import pseudo_label  # noqa: E402
 
@@ -278,14 +279,20 @@ def consistency_targets(prob, weak_bgr, calibration=None):
     return target, weight
 
 
-def _guard_calibration(calibration_pages, labeled, holdout_ids):
+def _guard_calibration(calibration_pages, labeled, holdout_ids, unlabeled=()):
     """Calibração conformal: rótulo independente, fora do treino e do selado."""
     if not calibration_pages:
         return []
     labeled_ids = {page.session_id for page in labeled}
+    labeled_ids |= {page.session_id for page in unlabeled}
     for page in calibration_pages:
         if not isinstance(page, PageExample) or page.mask is None:
             raise TypeError("calibração conformal exige PageExample com máscara")
+        if is_pseudo_origin(page.origin):
+            raise ValueError(
+                f"{page.file}: origem {page.origin!r} é pseudo-rótulo; o juízo "
+                "conformal só calibra em rótulo independente"
+            )
         if page.session_id in holdout_ids:
             raise ValueError(
                 f"sessão {page.session_id} é do holdout selado: não calibra o juízo"
@@ -635,7 +642,7 @@ def run_round(
     ema_init = {k: v.detach().clone() for k, v in teacher.state_dict().items()}
 
     calibration_sessions = _guard_calibration(
-        calibration_pages or [], labeled, set(holdout_ids)
+        calibration_pages or [], labeled, set(holdout_ids), unlabeled
     )
     calibration = None
     if calibration_pages:
