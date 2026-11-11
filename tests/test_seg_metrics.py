@@ -371,3 +371,94 @@ def test_validate_onnx_skipped_without_libraries(monkeypatch):
     report = validate_onnx.validate_onnx(object(), "dummy.onnx", np.zeros((1, 4, 2, 2)))
     assert report["status"] == "skipped"
     assert report["degraded"] is None
+
+
+def _stroke(shape=(40, 60), rows=slice(18, 21), cols=slice(5, 55)):
+    mask = np.zeros(shape, dtype=bool)
+    mask[rows, cols] = True
+    return mask
+
+
+def test_skeletonize_thins_bar_to_one_pixel_line():
+    skel = seg_metrics.skeletonize(_stroke())
+    assert skel.sum() > 30
+    assert skel.sum(axis=0).max() == 1
+
+
+def test_skeletonize_matches_opencv_thinning_away_from_border():
+    cv2 = pytest.importorskip("cv2")
+    if not hasattr(cv2, "ximgproc"):
+        pytest.skip("opencv-contrib ausente")
+    rng = np.random.default_rng(1)
+    for _ in range(5):
+        m = np.zeros((100, 110), np.uint8)
+        for _ in range(5):
+            p0 = tuple(int(v) + 10 for v in rng.integers(0, 80, 2))
+            p1 = tuple(int(v) + 10 for v in rng.integers(0, 80, 2))
+            cv2.line(m, p0, p1, 1, int(rng.integers(1, 6)))
+        ref = cv2.ximgproc.thinning(m * 255, thinningType=0) > 0
+        assert (seg_metrics.skeletonize(m) == ref).all()
+
+
+def test_cldice_perfect_empty_and_one_sided():
+    s = _stroke()
+    assert seg_metrics.cldice_binary(s, s)["cldice"] == 1.0
+    empty = np.zeros_like(s)
+    assert seg_metrics.cldice_binary(empty, empty)["cldice"] == 1.0
+    assert seg_metrics.cldice_binary(empty, s)["cldice"] == 0.0
+    assert seg_metrics.cldice_binary(s, empty)["cldice"] == 0.0
+    with pytest.raises(ValueError):
+        seg_metrics.cldice_binary(s, s[:10])
+
+
+def test_cldice_punishes_broken_stroke_more_than_iou():
+    gt = _stroke()
+    broken = gt.copy()
+    broken[:, 20:40] = False  # traço partido: 40% do comprimento some
+    m = seg_metrics.cldice_binary(broken, gt)
+    assert m["tprec"] == 1.0 and m["tsens"] < 0.7
+    thick = _stroke(rows=slice(16, 23))  # borrão mais grosso, mesmo traço
+    t = seg_metrics.cldice_binary(thick, gt)
+    assert t["tsens"] == 1.0 and t["tprec"] == 1.0
+
+
+def test_cldice_tolerance_forgives_small_shift():
+    gt = _stroke()
+    shifted = _stroke(rows=slice(21, 24))
+    assert seg_metrics.cldice_binary(shifted, gt)["cldice"] < 0.5
+    assert seg_metrics.cldice_binary(shifted, gt, tolerance_px=2)["cldice"] == 1.0
+
+
+def test_ink_cldice_ignores_255():
+    gt = np.full((40, 60), seg_metrics.PAPER, np.uint8)
+    gt[_stroke()] = seg_metrics.INK
+    pred = gt.copy()
+    pred[:, 40:] = seg_metrics.PAPER
+    gt_ignored = gt.copy()
+    gt_ignored[:, 40:] = seg_metrics.IGNORE_INDEX
+    assert seg_metrics.ink_cldice(pred, gt)["cldice"] < 1.0
+    assert seg_metrics.ink_cldice(pred, gt_ignored)["cldice"] == pytest.approx(
+        1.0, abs=0.05
+    )
+
+
+def test_evaluate_in_roi_only_counts_inside():
+    gt = np.full((20, 20), seg_metrics.PAPER, np.uint8)
+    gt[5:8, 2:18] = seg_metrics.INK
+    pred = gt.copy()
+    pred[15:18, 2:18] = seg_metrics.INK  # fantasma longe do traço real
+    roi = seg_metrics.interior_roi(gt.shape, 0.0)
+    roi[12:, :] = False
+    inside = seg_metrics.evaluate_in_roi(pred, gt, roi)
+    assert inside["iou"]["ink"] == 1.0
+    assert seg_metrics.evaluate(pred, gt)["iou"]["ink"] < 1.0
+    stroke = seg_metrics.stroke_roi(gt == seg_metrics.INK, pred == seg_metrics.INK, 1)
+    assert stroke[16, 10] and not stroke[11, 10]
+    assert seg_metrics.evaluate_in_roi(pred, gt, stroke)["iou"]["ink"] < 1
+    with pytest.raises(ValueError):
+        seg_metrics.evaluate_in_roi(pred, gt, roi[:5])
+
+
+def test_interior_roi_cuts_margin():
+    roi = seg_metrics.interior_roi((100, 200), 0.1)
+    assert roi.sum() == 80 * 160 and not roi[0, 0] and roi[50, 100]

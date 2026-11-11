@@ -251,3 +251,69 @@ def test_export_failure_preserves_round_metrics_and_blocks_delivery(
     assert metrics["onnx_validation"]["status"] == "failed"
     assert (tmp_path / "round_checkpoint.pt").is_file()
     assert json.loads((tmp_path / "metrics.json").read_text())["steps"] == 3
+
+
+def test_consistency_targets_conformal_only_removes_pixels():
+    tr = _train_round()
+    page = np.full((64, 64, 3), 0.94, dtype=np.float32)
+    page[28:32, 10:50] = 0.12
+    prob = np.full((64, 64), 0.01, dtype=np.float32)
+    prob[28:32, 10:50] = 0.99
+    prob[30, 40:50] = 0.93  # tinta aceita pelo teacher, mas fora do conformal
+    base_t, base_w = tr.consistency_targets(prob, page)
+    calib = {
+        "version": 1,
+        "classes": {
+            "ink": {"q": 0.05, "supported": True, "n": 1000},
+            "background": {"q": 0.05, "supported": True, "n": 1000},
+        },
+    }
+    t, w = tr.consistency_targets(prob, page, calib)
+    assert (t == base_t).all()
+    assert (w <= base_w).all()
+    assert base_w[30, 45] == 1.0 and w[30, 45] == 0.0
+    assert w[30, 20] == 1.0 and w[10, 10] == 1.0
+
+
+def test_calibration_guard_rejects_holdout_and_training_sessions():
+    tr = _train_round()
+    labeled = [_lineage_page(tr, "train")]
+    with pytest.raises(ValueError, match="holdout"):
+        tr._guard_calibration([_lineage_page(tr, "h")], labeled, {"h"})
+    with pytest.raises(ValueError, match="treina"):
+        tr._guard_calibration([_lineage_page(tr, "train")], labeled, set())
+    assert tr._guard_calibration([_lineage_page(tr, "cal")], labeled, set()) == ["cal"]
+
+
+def test_run_round_writes_accepted_profile_drift_and_conformal(tmp_path, monkeypatch):
+    tr = _train_round()
+    monkeypatch.setattr(
+        tr.torch.onnx, "export", lambda *a, **k: (_ for _ in ()).throw(RuntimeError())
+    )
+    kwargs = dict(
+        steps=3,
+        batch=2,
+        patch=16,
+        holdout=[_lineage_page(tr, "holdout", holdout=True)],
+        allow_random_init=True,
+    )
+    unlabeled = [_lineage_page(tr, "pool")]
+    first = tr.run_round(
+        [_lineage_page(tr, "train")], unlabeled, tmp_path / "r1", **kwargs
+    )
+    assert first["accepted_drift"]["status"] == "NO_REFERENCE"
+    profile = json.loads((tmp_path / "r1" / "accepted_profile.json").read_text())
+    assert profile["n_items"] == 3 * 2
+    second = tr.run_round(
+        [_lineage_page(tr, "train")],
+        unlabeled,
+        tmp_path / "r2",
+        accepted_reference=tmp_path / "r1" / "accepted_profile.json",
+        calibration_pages=[_lineage_page(tr, "cal")],
+        **kwargs,
+    )
+    report = json.loads((tmp_path / "r2" / "accepted_drift.json").read_text())
+    assert report["status"] == second["accepted_drift"]["status"]
+    assert report["role"] == "signal_to_judgment"
+    assert second["conformal"]["sessions"] == ["cal"]
+    assert second["promotion_status"] == "not_attempted_human_gate_required"

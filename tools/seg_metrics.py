@@ -464,3 +464,142 @@ def save_predictions(output_dir, predictions, model_name=""):
         json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
     )
     return manifest_path
+
+
+# ---------------------------------------------------------------------
+# Experimentos de régua (item 3 do self-learning v2, 2026-11-11):
+# clDice e avaliação restrita a ROI. São DIAGNÓSTICO ao lado da IoU,
+# nunca critério de promoção: nenhum portão lê estes números.
+# ---------------------------------------------------------------------
+
+
+def skeletonize(mask):
+    """Esqueleto Zhang-Suen de uma máscara binária, em NumPy puro.
+
+    Mesmo algoritmo de ``cv2.ximgproc.thinning`` (THINNING_ZHANGSUEN),
+    reescrito aqui para o núcleo das métricas seguir sem OpenCV (idêntico
+    longe da borda; aqui a borda da imagem conta como fundo). Cada
+    subiteração remove em bloco os pixels de borda que não quebram a
+    conectividade (A == 1, 2 <= B <= 6), até nada mais mudar.
+    """
+    img = np.pad(np.asarray(mask, dtype=bool), 1).astype(np.uint8)
+    while True:
+        changed = False
+        for step in (0, 1):
+            p2 = img[:-2, 1:-1]
+            p3 = img[:-2, 2:]
+            p4 = img[1:-1, 2:]
+            p5 = img[2:, 2:]
+            p6 = img[2:, 1:-1]
+            p7 = img[2:, :-2]
+            p8 = img[1:-1, :-2]
+            p9 = img[:-2, :-2]
+            ring = (p2, p3, p4, p5, p6, p7, p8, p9, p2)
+            b = sum(r.astype(np.int16) for r in ring[:8])
+            a = sum(
+                ((ring[i] == 0) & (ring[i + 1] == 1)).astype(np.int16) for i in range(8)
+            )
+            if step == 0:
+                c1 = (p2 * p4 * p6) == 0
+                c2 = (p4 * p6 * p8) == 0
+            else:
+                c1 = (p2 * p4 * p8) == 0
+                c2 = (p2 * p6 * p8) == 0
+            core = img[1:-1, 1:-1]
+            remove = (core == 1) & (b >= 2) & (b <= 6) & (a == 1) & c1 & c2
+            if remove.any():
+                core[remove] = 0
+                changed = True
+        if not changed:
+            return img[1:-1, 1:-1].astype(bool)
+
+
+def cldice_binary(pred, gt, tolerance_px=0, valid=None):
+    """clDice (centerline Dice, Shit et al., CVPR 2021) entre máscaras binárias.
+
+    Tprec = |S(pred) ∩ V(gt)| / |S(pred)| (o esqueleto previsto cai
+    dentro do traço real) e Tsens = |S(gt) ∩ V(pred)| / |S(gt)| (o
+    esqueleto real é coberto pelo previsto); clDice é a média
+    harmônica. Mede conectividade de traço fino: um traço partido ao
+    meio perde Tsens mesmo com IoU alta, e um borrão grosso perde
+    Tprec pouco mas não ganha nada por cobrir o fundo.
+
+    ``tolerance_px`` > 0 dilata os volumes V por um disco (mesma
+    tolerância espacial de ``ink_tolerance_metrics``); 0 é o clDice
+    original. ``valid`` (bool) restringe a conta a uma ROI/ignore.
+    Convenção do módulo: vazio dos dois lados vale 1.0; um lado vazio
+    e o outro não vale 0.0.
+    """
+    pred = np.asarray(pred, dtype=bool)
+    gt = np.asarray(gt, dtype=bool)
+    if pred.shape != gt.shape or pred.ndim != 2:
+        raise ValueError("cldice exige máscaras 2D com o mesmo formato")
+    if valid is not None:
+        valid = np.asarray(valid, dtype=bool)
+        pred = pred & valid
+        gt = gt & valid
+    skel_pred = skeletonize(pred)
+    skel_gt = skeletonize(gt)
+    if valid is not None:
+        skel_pred &= valid
+        skel_gt &= valid
+    n_sp, n_sg = int(skel_pred.sum()), int(skel_gt.sum())
+    if n_sp == 0 and n_sg == 0:
+        return {"cldice": 1.0, "tprec": 1.0, "tsens": 1.0, "tolerance_px": tolerance_px}
+    if n_sp == 0 or n_sg == 0:
+        return {"cldice": 0.0, "tprec": 0.0, "tsens": 0.0, "tolerance_px": tolerance_px}
+    vol_gt = _dilate_disk(gt, tolerance_px)
+    vol_pred = _dilate_disk(pred, tolerance_px)
+    tprec = float(np.count_nonzero(skel_pred & vol_gt)) / n_sp
+    tsens = float(np.count_nonzero(skel_gt & vol_pred)) / n_sg
+    value = 0.0 if tprec + tsens == 0 else 2 * tprec * tsens / (tprec + tsens)
+    return {
+        "cldice": value,
+        "tprec": tprec,
+        "tsens": tsens,
+        "tolerance_px": tolerance_px,
+    }
+
+
+def ink_cldice(pred, gt, tolerance_px=0):
+    """clDice da classe ink em mapas de classe; pixels 255 são ignorados."""
+    pred, gt = _validate_masks(pred, gt)
+    valid = gt != IGNORE_INDEX
+    return cldice_binary(pred == INK, gt == INK, tolerance_px=tolerance_px, valid=valid)
+
+
+def stroke_roi(gt_ink, pred_ink, radius_px):
+    """ROI de traço: vizinhança de raio ``radius_px`` da tinta real OU prevista.
+
+    Fora dela só há fundo trivial, que infla a accuracy e dilui o
+    erro do traço; dentro dela ficam o traço, a borda dele e os
+    fantasmas próximos. Tinta fantasma longe de tudo também entra,
+    porque a ROI inclui a vizinhança da predição.
+    """
+    union = np.asarray(gt_ink, dtype=bool) | np.asarray(pred_ink, dtype=bool)
+    return _dilate_disk(union, int(radius_px))
+
+
+def interior_roi(shape, margin_fraction):
+    """ROI do miolo da página: corta uma margem de ``margin_fraction`` por lado.
+
+    A borda do warp concentra resto de mesa, sombra do caderno e
+    serrilhado da homografia; avaliar sem ela separa erro de tinta
+    de erro de geometria da folha.
+    """
+    h, w = int(shape[0]), int(shape[1])
+    my = int(round(h * float(margin_fraction)))
+    mx = int(round(w * float(margin_fraction)))
+    roi = np.zeros((h, w), dtype=bool)
+    roi[my : h - my, mx : w - mx] = True
+    return roi
+
+
+def evaluate_in_roi(pred, gt, roi):
+    """``evaluate`` restrito a uma ROI: pixels fora dela viram ignore (255)."""
+    pred, gt = _validate_masks(pred, gt)
+    roi = np.asarray(roi, dtype=bool)
+    if roi.shape != gt.shape:
+        raise ValueError(f"roi shape {roi.shape} != gt shape {gt.shape}")
+    gt_roi = np.where(roi, gt, IGNORE_INDEX)
+    return evaluate(pred, gt_roi)

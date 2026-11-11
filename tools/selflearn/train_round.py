@@ -48,6 +48,7 @@ from torch import nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from draw.selflearn import conformal, drift  # noqa: E402
 from draw.selflearn.gate import MIN_HOLDOUT_PAGES, MIN_HOLDOUT_SESSIONS  # noqa: E402
 from draw.selflearn.split import (  # noqa: E402
     HOLDOUT,
@@ -255,18 +256,46 @@ def strong_view(img, rng):
     return np.clip(out, 0.0, 1.0)
 
 
-def consistency_targets(prob, weak_bgr):
+def consistency_targets(prob, weak_bgr, calibration=None):
     """Alvo/peso da consistência para uma página BGR não rotulada.
 
     Tinta prevista sem escurecimento e escurecimento não visto viram
     ignore. A testemunha confirma escurecimento, não semântica: impresso,
     pauta e sombra ainda exigem holdout independente e revisão humana.
+    Com ``calibration`` (conformal por classe, calibrado em rótulos
+    independentes), o pixel só é aceito se o conjunto conformal for
+    singleton e concordar com o pseudo-rótulo: juízo triplo, onde o
+    veto clássico e o conformal só retiram pixels, nunca acrescentam.
     """
     bgr = (np.clip(weak_bgr, 0.0, 1.0) * 255.0).round().astype(np.uint8)
     mask, ignore, _confidence = pseudo_label(prob, bgr, ink_thr=INK_THR, bg_thr=BG_THR)
     target = (mask > 0).astype(np.float32)
-    weight = (ignore == 0).astype(np.float32)
+    accepted = ignore == 0
+    if calibration is not None:
+        c_mask, c_ignore = conformal.conformal_accept(prob, calibration)
+        accepted &= (c_ignore == 0) & ((c_mask > 0) == (mask > 0))
+    weight = accepted.astype(np.float32)
     return target, weight
+
+
+def _guard_calibration(calibration_pages, labeled, holdout_ids):
+    """Calibração conformal: rótulo independente, fora do treino e do selado."""
+    if not calibration_pages:
+        return []
+    labeled_ids = {page.session_id for page in labeled}
+    for page in calibration_pages:
+        if not isinstance(page, PageExample) or page.mask is None:
+            raise TypeError("calibração conformal exige PageExample com máscara")
+        if page.session_id in holdout_ids:
+            raise ValueError(
+                f"sessão {page.session_id} é do holdout selado: não calibra o juízo"
+            )
+        if page.session_id in labeled_ids:
+            raise ValueError(
+                f"sessão {page.session_id} treina nesta rodada: calibração "
+                "conformal precisa de sessões que não treinam"
+            )
+    return sorted({page.session_id for page in calibration_pages})
 
 
 def _manifest_rows(root):
@@ -574,6 +603,9 @@ def run_round(
     holdout=None,
     init_checkpoint=None,
     allow_random_init=False,
+    accepted_reference=None,
+    calibration_pages=None,
+    conformal_alpha=conformal.DEFAULT_ALPHA,
 ):
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
@@ -601,6 +633,24 @@ def run_round(
         p.requires_grad_(False)
     teacher.eval()
     ema_init = {k: v.detach().clone() for k, v in teacher.state_dict().items()}
+
+    calibration_sessions = _guard_calibration(
+        calibration_pages or [], labeled, set(holdout_ids)
+    )
+    calibration = None
+    if calibration_pages:
+        # Calibra no teacher inicial (o incumbente): o limiar vem de
+        # rótulo independente, não da confiança do próprio gerador.
+        calibration = conformal.calibrate(
+            (
+                (predict_page_probability(teacher, page, device, patch), page.mask)
+                for page in calibration_pages
+            ),
+            alpha=conformal_alpha,
+        )
+        calibration["sessions"] = calibration_sessions
+        log(f"conformal calibrado em {len(calibration_sessions)} sessões")
+    accepted_profile = drift.AcceptedProfile()
     opt = torch.optim.Adam(student.parameters(), lr=lr)
 
     sup_history, cons_history, coverage_history, ink_history = [], [], [], []
@@ -645,7 +695,8 @@ def run_round(
                 probs = torch.sigmoid(teacher(x_weak))[:, 0].cpu().numpy()
             targets_u, weights_u = [], []
             for i in range(batch):
-                t_i, w_i = consistency_targets(probs[i], weak_np[i])
+                t_i, w_i = consistency_targets(probs[i], weak_np[i], calibration)
+                accepted_profile.add_item(probs[i], t_i, w_i)
                 targets_u.append(torch.from_numpy(t_i)[None])
                 weights_u.append(torch.from_numpy(w_i)[None])
             target_u = torch.stack(targets_u).to(device)
@@ -729,6 +780,18 @@ def run_round(
     delivery_status = (
         "validated" if onnx_check["status"] == "ok" else "blocked_onnx_validation"
     )
+    profile_dict = accepted_profile.to_dict()
+    (out_dir / "accepted_profile.json").write_text(
+        json.dumps(profile_dict), encoding="utf-8"
+    )
+    if accepted_reference is None:
+        drift_report = drift.no_reference_report()
+    else:
+        drift_report = drift.compare_profiles(accepted_reference, profile_dict)
+    (out_dir / "accepted_drift.json").write_text(
+        json.dumps(drift_report, indent=2), encoding="utf-8"
+    )
+    log(drift.format_report(drift_report))
     metrics = {
         "steps": steps,
         "sup_loss_first3": _mean_first3(sup_history),
@@ -759,6 +822,13 @@ def run_round(
         "onnx_validation": onnx_check,
         "delivery_status": delivery_status,
         "promotion_status": "not_attempted_human_gate_required",
+        "accepted_profile": "accepted_profile.json",
+        "accepted_drift": {
+            "status": drift_report["status"],
+            "report": "accepted_drift.json",
+            "role": "signal_to_judgment",
+        },
+        "conformal": calibration,
         "seconds": round(time.time() - t0, 1),
     }
     (out_dir / "metrics.json").write_text(
@@ -844,6 +914,16 @@ def main(argv=None):
     ap.add_argument("--holdout-dir")
     ap.add_argument("--init-checkpoint")
     ap.add_argument("--allow-random-init", action="store_true")
+    ap.add_argument(
+        "--accepted-reference",
+        help="accepted_profile.json da rodada de referência (monitor PSI/KS)",
+    )
+    ap.add_argument(
+        "--calibration-dir",
+        help="páginas com rótulo independente, fora do treino e do selado, "
+        "para o conformal por classe",
+    )
+    ap.add_argument("--conformal-alpha", type=float, default=conformal.DEFAULT_ALPHA)
     ap.add_argument("--out", default="selflearn_round_out")
     ap.add_argument("--epochs", type=int, default=12)
     ap.add_argument("--steps-per-epoch", type=int, default=50)
@@ -899,6 +979,11 @@ def main(argv=None):
         unlabeled = load_pages(
             args.unlabeled_dir, with_mask=False, holdout_session_ids=holdout_ids
         )
+    calibration_pages = None
+    if args.calibration_dir:
+        calibration_pages = load_pages(
+            args.calibration_dir, with_mask=True, holdout_session_ids=holdout_ids
+        )
     metrics = run_round(
         labeled,
         unlabeled,
@@ -907,6 +992,9 @@ def main(argv=None):
         holdout=holdout,
         init_checkpoint=args.init_checkpoint,
         allow_random_init=args.allow_random_init,
+        accepted_reference=args.accepted_reference,
+        calibration_pages=calibration_pages,
+        conformal_alpha=args.conformal_alpha,
     )
     print(json.dumps(metrics, indent=2))
     return 0 if metrics["delivery_status"] == "validated" else 3
