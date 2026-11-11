@@ -33,6 +33,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from ..safe_io import InputLimitError, ensure_private_dir, read_image, read_json
 from . import gate as gate_module
 from . import session as session_module
 from . import split as split_module
@@ -44,8 +45,19 @@ _FILES = ("reference_warp", "final_warp", "final_canvas")
 
 
 def _load_json(path):
-    with open(path, encoding="utf-8") as handle:
-        return json.load(handle)
+    return read_json(path)
+
+
+def _inside(base, rel):
+    """Caminho de rel sob base, ou None se rel escapa (absoluto ou ..)."""
+    if not isinstance(rel, str) or not rel:
+        return None
+    candidate = (base / rel).resolve()
+    try:
+        candidate.relative_to(base.resolve())
+    except ValueError:
+        return None
+    return candidate
 
 
 def scan_sessions(sessions_root):
@@ -67,11 +79,26 @@ def scan_sessions(sessions_root):
         if not manifest_path.exists():
             problems.append(f"sessao orfa (sem manifest.json), excluida: {session_id}")
             continue
-        manifest = _load_json(manifest_path)
+        try:
+            manifest = _load_json(manifest_path)
+        except InputLimitError as error:
+            problems.append(f"sessao com manifest.json ilegivel, excluida: {error}")
+            continue
+        entries = (
+            manifest.get("generations", []) if isinstance(manifest, dict) else None
+        )
+        if not isinstance(entries, list):
+            problems.append(
+                f"sessao com manifest.json malformado, excluida: {session_id}"
+            )
+            continue
         generations = []
-        for entry in manifest.get("generations", []):
+        for entry in entries:
+            if not isinstance(entry, dict) or not isinstance(entry.get("files"), dict):
+                problems.append(f"{session_id}: geracao malformada no manifesto")
+                continue
             gen = entry.get("generation")
-            files = entry.get("files", {})
+            files = entry["files"]
             ok = True
             for kind in _FILES:
                 rel = files.get(kind)
@@ -80,8 +107,14 @@ def scan_sessions(sessions_root):
                     problems.append(f"{session_id} gen {gen}: manifesto sem {kind}")
                     ok = False
                     continue
-                fpath = session_dir / rel
-                if not fpath.exists():
+                fpath = _inside(session_dir, rel)
+                if fpath is None:
+                    problems.append(
+                        f"{session_id} gen {gen}: caminho fora da sessao em {kind}"
+                    )
+                    ok = False
+                    continue
+                if not fpath.is_file():
                     problems.append(f"{session_id} gen {gen}: arquivo ausente {rel}")
                     ok = False
                     continue
@@ -102,7 +135,7 @@ def scan_sessions(sessions_root):
                 "session_id": session_id,
                 "path": str(session_dir),
                 "generations": generations,
-                "models": manifest.get("models", {}),
+                "models": manifest.get("models") or {},
             }
         )
     return sessions, problems
@@ -110,8 +143,8 @@ def scan_sessions(sessions_root):
 
 def _ink_fraction(final_path, reference_path):
     """Fracao de pixels que escureceram (rascunho final - referencia)."""
-    final = cv2.imread(str(final_path), cv2.IMREAD_COLOR)
-    reference = cv2.imread(str(reference_path), cv2.IMREAD_COLOR)
+    final = read_image(final_path, cv2.IMREAD_COLOR)
+    reference = read_image(reference_path, cv2.IMREAD_COLOR)
     if final is None or reference is None:
         raise ValueError(f"warp ilegivel: {final_path} / {reference_path}")
     mask = split_module.draft_independent_label(final, reference)
@@ -138,8 +171,7 @@ def process_pool(
     (uma linha por geracao, com linhagem), os rascunhos do holdout
     em holdout/<sessao>/gen_NNNN/label_draft.png e summary.json.
     """
-    out = Path(out_root)
-    out.mkdir(parents=True, exist_ok=True)
+    out = ensure_private_dir(out_root)
 
     sessions, problems = scan_sessions(sessions_root)
 

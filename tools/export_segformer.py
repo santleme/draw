@@ -44,10 +44,8 @@ def _sha256(path):
 
 
 def _load_state(torch, checkpoint, device):
-    try:
-        return torch.load(checkpoint, map_location=device, weights_only=True)
-    except TypeError:  # torch anterior ao argumento weights_only
-        return torch.load(checkpoint, map_location=device)
+    # Só tensores: sem fallback para o unpickler completo.
+    return torch.load(checkpoint, map_location=device, weights_only=True)
 
 
 def main(argv=None):

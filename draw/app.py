@@ -53,6 +53,7 @@ except ImportError:
     # --ink-model avisa e o app segue so com a heuristica.
     ink_model_module = None
 from . import manifest as manifest_module
+from .safe_io import ensure_private_dir
 from . import neural as neural_module
 from . import page_clean as page_clean_module
 from .selflearn import session as session_module
@@ -295,16 +296,26 @@ def _check_models():
     """Confere os modelos contra models/MANIFEST.json. True se tudo bate.
 
     Sem manifesto (o caso de um clone novo), imprime o aviso e
-    devolve True: nada a verificar nao e falha.
+    devolve True: nada a verificar nao e falha. Um .onnx/.task em
+    models/ sem entrada no manifesto e FAIL no modo estrito (padrao)
+    e AVISO com DRAW_MODEL_STRICT=0.
     """
     manifest_path, models = manifest_module.load_manifest()
+    ok = True
+    strict = manifest_module.strict_enabled()
+    for extra in manifest_module.unregistered_model_files():
+        label = "FAIL" if strict else "AVISO"
+        print(
+            f"{label}: {extra.name} esta em models/ e nao tem entrada no "
+            "manifesto; a carga dele e recusada no modo estrito."
+        )
+        ok = ok and not strict
     if not models:
         print(
             f"AVISO: {manifest_path} sem modelos registrados; "
             "nenhum binario foi conferido."
         )
-        return True
-    ok = True
+        return ok
     for name in sorted(models):
         path = Path(__file__).resolve().parent.parent / "models" / name
         if not path.exists():
@@ -632,7 +643,9 @@ def run(
     if not markers_mode:
         detection_worker = _SheetDetectionWorker(detect_sheet).start()
     png_writer = _PngWriter()
-    save_path = Path(save_dir)
+    # Capturas, telemetria e relatórios são privados: a pasta ganha
+    # um .gitignore "*" qualquer que seja o --save-dir.
+    save_path = ensure_private_dir(save_dir)
     telemetry = telemetry_module.SessionTelemetry(save_path / "telemetry.jsonl").start()
     format_metadata = {
         "paper_format": config.PAPER_FORMAT,
@@ -1529,12 +1542,24 @@ def main():
     )
     parser.add_argument("--save-dir", default="captures")
     parser.add_argument(
+        "--allow-unverified",
+        action="store_true",
+        help="carrega modelos divergentes ou fora de models/MANIFEST.json "
+        "com aviso, em vez de recusar (equivale a DRAW_MODEL_STRICT=0)",
+    )
+    parser.add_argument(
         "--format",
         choices=list(config.FORMATS),
         default=None,
         help="formato da sessao em retrato (flag > DRAW_FORMAT > a4)",
     )
     args = parser.parse_args()
+    if args.allow_unverified:
+        manifest_module.allow_unverified()
+        print(
+            "AVISO: --allow-unverified ativo; modelos divergentes ou fora do "
+            "manifesto serao carregados apenas com aviso."
+        )
     try:
         config.apply_format(args.format or os.environ.get("DRAW_FORMAT", "a4"))
     except ValueError as error:

@@ -32,10 +32,21 @@ Duas metades:
    0 rodar).
 
 Uso pretendido (no Windows, quando testado):
-  python windows_helper.py --port 8765
+  set DRAW_HELPER_TOKEN=<token compartilhado com o WSL>
+  python windows_helper.py --port 8765 [--host <IP do vEthernet (WSL)>]
+
+Segurança (PROTOCOL.md, "Authentication handshake"): o bind padrão é
+127.0.0.1; escutar em todas as interfaces exige --allow-all-interfaces
+e emite aviso. Toda conexão precisa apresentar o token antes do
+primeiro frame; sem token configurado, o ajudante gera um e o mostra
+uma única vez no console.
 """
 
 import argparse
+import hmac
+import ipaddress
+import os
+import secrets
 import struct
 import sys
 import time
@@ -46,6 +57,16 @@ MAGIC = b"DRAW"
 VERSION = 1
 HEADER = struct.Struct("<4sHHQqI")  # 28 bytes, little-endian
 DEFAULT_PORT = 8765
+DEFAULT_HOST = "127.0.0.1"
+
+HELLO_MAGIC = b"DRAH"
+HELLO_VERSION = 1
+HELLO = struct.Struct("<4sHH")  # 8 bytes, little-endian
+ACCEPT = b"DROK"
+TOKEN_ENV = "DRAW_HELPER_TOKEN"
+TOKEN_MIN_LEN = 16
+TOKEN_MAX_LEN = 256
+HANDSHAKE_TIMEOUT_S = 5.0
 
 # --- Constantes Win32 (documentadas; conferir na sessao real) ---
 
@@ -241,22 +262,123 @@ def capture_frames():
     )
 
 
-def serve(port=DEFAULT_PORT):
-    """Laco principal: escuta, aceita o WSL, envia frames. ESBOCO.
+def resolve_bind_host(host=DEFAULT_HOST, allow_all_interfaces=False):
+    """Endereço de bind: loopback por padrão, wildcard só com opt-in.
+
+    Um IP específico (ex.: o do adaptador vEthernet (WSL) no modo NAT)
+    é aceito sem flag, pois não expõe as demais interfaces. "0.0.0.0",
+    "::" ou vazio exigem allow_all_interfaces=True e geram aviso.
+    """
+    host = (host or "").strip()
+    wildcard = host in ("", "0.0.0.0", "::")
+    if not wildcard:
+        try:
+            wildcard = ipaddress.ip_address(host).is_unspecified
+        except ValueError:
+            wildcard = False
+    if wildcard:
+        if not allow_all_interfaces:
+            raise SystemExit(
+                f"Recusado: bind em {host or '0.0.0.0'!r} expoe o ajudante a "
+                "toda a rede. Use 127.0.0.1 (WSL espelhado) ou o IP do "
+                "adaptador vEthernet (WSL); para expor de proposito, passe "
+                "--allow-all-interfaces."
+            )
+        print(
+            "AVISO DE SEGURANCA: escutando em todas as interfaces. Qualquer "
+            "maquina que alcance esta porta pode tentar o handshake; o canal "
+            "nao tem TLS. Restrinja a porta no firewall do Windows.",
+            file=sys.stderr,
+        )
+        return host or "0.0.0.0"
+    return host
+
+
+def resolve_token(token=None, token_file=None):
+    """Token como bytes: argumento, --token-file, ambiente ou gerado."""
+    if token is None and token_file:
+        with open(token_file, encoding="utf-8") as handle:
+            token = handle.read().strip()
+    if token is None:
+        token = os.environ.get(TOKEN_ENV) or None
+    if token is None:
+        token = secrets.token_urlsafe(32)
+        print(
+            f"Token gerado para esta sessao (defina {TOKEN_ENV} igual no WSL):\n"
+            f"  {token}"
+        )
+    if isinstance(token, str):
+        token = token.encode("utf-8")
+    if not TOKEN_MIN_LEN <= len(token) <= TOKEN_MAX_LEN:
+        raise SystemExit(
+            f"token do ajudante precisa ter {TOKEN_MIN_LEN}..{TOKEN_MAX_LEN} bytes"
+        )
+    return token
+
+
+def _recv_exact(conn, size):
+    data = bytearray()
+    while len(data) < size:
+        chunk = conn.recv(size - len(data))
+        if not chunk:
+            return None
+        data.extend(chunk)
+    return bytes(data)
+
+
+def authenticate_client(conn, token, timeout=HANDSHAKE_TIMEOUT_S):
+    """Lê HELLO + token do cliente; True e ACCEPT se o token confere.
+
+    Falha (magic, versão, tamanho, token errado, timeout) devolve
+    False sem responder nada; quem chamou fecha a conexão.
+    """
+    previous = conn.gettimeout()
+    conn.settimeout(timeout)
+    try:
+        hello = _recv_exact(conn, HELLO.size)
+        if hello is None:
+            return False
+        magic, version, length = HELLO.unpack(hello)
+        if magic != HELLO_MAGIC or version != HELLO_VERSION:
+            return False
+        if not TOKEN_MIN_LEN <= length <= TOKEN_MAX_LEN:
+            return False
+        offered = _recv_exact(conn, length)
+        if offered is None or not hmac.compare_digest(offered, token):
+            return False
+        conn.sendall(ACCEPT)
+        return True
+    except OSError:
+        return False
+    finally:
+        conn.settimeout(previous)
+
+
+def serve(port=DEFAULT_PORT, host=DEFAULT_HOST, token=None, allow_all_interfaces=False):
+    """Laco principal: escuta, autentica o WSL, envia frames. ESBOCO.
 
     O ajudante escuta e o WSL conecta (PROTOCOL.md, "Transporte").
+    Conexoes sem o token sao fechadas antes de qualquer frame.
     frame_id comeca em 0 a cada sessao; a epoca do timestamp e o
     inicio do processo.
     """
     import socket
 
+    bind_host = resolve_bind_host(host, allow_all_interfaces)
+    token = resolve_token(token)
     set_dpi_awareness()
-    server = socket.socket()
+    family = socket.AF_INET6 if ":" in bind_host else socket.AF_INET
+    server = socket.socket(family, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(("0.0.0.0", port))
+    server.bind((bind_host, port))
     server.listen(1)
-    print(f"Ajudante Draw (ESBOCO) escutando na porta {port}.")
-    conn, _addr = server.accept()
+    print(f"Ajudante Draw (ESBOCO) escutando em {bind_host}:{port}.")
+    while True:
+        conn, addr = server.accept()
+        if authenticate_client(conn, token):
+            break
+        print(f"Conexao de {addr[0]} recusada: handshake/token invalido.")
+        conn.close()
     with conn:
         frame_id = 0
         for jpeg in capture_frames():
@@ -272,8 +394,29 @@ def main():
         description="Ajudante Draw no Windows (ESBOCO NAO TESTADO)"
     )
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument(
+        "--host",
+        default=DEFAULT_HOST,
+        help="endereco de bind (padrao 127.0.0.1; no WSL NAT, o IP do "
+        "adaptador vEthernet (WSL))",
+    )
+    parser.add_argument(
+        "--allow-all-interfaces",
+        action="store_true",
+        help="permite bind em 0.0.0.0/:: (expoe a porta a rede; com aviso)",
+    )
+    parser.add_argument(
+        "--token-file",
+        default=None,
+        help=f"arquivo com o token compartilhado (padrao: ${TOKEN_ENV})",
+    )
     args = parser.parse_args()
-    serve(args.port)
+    serve(
+        args.port,
+        host=args.host,
+        token=resolve_token(token_file=args.token_file),
+        allow_all_interfaces=args.allow_all_interfaces,
+    )
 
 
 if __name__ == "__main__":

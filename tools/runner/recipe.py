@@ -16,7 +16,14 @@ O resto e livro-razao da corrida: fica registrado no arquivo junto
 com as metricas, para a comparacao ser honesta meses depois.
 """
 
+import re
 from dataclasses import asdict, dataclass, field
+
+# Slugs viram caminho e query da API do Kaggle: só o alfabeto do
+# Kaggle, sem barra, espaço, "?" ou "&".
+_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,49}$")
+_DATASET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,49}/[a-z0-9][a-z0-9-]{1,49}$")
+_MAX_DATASETS = 50
 
 
 @dataclass
@@ -38,6 +45,15 @@ class Recipe:
         for name in ("name", "train_script", "kernel_slug"):
             if not getattr(self, name):
                 raise ValueError(f"receita sem {name}")
+        if not isinstance(self.kernel_slug, str) or not _SLUG_RE.match(
+            self.kernel_slug
+        ):
+            raise ValueError(f"kernel_slug invalido: {self.kernel_slug!r}")
+        if not isinstance(self.datasets, list) or len(self.datasets) > _MAX_DATASETS:
+            raise ValueError(f"datasets precisa ser lista de ate {_MAX_DATASETS}")
+        for source in self.datasets:
+            if not isinstance(source, str) or not _DATASET_RE.match(source):
+                raise ValueError(f"dataset invalido (esperado dono/slug): {source!r}")
         return True
 
     def to_dict(self):
@@ -45,5 +61,7 @@ class Recipe:
 
     @classmethod
     def from_dict(cls, data):
+        if not isinstance(data, dict):
+            raise ValueError("receita precisa ser um objeto JSON")
         known = {f for f in cls.__dataclass_fields__}
         return cls(**{k: v for k, v in data.items() if k in known})

@@ -12,17 +12,19 @@ import hashlib
 import json
 import time
 import uuid
-from pathlib import Path
 
 import cv2
 import numpy as np
+
+from ..safe_io import ensure_private_dir
+from . import split as split_module
 
 
 class ExampleRecorder:
     """Gravador de exemplos. Uma chamada de record() por passada."""
 
     def __init__(self, out_dir):
-        self.out_dir = Path(out_dir)
+        self.out_dir = ensure_private_dir(out_dir)
         self.input_dir = self.out_dir / "input"
         self.prob_dir = self.out_dir / "prob"
         self.input_dir.mkdir(parents=True, exist_ok=True)
@@ -42,6 +44,11 @@ class ExampleRecorder:
         colisao gera um nome novo. A linha do manifesto so e
         publicada depois que os dois arquivos estao gravados.
         """
+        # Linhagem obrigatória na escrita, não só na leitura: sem
+        # session_id/origem/split válidos a linha não é gravada.
+        split_module._require_lineage({"session_id": session_id, "origin": origin})
+        if split not in (split_module.TRAIN, split_module.HOLDOUT):
+            raise split_module.LeakageError(f"split desconhecido: {split!r}")
         stamp = time.time()
 
         ok, buf = cv2.imencode(".png", warped_bgr)

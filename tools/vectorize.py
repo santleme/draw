@@ -76,7 +76,7 @@ def load_ink(path):
 
 def load_stamps(path):
     """Carrega planos de carimbo (`first_seen_ms`, `last_update_ms`) de um `.npz`."""
-    data = np.load(str(path))
+    data = np.load(str(path), allow_pickle=False)
     first = data["first_seen_ms"] if "first_seen_ms" in data else None
     last = (
         data["last_update_ms"]

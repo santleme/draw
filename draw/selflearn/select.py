@@ -11,6 +11,8 @@ distribuicao rodada apos rodada.
 
 import random
 
+from .split import guard_selection_pool
+
 W_TTA = 0.35
 W_TEMPORAL = 0.25
 W_IMPURITY = 0.20
@@ -57,8 +59,14 @@ class RankedExamples(list):
     random_quota_unmet = 0
 
 
-def rank_examples(items, per_session_cap=3, random_quota=0.2, seed=0):
+def rank_examples(
+    items, per_session_cap=3, random_quota=0.2, seed=0, *, holdout_session_ids
+):
     """Ordena items e aplica teto por sessao e cota aleatoria.
+
+    holdout_session_ids e obrigatorio: a fila so enxerga sessoes de
+    treino com linhagem (guard_selection_pool); item de sessao selada
+    ou sem session_id/origin levanta LeakageError antes do ranking.
 
     items: lista de dicts com os sinais (ver modulo) e session_id.
     Retorna nova lista ordenada; cada item ganha "score" (float) e
@@ -72,6 +80,7 @@ def rank_examples(items, per_session_cap=3, random_quota=0.2, seed=0):
     por sessao segue respeitado. O que a cota nao preencher fica
     registrado em `random_quota_unmet` da lista devolvida.
     """
+    guard_selection_pool(items, holdout_session_ids)
     scored = []
     for item in items:
         score, reasons = _score(item)

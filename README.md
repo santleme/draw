@@ -136,8 +136,10 @@ it is not format-aware and is unchanged.
 
 Environment variables set model paths (`DRAW_NEURAL_MODEL`,
 `DRAW_PAGE_CLEAN_MODEL`, `DRAW_INK_MODEL`, `DRAW_HAND_MODEL`) and
-thread caps for the ONNX sessions and OpenCV. `DRAW_MODEL_STRICT=1`
-turns a model/MANIFEST mismatch from a startup warning into an error.
+thread caps for the ONNX sessions and OpenCV. Model verification is strict by
+default: a model whose sha256/size differs from `models/MANIFEST.json`,
+or that has no entry there, is refused. `DRAW_MODEL_STRICT=0` or
+`--allow-unverified` downgrades that to a warning.
 
 Every run writes a session report (rates, pass timings, worker states)
 as JSON under `<save-dir>/session-reports/`, updated every 15 s and on

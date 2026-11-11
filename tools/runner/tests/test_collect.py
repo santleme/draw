@@ -66,7 +66,11 @@ def test_resume_recovers_full_file(tmp_path):
     thread.start()
     try:
         url = f"http://127.0.0.1:{port}/model.onnx"
-        manifest = collect([{"name": "model.onnx", "url": url}], str(tmp_path))
+        manifest = collect(
+            [{"name": "model.onnx", "url": url}],
+            str(tmp_path),
+            allow_loopback_http=True,
+        )
     finally:
         server.shutdown()
     target = tmp_path / "model.onnx"
@@ -74,3 +78,47 @@ def test_resume_recovers_full_file(tmp_path):
     assert manifest["model.onnx"]["bytes"] == len(PAYLOAD)
     assert manifest["model.onnx"]["sha256"] == EXPECTED_SHA
     assert sha256_of(str(target)) == EXPECTED_SHA
+
+
+class RedirectHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        self.send_response(302)
+        self.send_header("Location", "https://evil.example/model.onnx")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+
+def test_redirect_is_refused(tmp_path):
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), RedirectHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        url = f"http://127.0.0.1:{server.server_address[1]}/model.onnx"
+        with pytest.raises(IOError, match="redirect"):
+            collect(
+                [{"name": "model.onnx", "url": url}],
+                str(tmp_path),
+                allow_loopback_http=True,
+            )
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://storage.googleapis.com/x/model.onnx",
+        "https://evil.example/model.onnx",
+        "https://storage.googleapis.com.evil.example/model.onnx",
+        "https://user:pw@storage.googleapis.com/model.onnx",
+        "file:///etc/passwd",
+        "http://127.0.0.1:1/model.onnx",
+    ],
+)
+def test_url_outside_policy_is_refused_before_connecting(tmp_path, url):
+    with pytest.raises(ValueError):
+        collect([{"name": "model.onnx", "url": url}], str(tmp_path))
+    assert not (tmp_path / "model.onnx").exists()

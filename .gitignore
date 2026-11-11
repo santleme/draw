@@ -14,3 +14,7 @@ template/paper_template.png
 .DS_Store
 .idea/
 .vscode/
+# Gravacoes do bridge (frames privados da webcam) e saidas locais do
+# self-learning: nunca versionar.
+*.drawcap
+selflearn_round_out/

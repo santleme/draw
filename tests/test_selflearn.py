@@ -124,6 +124,7 @@ def test_recorder_concurrent_same_millisecond_never_overwrites(tmp_path, monkeyp
 def _item(session, tta, novelty=0.0):
     return {
         "session_id": session,
+        "origin": "live",
         "tta_disagreement": tta,
         "temporal_dispersion": 0.0,
         "region_impurity": 0.0,
@@ -135,7 +136,9 @@ def _item(session, tta, novelty=0.0):
 
 def test_ranking_orders_high_disagreement_first_and_respects_cap():
     items = [_item("a", 0.9), _item("a", 0.8), _item("a", 0.7), _item("b", 0.6)]
-    ranked = rank_examples(items, per_session_cap=2, random_quota=0.0)
+    ranked = rank_examples(
+        items, per_session_cap=2, random_quota=0.0, holdout_session_ids=()
+    )
     sessions = [r["session_id"] for r in ranked]
     assert sessions.count("a") <= 2
     assert ranked[0]["tta_disagreement"] == 0.9
@@ -152,7 +155,9 @@ def test_ranking_random_quota_filled_from_remainder():
         _item("a", 0.6),
         _item("a", 0.5),
     ]
-    ranked = rank_examples(items, per_session_cap=4, random_quota=0.25, seed=3)
+    ranked = rank_examples(
+        items, per_session_cap=4, random_quota=0.25, seed=3, holdout_session_ids=()
+    )
     quota = [r for r in ranked if "random_quota" in r["reasons"]]
     assert len(ranked) == 4
     assert len(quota) == 1
@@ -163,7 +168,9 @@ def test_ranking_random_quota_filled_without_overflow():
     # Coleta pequena: nenhuma sessao estoura o teto, nao ha overflow,
     # e mesmo assim a cota aleatoria tem de ser cumprida (issue #20).
     items = [_item("a", 0.9), _item("a", 0.8), _item("b", 0.7), _item("b", 0.6)]
-    ranked = rank_examples(items, per_session_cap=2, random_quota=0.5, seed=1)
+    ranked = rank_examples(
+        items, per_session_cap=2, random_quota=0.5, seed=1, holdout_session_ids=()
+    )
     quota = [r for r in ranked if "random_quota" in r["reasons"]]
     assert len(ranked) == 4
     assert len(quota) == 2
@@ -180,7 +187,9 @@ def test_ranking_random_quota_unmet_is_recorded():
     # Cota maior que a populacao candidata: o nao atendido fica
     # registrado explicitamente em vez de sumir em silencio.
     items = [_item("a", 0.9), _item("b", 0.8)]
-    ranked = rank_examples(items, per_session_cap=3, random_quota=1.5, seed=0)
+    ranked = rank_examples(
+        items, per_session_cap=3, random_quota=1.5, seed=0, holdout_session_ids=()
+    )
     quota = [r for r in ranked if "random_quota" in r["reasons"]]
     assert ranked.random_quota_requested == 3
     assert len(quota) == 2

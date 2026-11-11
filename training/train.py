@@ -332,7 +332,7 @@ def load_init_checkpoint(model, path, only_prefixes=None):
     """
     import torch
 
-    raw = torch.load(path, map_location="cpu")
+    raw = torch.load(path, map_location="cpu", weights_only=True)
     if isinstance(raw, dict):
         for key in ("model", "state_dict", "model_state_dict"):
             if isinstance(raw.get(key), dict):
@@ -3395,7 +3395,9 @@ def main(argv=None):
     if channels_last:
         disable_channels_last(torch, base_model, channels_last_hook)
     base_model.load_state_dict(
-        torch.load(out_dir / "checkpoints" / "best.pt", map_location=device)
+        torch.load(
+            out_dir / "checkpoints" / "best.pt", map_location=device, weights_only=True
+        )
     )
     onnx_path = out_dir / cfg["export"]["onnx"]
     try:

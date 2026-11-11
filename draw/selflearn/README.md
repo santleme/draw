@@ -62,7 +62,16 @@ right gates.
   sha256 of the files and of the models, keys with relative time and
   pass telemetry. Local only
   (`captures/sessions/<session_id>/`, outside git); another
-  person's desk requires consent.
+  person's desk requires consent. Whatever the `--save-dir`, the
+  save directory and each session folder get a `.gitignore` with
+  `*`, so raw frames never enter git (`draw/safe_io.py`).
+- Enforcement in code, not only here: `collect.py` refuses rows
+  without `session_id`/`origin`; `select.rank_examples` requires an
+  explicit `holdout_session_ids` and runs `guard_selection_pool`;
+  `tools/selflearn/train_round.py --split-ledger captures/pool/split.json`
+  refuses holdout pages from unsealed sessions and keeps every sealed
+  session out of training. Consent and human promotion remain
+  procedural.
 - `split.py` (U2) train x holdout split **by session**,
   deterministic by hash, stratified so that the holdout includes
   easy sessions and sessions with blank pages. Guards that raise
