@@ -1366,7 +1366,15 @@ class _CompileFallbackLog(logging.Handler):
         self.messages = []
 
     def emit(self, record):
-        self.messages.append(record.getMessage().splitlines()[0][:300])
+        lines = record.getMessage().splitlines() or [""]
+        errors = [
+            line
+            for line in lines[1:]
+            if line
+            and not line[0].isspace()
+            and not line.startswith(("due to", "Traceback", "Set TORCHDYNAMO"))
+        ]
+        self.messages.append(" | ".join([lines[0].strip(), *errors])[:500])
 
 
 _COMPILE_FALLBACK_LOG = _CompileFallbackLog()

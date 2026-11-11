@@ -85,7 +85,7 @@ def test_apply_compile_falha_no_primeiro_passo_cai_para_eager(monkeypatch):
         out.sum().backward()
         status, reason = T.compile_runtime_status(status)
         assert status == "eager_fallback_runtime"
-        assert "backend quebrado" in reason or "CONVERT" in reason, reason
+        assert "CONVERT" in reason and "backend quebrado" in reason, reason
         assert torch.allclose(out.detach(), eager, atol=1e-6)
         assert all(torch.isfinite(p.grad).all() for p in net.parameters())
     finally:
