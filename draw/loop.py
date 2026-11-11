@@ -492,74 +492,84 @@ class SheetInkLoop:
                         self.legacy_generation, self.accumulated_canvas
                     )
 
-        if self.ink_worker is not None:
-            # Colhe a tinta assincrona pelo canal de
-            # exibicao: a confirmada vira o canvas
-            # (clean_mask, o que snapshot e consumidores
-            # leem) e a provisoria entra so no painel, em
-            # cinza. Sem versao nova, o painel exibido e o
-            # mesmo de antes, sem custo de modelo neste laco.
-            got = self.ink_worker.poll_display(
-                self.clean_generation, self.clean_display_version
+        return self.collect_ink()
+
+    def collect_ink(self):
+        """Colhe a tinta assincrona: painel, virada, divisao e erro.
+
+        E o fim de step(); quem dirige a trabalhadora em pump() logo
+        depois de step() chama de novo para o consumidor ver a passada
+        no mesmo quadro. Devolve None ou INK_WORKER_FAILED.
+        """
+        if self.ink_worker is None:
+            return None
+        # Colhe a tinta assincrona pelo canal de
+        # exibicao: a confirmada vira o canvas
+        # (clean_mask, o que snapshot e consumidores
+        # leem) e a provisoria entra so no painel, em
+        # cinza. Sem versao nova, o painel exibido e o
+        # mesmo de antes, sem custo de modelo neste laco.
+        got = self.ink_worker.poll_display(
+            self.clean_generation, self.clean_display_version
+        )
+        if got is not None:
+            (
+                self.clean_display_version,
+                self.clean_mask,
+                self.clean_provisional_mask,
+            ) = got
+            self.accumulated_canvas = self._render_display(
+                self.clean_mask,
+                self.clean_provisional_mask,
+                out=self.canvas_buffer,
             )
-            if got is not None:
-                (
-                    self.clean_display_version,
-                    self.clean_mask,
-                    self.clean_provisional_mask,
-                ) = got
-                self.accumulated_canvas = self._render_display(
-                    self.clean_mask,
-                    self.clean_provisional_mask,
-                    out=self.canvas_buffer,
+            if self.session_recorder is not None:
+                self.session_recorder.note_canvas(
+                    self.clean_generation, self.accumulated_canvas
                 )
-                if self.session_recorder is not None:
-                    self.session_recorder.note_canvas(
-                        self.clean_generation, self.accumulated_canvas
-                    )
-            # Virada de pagina (U3): a trabalhadora detectou
-            # conteudo descorrelacionado do canvas por 2
-            # passadas. A pagina anterior vira snapshot em
-            # disco (nao se perde) e a geracao nova comeca em
-            # branco, com passada imediata (U4 via
-            # new_generation).
-            turn_canvas = self.ink_worker.take_turn_event(self.clean_generation)
-            if turn_canvas is not None:
-                self.generation_events["turn"] += 1
-                if self.clean_mask is not None:
-                    self._save_page_snapshot("canvas_turn", turn_canvas)
-                self.clean_generation = self.ink_worker.new_generation()
-                self.clean_display_version = 0
-                self.clean_provisional_mask = None
-                self.clean_mask = None
-                self.accumulated_canvas = None
-            # Divisao por identidade (frente 28): o juiz,
-            # armado no meio da geracao pela vigia (salto de
-            # pose ou ruptura de conteudo), decidiu pagina
-            # nova com a folha presente o tempo todo. A
-            # pagina anterior sai como snapshot (nao se
-            # perde) e a geracao nova comeca, como na
-            # virada U3 — sem isto, virar a pagina somava
-            # as duas no mesmo canvas.
-            identity_split = self.ink_worker.take_identity_split(self.clean_generation)
-            if identity_split is not None:
-                self.generation_events["split"] += 1
-                split_canvas, _split_reason = identity_split
-                if self.clean_mask is not None:
-                    self._save_page_snapshot("canvas_page", split_canvas)
-                self.clean_generation = self.ink_worker.new_generation()
-                self.clean_display_version = 0
-                self.clean_provisional_mask = None
-                self.clean_mask = None
-                self.accumulated_canvas = None
-            # Trabalhadora morta por excecao: sem isto o canvas
-            # congelava no ultimo quadro e nem o console nem a
-            # janela diziam nada (o erro morria na thread).
-            worker_error = self.ink_worker.error
-            if worker_error is not None:
-                self._log(
-                    "A tinta pagina->limpa falhou e a thread "
-                    f"parou: {worker_error}. O canvas nao avanca."
-                )
-                return INK_WORKER_FAILED
+        # Virada de pagina (U3): a trabalhadora detectou
+        # conteudo descorrelacionado do canvas por 2
+        # passadas. A pagina anterior vira snapshot em
+        # disco (nao se perde) e a geracao nova comeca em
+        # branco, com passada imediata (U4 via
+        # new_generation).
+        turn_canvas = self.ink_worker.take_turn_event(self.clean_generation)
+        if turn_canvas is not None:
+            self.generation_events["turn"] += 1
+            if self.clean_mask is not None:
+                self._save_page_snapshot("canvas_turn", turn_canvas)
+            self.clean_generation = self.ink_worker.new_generation()
+            self.clean_display_version = 0
+            self.clean_provisional_mask = None
+            self.clean_mask = None
+            self.accumulated_canvas = None
+        # Divisao por identidade (frente 28): o juiz,
+        # armado no meio da geracao pela vigia (salto de
+        # pose ou ruptura de conteudo), decidiu pagina
+        # nova com a folha presente o tempo todo. A
+        # pagina anterior sai como snapshot (nao se
+        # perde) e a geracao nova comeca, como na
+        # virada U3 — sem isto, virar a pagina somava
+        # as duas no mesmo canvas.
+        identity_split = self.ink_worker.take_identity_split(self.clean_generation)
+        if identity_split is not None:
+            self.generation_events["split"] += 1
+            split_canvas, _split_reason = identity_split
+            if self.clean_mask is not None:
+                self._save_page_snapshot("canvas_page", split_canvas)
+            self.clean_generation = self.ink_worker.new_generation()
+            self.clean_display_version = 0
+            self.clean_provisional_mask = None
+            self.clean_mask = None
+            self.accumulated_canvas = None
+        # Trabalhadora morta por excecao: sem isto o canvas
+        # congelava no ultimo quadro e nem o console nem a
+        # janela diziam nada (o erro morria na thread).
+        worker_error = self.ink_worker.error
+        if worker_error is not None:
+            self._log(
+                "A tinta pagina->limpa falhou e a thread "
+                f"parou: {worker_error}. O canvas nao avanca."
+            )
+            return INK_WORKER_FAILED
         return None

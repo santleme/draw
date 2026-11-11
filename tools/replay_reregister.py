@@ -620,6 +620,11 @@ class ReplayApp:
         with _scoped_env(_ink._ENV_TURN_EVENT_VAR, "1" if self.turn_event_enabled else "0"):
             outcome = self.loop.step(frame, self.clock.now * 1000.0)
             ran = self.pump_ink()
+            if ran and outcome is None:
+                # O consumidor colhe a passada no mesmo quadro (o
+                # mesmo código do fim de step()): o canvas e a
+                # contagem de passadas do relatório andam juntos.
+                outcome = self.loop.collect_ink()
         if outcome is not None or self.worker.error is not None:
             raise RuntimeError("a trabalhadora de tinta falhou") from self.worker.error
         self.frame_index += 1
