@@ -2,7 +2,7 @@
 # para rodar o app.
 -r requirements.txt
 pytest>=8
-ruff>=0.6
+ruff==0.17.4
 # Gera os modelos ONNX minúsculos dos testes de contrato
 # (tests/onnx_fixtures.py). Sem ele, esses testes saem como skip;
 # o onnxruntime, que executa os modelos, vem de requirements.txt.
