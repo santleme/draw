@@ -8,10 +8,11 @@ de probabilidade do cache.
 
 - before: o comportamento da main 8b7ec90. União pura das
   máscaras por passada, publicada a cada passada. Nada sai.
-- after: o _LayeredInkAccumulator desta árvore. A exibição é
-  confirmada + provisória; o canvas dos consumidores é só a
-  confirmada; a provisória que não confirma é retratada e
-  contada.
+- after: a `_PageCleanWorker` desta árvore (passada real, sem
+  thread, relógio de cena) e o _LayeredInkAccumulator que ela
+  alimenta. A exibição é confirmada + provisória; o canvas dos
+  consumidores é só a confirmada; a provisória que não confirma é
+  retratada e contada.
 
 A unidade é a passada, não o segundo: segundos desta VM não
 dizem nada sobre a máquina de quem usa. Uso:
@@ -30,7 +31,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from draw.app import _LayeredInkAccumulator  # noqa: E402
+from tools import replay_reregister as rr  # noqa: E402
 
 HOME = Path.home()
 LAB = HOME / "workspace/draw-lab"
@@ -76,14 +77,39 @@ class UnionPipeline:
         }
 
 
+class _ProbIsWarp:
+    threshold = THRESHOLD
+
+    def ink_prob(self, warped):
+        return warped
+
+
+# Um passo de cena por passada: folga sobre qualquer cadencia.
+STEP_SECONDS = 10.0
+
+
 class LayeredPipeline:
-    """Esta arvore: exibicao em duas camadas, canvas confirmado."""
+    """Esta arvore: exibicao em duas camadas, canvas confirmado.
+
+    A passada e a da `_PageCleanWorker` real, no caminho sincrono
+    compartilhado com tools/replay_reregister.py (make_ink_worker +
+    pump() em relogio de cena), com uma geracao so e sem cantos: o
+    resultado e o do acumulador que a trabalhadora alimenta.
+    """
 
     def __init__(self):
-        self._acc = _LayeredInkAccumulator(threshold=THRESHOLD)
+        self._clock = rr.SceneClock()
+        self._worker = rr.make_ink_worker(_ProbIsWarp(), self._clock)
+        self._generation = self._worker.new_generation()
 
     def add(self, prob):
-        result = self._acc.add(prob)
+        self._clock.now += STEP_SECONDS
+        self._worker.submit(prob, self._generation)
+        if not self._worker.pump():
+            raise RuntimeError("a passada nao executou")
+        if self._worker.error is not None:
+            raise self._worker.error
+        result = self._worker._accumulator.last_result
         confirmed = result["confirmed"] > 0
         provisional = result["provisional"] > 0
         return {

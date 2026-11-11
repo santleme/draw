@@ -35,7 +35,6 @@ import argparse
 import os
 import sys
 import time
-from collections import deque
 from pathlib import Path
 
 import cv2
@@ -60,6 +59,12 @@ from . import paper as paper_module
 from . import session_report as session_report_module
 from . import telemetry as telemetry_module
 from .view import _blank_sheet, _compose_view, _dead_source_view, _error_view
+from .loop import (
+    INK_WORKER_FAILED,
+    SheetInkLoop,
+    _INK_CORNER_HISTORY as _INK_CORNER_HISTORY,
+    _acquisition_record as _acquisition_record,
+)
 
 from . import capture as capture_module
 from .sheet_track import (
@@ -141,15 +146,6 @@ from .ink_layers import (
     _PageCleanWorker as _PageCleanWorker,
     _render_layered_canvas as _render_layered_canvas,
 )
-
-
-# A tinta e lida numa geometria estabilizada: a mediana dos ultimos
-# conjuntos de cantos do rastreador. O jitter de canto entre deteccoes
-# (media de ~5 px, com saltos de dezenas de pixels quando a mao cobre
-# um canto) desloca o traco de 1 a 3 px no espaco do papel e desfaz o
-# voto por pixel do canvas acumulativo; a mediana de 5 segura a
-# geometria no lugar por tempo bastante para a janela do acumulador.
-_INK_CORNER_HISTORY = 5
 
 
 # Tempo que o aviso de fonte morta fica na janela antes da saida.
@@ -421,23 +417,6 @@ def _detect_sheet_combined_traced(frame, neural_detector):
     return _done(corners, verdict, "classic" if corners is not None else "none")
 
 
-def _acquisition_record(trace, frame_index, consumed, before, after, tracker_event):
-    """Evento por aquisicao: rastro do combinado + rastreador.
-
-    detected_frame_index (do rastro) e a passada cujo quadro o
-    detector examinou; frame_index e a passada em que o rastreador
-    consumiu o resultado (com deteccao atrasada, posterior).
-    """
-    return {
-        **trace,
-        "frame_index": frame_index,
-        "consumed_by_tracker": consumed,
-        "tracker_before": before,
-        "tracker_after": after,
-        "tracker_event": tracker_event,
-    }
-
-
 def _emit_acquisition(telemetry, session_recorder, record):
     telemetry.event("acquisition", **record)
     if session_recorder is not None:
@@ -602,9 +581,7 @@ def run(
         )
 
     clean_hand_presence = None
-    clean_hand_present = None
     hand_presence_worker = None
-    hand_presence_seq = 0
     if page_clean is not None and not markers_mode:
         clean_hand_presence = _make_hand_presence(hand_model)
         if clean_hand_presence is not None:
@@ -713,10 +690,6 @@ def run(
     # Sessao gravada e diagnosticavel: quadros crus esparsos e um
     # evento por aquisicao de folha (observabilidade, 2026-11-10).
     trace_acquisitions = session_recorder is not None
-    last_acq_seq = None
-    # Geracao do gravador no caminho legado (sem worker, a geracao
-    # e local: abre na folha nova e na tecla C).
-    legacy_generation = 0
     if markers_mode:
         print("Draw v0 rodando. Mostre a folha-modelo para a camera.")
     else:
@@ -729,17 +702,6 @@ def run(
     frames_path = save_path / "frames"
     frames_saved = 0
     auto_capture = False
-    restart_reference = False
-    baseline_armed = False
-    # Geometria da tinta CONGELADA na tecla C: os warps da sessao
-    # usam estes cantos, nao os do rastreador ao vivo. Medido nos
-    # frames reais de 2026-10-30: sobre o caderno aberto, o ajuste
-    # do detector oscila ate 314 px entre frames de uma cena
-    # parada; com a geometria viva, o warp teleporta e nenhuma
-    # referencia sobrevive. O rastreador segue vivo para o
-    # contorno verde e os banners; a tinta vive na geometria do C.
-    session_corners = None
-    freeze_pending = False
     loop_frames = 0
     tel_window_start = time.monotonic()
     tel_window_frames = 0
@@ -759,13 +721,13 @@ def run(
         png_writer.save(out, img, _saved)
 
     def handle_capture_key(key, img):
-        nonlocal auto_capture, restart_reference
+        nonlocal auto_capture
         if session_recorder is not None:
             session_recorder.note_key(key)
         if key == ord("f"):
             save_raw_frame(img)
         elif key == ord("c") and session_ink is not None:
-            restart_reference = True
+            loop.restart_reference = True
             print(
                 "Pagina base pedida: capturando os proximos quadros "
                 "retificados. Maos fora da folha."
@@ -780,45 +742,45 @@ def run(
             else:
                 print("Captura automatica desligada.")
 
-    tracker = _SheetTracker()
-    ink_accumulator = ink_module.InkAccumulator()
-    corner_history = deque(maxlen=_INK_CORNER_HISTORY)
-    ink_session_open = False
-    accumulated_canvas = None
-    # Canvas do caminho novo: a mascara acumulada e a uniao simples
-    # das mascaras do modelo pagina->limpa, sem acumulador temporal.
-    # None enquanto nenhuma folha foi lida nesta sessao.
-    clean_mask = None
-    # Geracao da tinta assincrona: acompanha a geracao da
-    # trabalhadora; folha nova sobe a geracao. Ao cair do tracker,
-    # a identidade fica pendente ate a folha voltar e o conteudo
-    # decidir se e re-registro ou pagina nova. (A versao aplicada do poll()
-    # saiu na orquestracao em camadas: o laco le o canvas pelo
-    # poll_display(), e a clean_applied_version ficou morta.)
-    clean_generation = 0
-    clean_display_version = 0
-    clean_provisional_mask = None
-    clean_recovery_pending = False
-    # Vigia de identidade (frente 28): seq do ultimo salto grande
-    # de pose ja sinalizado a trabalhadora.
-    last_big_jump_seq = 0
-    # Buffers donos dos canvas renderizados no laco. O acumulado
-    # mora em canvas_buffer de um frame de deteccao ao outro, e
-    # view_canvas_buffer serve aos canvas transitorios de exibicao.
-    # Sao buffers separados porque o acumulado e retido entre
-    # frames: nenhum outro uso pode escrever nele.
-    canvas_buffer = np.empty(
+    format_suggester = paper_module.FormatSuggester()
+
+    def save_page_snapshot(prefix, mask):
+        save_path.mkdir(parents=True, exist_ok=True)
+        snapshot_path = save_path / f"{prefix}_{int(time.time())}.png"
+        png_writer.save(
+            snapshot_path,
+            ink_module.render_canvas(mask),
+            lambda path: print(f"Pagina anterior salva em {path}"),
+        )
+
+    loop = SheetInkLoop(
+        detection_worker=detection_worker,
+        ink_worker=ink_worker,
+        hand_presence_worker=hand_presence_worker,
+        hand_masker=hand_masker,
+        session_ink=session_ink,
+        ink_source=ink_source,
+        session_recorder=session_recorder,
+        trace_acquisitions=trace_acquisitions,
+        format_suggester=format_suggester,
+        on_format_suggestion=lambda suggestion: _report_format_suggestion(
+            telemetry, suggestion
+        ),
+        on_acquisition=lambda record: _emit_acquisition(
+            telemetry, session_recorder, record
+        ),
+        save_page_snapshot=save_page_snapshot,
+    )
+    tracker = loop.tracker
+    # Buffer dos canvas transitorios de exibicao (o acumulado mora
+    # no buffer do laco: nenhum outro uso pode escrever nele).
+    view_canvas_buffer = np.empty(
         (ink_module.config.PAPER_H, ink_module.config.PAPER_W, 3),
         dtype=np.uint8,
     )
-    view_canvas_buffer = np.empty_like(canvas_buffer)
-    frame_number = 0
     last_seq = 0
-    last_det_seq = 0
     last_view = None
-    display_corners = None
-    display_gray = None
-    format_suggester = paper_module.FormatSuggester()
+
     try:
         while True:
             item = frame_source.wait_next(last_seq)
@@ -881,401 +843,29 @@ def run(
                         _report_format_suggestion(telemetry, suggestion)
             else:
                 markers = {}
-                det_result = detection_worker.poll(last_det_seq)
-                if det_result is not None:
-                    (
-                        last_det_seq,
-                        detected_corners,
-                        detected_verdict,
-                        det_captured_at,
-                        tel_detect_ms,
-                    ) = det_result
-                    ran_detection = True
-                else:
-                    detected_corners, detected_verdict = None, None
-                    det_captured_at = None
-                    ran_detection = False
-                if tracker.should_detect(frame_number):
-                    detection_worker.submit(
-                        frame, frame_capture_ms / 1000.0, frame_number
-                    )
-                if detection_worker.error is not None:
-                    raise detection_worker.error
-                tracker_before = (
-                    tracker.diagnostic_state()
-                    if trace_acquisitions and ran_detection
-                    else None
-                )
-                tracker_event = tracker.update(
-                    detected_corners,
-                    detected_verdict,
-                    ran_detection,
-                    det_captured_at if ran_detection else time.monotonic(),
-                )
-                if trace_acquisitions:
-                    if ran_detection:
-                        tracker_after = tracker.diagnostic_state()
-                        for trace in detection_worker.take_traces(last_det_seq):
-                            consumed = trace["result_seq"] == last_det_seq
-                            if consumed:
-                                last_acq_seq = trace["acq_seq"]
-                            _emit_acquisition(
-                                telemetry,
-                                session_recorder,
-                                _acquisition_record(
-                                    trace,
-                                    frame_number,
-                                    consumed,
-                                    tracker_before if consumed else None,
-                                    tracker_after if consumed else None,
-                                    tracker_event if consumed else None,
-                                ),
-                            )
-                    session_recorder.note_raw_frame(
-                        frame,
-                        frame_number,
-                        "sheet"
-                        if tracker.corners is not None
-                        else "candidate"
-                        if tracker.has_pending
-                        else "no_sheet",
-                        capture_ms=frame_capture_ms,
-                        acq_seq=last_acq_seq,
-                        ink_passes_total=tel_fields.get("passes_total"),
-                    )
-                if tracker_event == "drop":
-                    ink_session_open = False
-                    session_corners = None
-                    freeze_pending = False
-                    clean_mask = None
-                    if ink_worker is not None:
-                        # A queda do tracker nao prova que a pagina
-                        # mudou. Guarda a geracao ate a folha voltar;
-                        # a primeira mascara decide pela tinta se e
-                        # re-registro ou pagina nova.
-                        clean_recovery_pending = True
-                if tracker.big_jump_seq != last_big_jump_seq:
-                    last_big_jump_seq = tracker.big_jump_seq
-                    if (
-                        ink_worker is not None
-                        and ink_session_open
-                        and os.environ.get("DRAW_IDENTITY_WATCH", "").strip() == "1"
-                        and (tracker.last_big_jump or {}).get("episode_discontinuous")
-                    ):
-                        # Salto grande de pose com a folha presente
-                        # E episodio descontínuo (frentes 28/32): so
-                        # ai o juiz de identidade e armado no meio
-                        # da geracao. Reposicionamento continuo da
-                        # mesma folha (candidato fixo, papel o tempo
-                        # todo, sem perda) NAO arma: neste material
-                        # (spread enrolado), o conteudo deformado e
-                        # indistinguivel de pagina nova pro juiz, e
-                        # partir um desenho por reposicionamento e o
-                        # erro mais caro. A troca em repouso segue
-                        # com a vigia de conteudo.
-                        ink_worker.arm_identity_check("pose_jump")
-
-                frame_number += 1
-                # Presenca e o estado do rastreador: warp_sheet com
-                # cantos nunca devolve None, entao o warp por quadro
-                # era so um teste de presenca caro, e o resultado era
-                # descartado. O unico consumo dos pixels fora do bloco
-                # de tinta e o fallback de exibicao, que retifica sob
-                # demanda.
-                sheet_present = tracker.corners is not None
-                tel_sheet_present = sheet_present
                 warped = None
-                if ran_detection and sheet_present and detected_corners is not None:
-                    suggestion = format_suggester.observe(detected_corners, frame.shape)
-                    if suggestion is not None:
-                        _report_format_suggestion(telemetry, suggestion)
-
-                # Presenca de mao assincrona (T4): colhe o
-                # resultado mais novo da trabalhadora (o estado
-                # clean_hand_present que o congelamento de
-                # geometria le abaixo) e alimenta a porta da
-                # tinta. O atraso e de ate um ciclo de amostragem
-                # frente ao desenho sincrono antigo — irrelevante
-                # na cadencia de 250 ms da tinta e na janela de
-                # quietude de 1 s da mao.
-                if hand_presence_worker is not None:
-                    if hand_presence_worker.error is not None:
-                        # Presenca morta degrada para "sem sinal":
-                        # a cadencia trata None como ativo e o app
-                        # segue como antes da porta existir.
-                        print(
-                            "Aviso: a presenca de mao falhou e foi "
-                            "desligada: "
-                            f"{hand_presence_worker.error}. A tinta "
-                            "segue na cadencia normal."
-                        )
-                        hand_presence_worker = None
-                        clean_hand_present = None
-                        if ink_worker is not None:
-                            ink_worker.set_hand_presence(None)
-                    hp_result = (
-                        hand_presence_worker.poll(hand_presence_seq)
-                        if hand_presence_worker is not None
-                        else None
+                loop_outcome = loop.step(
+                    frame,
+                    frame_capture_ms,
+                    ink_passes_total=tel_fields.get("passes_total"),
+                )
+                tel_detect_ms = loop.detect_ms
+                sheet_present = loop.sheet_present
+                tel_sheet_present = sheet_present
+                if loop_outcome == INK_WORKER_FAILED:
+                    cv2.imshow(
+                        "Draw",
+                        _error_view(
+                            last_view,
+                            "A tinta pagina->limpa falhou",
+                            [
+                                "O canvas parou de atualizar.",
+                                "Veja a mensagem no terminal e reinicie o app.",
+                            ],
+                        ),
                     )
-                    if hp_result is not None:
-                        (
-                            hand_presence_seq,
-                            clean_hand_present,
-                            clean_hand_moved,
-                        ) = hp_result
-                        if ink_worker is not None:
-                            ink_worker.set_hand_presence(
-                                clean_hand_present,
-                                moved=clean_hand_moved,
-                            )
-                # Quad de EXIBICAO (T9): em quadro com resultado de
-                # deteccao, o exibido e o confirmado; nos demais,
-                # propaga por LK sobre o cinza anterior. Falha de
-                # propagacao volta ao confirmado. So exibicao: a
-                # tinta nunca le este quad.
-                if tracker.corners is None:
-                    display_corners = None
-                    display_gray = None
-                else:
-                    gray_now = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                    if ran_detection or display_corners is None or display_gray is None:
-                        display_corners = tracker.corners.copy()
-                    else:
-                        tracked_display = _lk_track_corners(
-                            display_gray, gray_now, display_corners
-                        )
-                        display_corners = (
-                            tracked_display
-                            if tracked_display is not None
-                            else tracker.corners.copy()
-                        )
-                    display_gray = gray_now
-                if ran_detection and tracker.corners is not None:
-                    if hand_presence_worker is not None:
-                        # Submete com o carimbo de captura: e ele
-                        # que alimenta o modo VIDEO do landmarker.
-                        hand_presence_worker.submit(frame, frame_capture_ms)
-                    if not ink_session_open:
-                        # Folha nova na cena: canvas e geometria recomecam.
-                        ink_accumulator.reset()
-                        clean_mask = None
-                        # accumulated_canvas tambem zera: sem isto, o
-                        # painel continuava exibindo o canvas da folha
-                        # ANTERIOR ate a trabalhadora publicar a
-                        # primeira mascara da geracao nova (ate ~250 ms
-                        # de cadencia mais a passada do modelo), e a
-                        # tecla s salvava esse canvas errado. Medido no
-                        # harness headless: 22 quadros com a tinta velha
-                        # depois de a folha voltar.
-                        accumulated_canvas = None
-                        if ink_worker is not None:
-                            clean_generation = ink_worker.new_generation(
-                                preserve_identity=clean_recovery_pending
-                            )
-                            clean_recovery_pending = False
-                            clean_display_version = 0
-                            clean_provisional_mask = None
-                        if session_ink is not None:
-                            session_ink.reset()
-                            baseline_armed = False
-                            session_corners = None
-                            freeze_pending = False
-                        corner_history.clear()
-                        ink_session_open = True
-                        if session_recorder is not None and page_clean is None:
-                            legacy_generation += 1
-                            session_recorder.start_generation(legacy_generation)
-                    if restart_reference:
-                        # Tecla C: novo ponto zero da sessao. O canvas
-                        # acumulado zera junto, porque a pagina base nova
-                        # redefine o que conta como traco desta sessao.
-                        # A geometria congela nos cantos deste momento.
-                        restart_reference = False
-                        ink_accumulator.reset()
-                        session_ink.reset()
-                        baseline_armed = True
-                        freeze_pending = True
-                        if session_recorder is not None:
-                            # Tecla C: a geracao do gravador recomeca
-                            # aqui; a referencia dela e o warp deste
-                            # momento (a pagina base do legado).
-                            legacy_generation += 1
-                            session_recorder.start_generation(legacy_generation)
-                    # Sem mao, a geometria da tinta congela na
-                    # ultima mediana: a pagina esta assentada e a
-                    # mediana viva seguiria andando com o balanco
-                    # do detector, deslocando a tinta ja publicada.
-                    if clean_hand_present is not False or (not corner_history):
-                        corner_history.append(tracker.corners.copy())
-                    ink_corners = np.median(np.stack(corner_history), axis=0).astype(
-                        np.float32
-                    )
-                    if freeze_pending:
-                        session_corners = ink_corners.copy()
-                        freeze_pending = False
-                    warp_corners = (
-                        session_corners
-                        if session_ink is not None and session_corners is not None
-                        else ink_corners
-                    )
-                    ink_warped = paper_module.warp_sheet(frame, warp_corners)
-                    # Visibilidade na grade da pagina: onde a mao
-                    # esta, a passada nao ve a folha — nenhum dos
-                    # dois caminhos pode votar com evidencia
-                    # fabricada sob oclusao. O mesmo mapa serve a
-                    # trabalhadora neural e ao caminho classico.
-                    visible = None
-                    if hand_masker is not None:
-                        camera_mask = hand_masker.mask(frame)
-                        if camera_mask is not None:
-                            hand_warped = paper_module.warp_sheet(
-                                camera_mask, warp_corners
-                            )
-                            visible = hand_warped == 0
-                    if page_clean is not None:
-                        # Caminho novo: o warp vai para a trabalhadora
-                        # de tinta e o laco segue sem esperar o modelo.
-                        # Sem referencia e sem pagina base: as camadas
-                        # moram na trabalhadora e entram no painel
-                        # pelo poll_display() logo abaixo, a provisoria
-                        # na primeira passada e a confirmada quando o
-                        # voto fecha. Os cantos vao junto: sao o quad
-                        # que retificou ESTE warp, e a trabalhadora
-                        # registra a evidencia de cada passada na
-                        # geometria ancora da geracao — sem isso, o
-                        # quad que anda entre passadas re-projeta a
-                        # tinta assentada e cada alinhamento confirma
-                        # a sua copia (a reimpressao da regua de
-                        # 2026-11-05 em draw/ink_layers.py).
-                        ink_worker.submit(
-                            ink_warped,
-                            clean_generation,
-                            warp_corners,
-                            visible,
-                        )
-                        if session_recorder is not None:
-                            session_recorder.note_warp(clean_generation, ink_warped)
-                    else:
-                        if session_ink is not None:
-                            if not session_ink.ready:
-                                if baseline_armed:
-                                    session_ink.add_sample(ink_warped, visible)
-                                observed = np.zeros(
-                                    ink_warped.shape[:2], dtype=np.uint8
-                                )
-                            else:
-                                observed = session_ink.observe(ink_warped, visible)
-                        else:
-                            observed = ink_source(ink_warped)
-                        accumulated_canvas = ink_module.render_canvas(
-                            ink_accumulator.update(
-                                observed, visible, t_capture_ms=frame_capture_ms
-                            ),
-                            out=canvas_buffer,
-                        )
-                        if session_recorder is not None:
-                            session_recorder.note_warp(legacy_generation, ink_warped)
-                            session_recorder.note_canvas(
-                                legacy_generation, accumulated_canvas
-                            )
-
-                if ink_worker is not None:
-                    # Colhe a tinta assincrona pelo canal de
-                    # exibicao: a confirmada vira o canvas
-                    # (clean_mask, o que snapshot e consumidores
-                    # leem) e a provisoria entra so no painel, em
-                    # cinza. Sem versao nova, o painel exibido e o
-                    # mesmo de antes, sem custo de modelo neste laco.
-                    got = ink_worker.poll_display(
-                        clean_generation, clean_display_version
-                    )
-                    if got is not None:
-                        (
-                            clean_display_version,
-                            clean_mask,
-                            clean_provisional_mask,
-                        ) = got
-                        accumulated_canvas = _render_layered_canvas(
-                            clean_mask,
-                            clean_provisional_mask,
-                            out=canvas_buffer,
-                        )
-                        if session_recorder is not None:
-                            session_recorder.note_canvas(
-                                clean_generation, accumulated_canvas
-                            )
-                    # Virada de pagina (U3): a trabalhadora detectou
-                    # conteudo descorrelacionado do canvas por 2
-                    # passadas. A pagina anterior vira snapshot em
-                    # disco (nao se perde) e a geracao nova comeca em
-                    # branco, com passada imediata (U4 via
-                    # new_generation).
-                    turn_canvas = ink_worker.take_turn_event(clean_generation)
-                    if turn_canvas is not None:
-                        if clean_mask is not None:
-                            save_path.mkdir(parents=True, exist_ok=True)
-                            turn_path = save_path / (
-                                f"canvas_turn_{int(time.time())}.png"
-                            )
-                            png_writer.save(
-                                turn_path,
-                                ink_module.render_canvas(turn_canvas),
-                                lambda path: print(f"Pagina anterior salva em {path}"),
-                            )
-                        clean_generation = ink_worker.new_generation()
-                        clean_display_version = 0
-                        clean_provisional_mask = None
-                        clean_mask = None
-                        accumulated_canvas = None
-                    # Divisao por identidade (frente 28): o juiz,
-                    # armado no meio da geracao pela vigia (salto de
-                    # pose ou ruptura de conteudo), decidiu pagina
-                    # nova com a folha presente o tempo todo. A
-                    # pagina anterior sai como snapshot (nao se
-                    # perde) e a geracao nova comeca, como na
-                    # virada U3 — sem isto, virar a pagina somava
-                    # as duas no mesmo canvas.
-                    identity_split = ink_worker.take_identity_split(clean_generation)
-                    if identity_split is not None:
-                        split_canvas, _split_reason = identity_split
-                        if clean_mask is not None:
-                            save_path.mkdir(parents=True, exist_ok=True)
-                            split_path = save_path / (
-                                f"canvas_page_{int(time.time())}.png"
-                            )
-                            png_writer.save(
-                                split_path,
-                                ink_module.render_canvas(split_canvas),
-                                lambda path: print(f"Pagina anterior salva em {path}"),
-                            )
-                        clean_generation = ink_worker.new_generation()
-                        clean_display_version = 0
-                        clean_provisional_mask = None
-                        clean_mask = None
-                        accumulated_canvas = None
-                    # Trabalhadora morta por excecao: sem isto o canvas
-                    # congelava no ultimo quadro e nem o console nem a
-                    # janela diziam nada (o erro morria na thread).
-                    worker_error = ink_worker.error
-                    if worker_error is not None:
-                        print(
-                            "A tinta pagina->limpa falhou e a thread "
-                            f"parou: {worker_error}. O canvas nao avanca."
-                        )
-                        cv2.imshow(
-                            "Draw",
-                            _error_view(
-                                last_view,
-                                "A tinta pagina->limpa falhou",
-                                [
-                                    "O canvas parou de atualizar.",
-                                    "Veja a mensagem no terminal e reinicie o app.",
-                                ],
-                            ),
-                        )
-                        cv2.waitKey(_DEAD_NOTICE_MS)
-                        break
+                    cv2.waitKey(_DEAD_NOTICE_MS)
+                    break
 
             status = frame.copy()
             if markers_mode:
@@ -1283,7 +873,9 @@ def run(
                     cv2.circle(status, (int(x), int(y)), 8, (0, 255, 0), -1)
             elif tracker.corners is not None:
                 view_corners = (
-                    display_corners if display_corners is not None else tracker.corners
+                    loop.display_corners
+                    if loop.display_corners is not None
+                    else tracker.corners
                 )
                 outline = view_corners.astype(np.int32).reshape((-1, 1, 2))
                 cv2.polylines(status, [outline], True, (0, 255, 0), 2)
@@ -1304,8 +896,8 @@ def run(
                     2,
                 )
                 panel = (
-                    accumulated_canvas
-                    if accumulated_canvas is not None
+                    loop.accumulated_canvas
+                    if loop.accumulated_canvas is not None
                     else _blank_sheet()
                 )
                 last_view = _compose_view(
@@ -1321,7 +913,7 @@ def run(
                         status_text = "Folha detectada"
                         status_color = (0, 255, 0)
                     if session_ink is not None and not session_ink.ready:
-                        if baseline_armed:
+                        if loop.baseline_armed:
                             status_text = (
                                 "Folha detectada: capturando a pagina "
                                 "base, maos fora da folha"
@@ -1343,8 +935,8 @@ def run(
                 if markers_mode:
                     ink_mask = ink_module.extract_ink(warped, clear_markers=True)
                     canvas = ink_module.render_canvas(ink_mask, out=view_canvas_buffer)
-                elif accumulated_canvas is not None:
-                    canvas = accumulated_canvas
+                elif loop.accumulated_canvas is not None:
+                    canvas = loop.accumulated_canvas
                 elif page_clean is not None:
                     # Tinta assincrona: ate a trabalhadora publicar a
                     # primeira mascara desta folha, o painel e a folha
@@ -1355,8 +947,8 @@ def run(
                     ink_mask = ink_source(
                         paper_module.warp_sheet(
                             frame,
-                            display_corners
-                            if display_corners is not None
+                            loop.display_corners
+                            if loop.display_corners is not None
                             else tracker.corners,
                         )
                     )
@@ -1370,11 +962,11 @@ def run(
                 if key == ord("s"):
                     save_path.mkdir(parents=True, exist_ok=True)
                     out = save_path / f"canvas_{int(time.time())}.png"
-                    if ink_worker is not None and clean_mask is not None:
+                    if ink_worker is not None and loop.clean_mask is not None:
                         # O snapshot e um consumidor de canvas: ele
                         # salva a camada confirmada, nunca o painel
                         # com a tinta provisoria.
-                        save_image = ink_module.render_canvas(clean_mask)
+                        save_image = ink_module.render_canvas(loop.clean_mask)
                     else:
                         save_image = canvas
                     png_writer.save(
@@ -1410,8 +1002,8 @@ def run(
                         session_recorder,
                         _acquisition_record(trace, None, False, None, None, None),
                     )
-        if hand_presence_worker is not None:
-            hand_presence_worker.stop()
+        if loop.hand_presence_worker is not None:
+            loop.hand_presence_worker.stop()
         if ink_worker is not None:
             ink_worker.stop()
         if session_recorder is not None:

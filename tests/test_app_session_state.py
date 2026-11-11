@@ -323,3 +323,28 @@ def test_epilogue_runs_when_the_loop_raises(monkeypatch):
     assert finished
     assert errors and isinstance(errors[0], RuntimeError)
     assert capture.released, "o finally precisa liberar a captura"
+
+
+def test_run_drives_the_shared_loop_object(monkeypatch):
+    """run() passa todo quadro sem marcadores por draw.loop.SheetInkLoop.
+
+    É o mesmo objeto que tools/replay_reregister.py dirige com
+    dependências simuladas: se o laço de run() voltasse a ter lógica
+    própria de folha/geração/tinta, os replays deixariam de medi-lo.
+    """
+    from draw import loop as loop_module
+
+    steps = []
+    original = loop_module.SheetInkLoop.step
+
+    def counted(self, frame, frame_capture_ms, ink_passes_total=None):
+        steps.append(self.frame_number)
+        return original(self, frame, frame_capture_ms, ink_passes_total)
+
+    monkeypatch.setattr(loop_module.SheetInkLoop, "step", counted)
+    monkeypatch.setattr(ink_layers_module, "_PAGE_CLEAN_INTERVAL_SECONDS", 0.01)
+    plan = ["sheet"] * 12
+    _spy, _capture, errors, finished = _run_headless(plan, _fake_ink_class([0]))
+    assert finished and not errors
+    # Latest-wins na captura: nem todo quadro do plano chega ao laco.
+    assert steps and steps == list(range(len(steps)))

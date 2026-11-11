@@ -54,7 +54,6 @@ import importlib.util
 import json
 import os
 import sys
-import time
 from pathlib import Path
 
 import cv2
@@ -129,17 +128,6 @@ def _env(values):
                 os.environ[name] = value
 
 
-@contextlib.contextmanager
-def _fast():
-    saved = (ink._PAGE_CLEAN_INTERVAL_SECONDS, ink._IDLE_PROBE_SECONDS)
-    ink._PAGE_CLEAN_INTERVAL_SECONDS = 0.002
-    ink._IDLE_PROBE_SECONDS = 0.002
-    try:
-        yield
-    finally:
-        ink._PAGE_CLEAN_INTERVAL_SECONDS, ink._IDLE_PROBE_SECONDS = saved
-
-
 def positional_order(quad):
     """Cantos na ordem posicional da imagem (TL, TR, BR, BL)."""
     quad = np.asarray(quad, np.float32)
@@ -150,34 +138,43 @@ def positional_order(quad):
     )
 
 
+# Um passo de cena por passada: folga sobre qualquer cadencia da
+# trabalhadora (250 ms ativa, 1 s de sonda), sem relogio de parede.
+STEP_SECONDS = 10.0
+
+
 class Episode:
-    """Uma geracao da trabalhadora real, passada a passada."""
+    """Uma geracao da trabalhadora real, passada a passada.
+
+    A trabalhadora e a `_PageCleanWorker` de producao no caminho
+    sincrono compartilhado com tools/replay_reregister.py
+    (`make_ink_worker` + `pump()` em relogio de cena): sem thread,
+    sem espera por relogio de parede e sem encurtar a cadencia.
+    O protocolo deste estudo entrega o quad do detector direto a
+    trabalhadora (sem rastreador nem mediana do laco), como no
+    pre-registro.
+    """
 
     def __init__(self):
-        self.worker = ink._PageCleanWorker(_ProbIsWarp()).start()
+        self.clock = rr.SceneClock()
+        self.worker = rr.make_ink_worker(_ProbIsWarp(), self.clock)
         self.generation = self.worker.new_generation()
-        self.version = 0
-        self.stale_polls = 0
 
     def step(self, page, true_quad, detected):
         prob = rr.render_pass(page, true_quad, detected)
-        worker = self.worker
-        before = worker.stats()["passes_total"]
-        worker.submit(prob, self.generation, detected)
-        deadline = time.monotonic() + 10.0
-        while worker.stats()["passes_total"] <= before:
-            if time.monotonic() > deadline:
-                raise RuntimeError("a passada nao executou")
-            time.sleep(0.0005)
+        self.clock.now += STEP_SECONDS
+        self.worker.submit(prob, self.generation, detected)
+        if not self.worker.pump():
+            raise RuntimeError("a passada nao executou")
+        if self.worker.error is not None:
+            raise self.worker.error
 
     def canvas(self):
         got = self.worker.poll_display(self.generation, 0)
         return np.zeros(SHAPE, np.uint8) if got is None else got[1]
 
     def close(self):
-        snapshot = self.worker.telemetry_snapshot()
-        self.worker.stop()
-        return snapshot
+        return self.worker.telemetry_snapshot()
 
 
 def _near(mask, radius):
@@ -449,7 +446,7 @@ def run(series=None, threshold=None, passes=None, diagnostics=False):
     arms = dict(ARMS)
     if diagnostics:
         arms.update(DIAGNOSTIC_ARMS)
-    with _fast(), _migration_constants(threshold, passes):
+    with _migration_constants(threshold, passes):
         for arm, flags in arms.items():
             patch = (
                 _identity_migration()
