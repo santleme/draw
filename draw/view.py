@@ -153,11 +153,13 @@ def _draw_status_badge(status, text, status_color=None):
     )
 
 
-def _compose_view(camera_img, canvas_img):
+def _compose_view(camera_img, canvas_img, show_base=False):
     """Janela unica: camera e folha digital em viewports dedicados simetricos.
 
     Tamanho final fixo (1600x640), garantindo contraste, legibilidade,
     enquadramento simetrico da folha no mesmo padrao da camera e sem mutacao.
+    show_base liga o botao [C] Base do rodape: a tecla so tem efeito no
+    modo baseline (session_ink), entao fora dele o botao nao aparece.
     """
     target_w, target_h = 1600, 640
     header_h = 44
@@ -262,12 +264,10 @@ def _compose_view(camera_img, canvas_img):
     )
 
     # 3. Teclas de atalho no rodape (esquerda, abaixo da camera)
-    buttons = [
-        ("[S]", "Salvar"),
-        ("[C]", "Base"),
-        ("[F]", "Frame"),
-        ("[Q]", "Sair"),
-    ]
+    buttons = [("[S]", "Salvar")]
+    if show_base:
+        buttons.append(("[C]", "Base"))
+    buttons += [("[F]", "Frame"), ("[Q]", "Sair")]
     btn_h = 22
     btn_y = target_h - footer_h + (footer_h - btn_h) // 2
     btn_x = 12
@@ -346,10 +346,15 @@ def _compose_view(camera_img, canvas_img):
         cv2.LINE_AA,
     )
 
+    # Pilula CAMERA no canto superior direito da imagem: o canto esquerdo
+    # e onde o app desenha o texto de status ("Folha detectada", "Mostre
+    # uma folha...") sobre o quadro, e a pilula ali cobria o comeco dele.
+    pill_x = cam_x + inner_cam_w - 102
+    pill_y = cam_y + 12
     _draw_pill(
         studio,
-        cam_area_x + 12,
-        panel_y + 12,
+        pill_x,
+        pill_y,
         90,
         22,
         (20, 22, 21),
@@ -358,12 +363,12 @@ def _compose_view(camera_img, canvas_img):
         alpha=0.9,
     )
     cv2.circle(
-        studio, (cam_area_x + 22, panel_y + 23), 3, COLOR_ACCENT_YELLOW, -1, cv2.LINE_AA
+        studio, (pill_x + 10, pill_y + 11), 3, COLOR_ACCENT_YELLOW, -1, cv2.LINE_AA
     )
     cv2.putText(
         studio,
         "CAMERA",
-        (cam_area_x + 32, panel_y + 27),
+        (pill_x + 20, pill_y + 15),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.32,
         COLOR_TEXT_BRIGHT,

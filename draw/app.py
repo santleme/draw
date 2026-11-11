@@ -1315,7 +1315,9 @@ def run(
                     if accumulated_canvas is not None
                     else _blank_sheet()
                 )
-                last_view = _compose_view(status, panel)
+                last_view = _compose_view(
+                    status, panel, show_base=session_ink is not None
+                )
                 cv2.imshow("Draw", last_view)
             else:
                 if not markers_mode:
@@ -1366,7 +1368,9 @@ def run(
                         )
                     )
                     canvas = ink_module.render_canvas(ink_mask, out=view_canvas_buffer)
-                last_view = _compose_view(status, canvas)
+                last_view = _compose_view(
+                    status, canvas, show_base=session_ink is not None
+                )
                 cv2.imshow("Draw", last_view)
 
                 key = cv2.waitKey(1) & 0xFF
