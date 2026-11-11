@@ -233,6 +233,22 @@ never enter this repository.
 
 ## Repository layout
 
+This is **not a formal monorepo**: there is no workspace tooling, no
+per-package versioning and no `apps/` + `packages/` split. It is one
+product whose three systems share a single history and a single CI,
+each already isolated in its own folder with its own stack and build:
+
+| System | Where | Stack | Build / entry point |
+|---|---|---|---|
+| Desktop app (the product) | `draw/` + `main.py` | Python, OpenCV, ONNX | `python main.py` |
+| Website | `site/` | React, TypeScript, Vite | `npm run build` inside `site/` |
+| Training pipeline | `training/` | Python, PyTorch | `python training/run.py`; Kaggle/Colab launchers inside |
+
+Everything else in the tree supports one of those three. The CI
+(`.github/workflows/ci.yml`) already treats them as separate areas:
+path filters run the app suite, the training contracts and the site
+build only when their own area changes.
+
 - `draw/` — the application: `app.py` (main loop), `capture.py`
   (camera and asynchronous I/O), `sheet_track.py` (sheet tracking),
   `hand_presence.py` (presence worker), `ink_layers.py` (ink worker,
@@ -246,7 +262,8 @@ never enter this repository.
   binaries. Binaries themselves are Release assets, not git content.
 - `tools/` — operator tools: `fetch_models.py`, `eval_real_frames.py`,
   `label_frames.py`, `judge.py`, and the experiment runner in
-  `tools/runner/`.
+  `tools/runner/`. The full index, grouped by job, is
+  [tools/README.md](tools/README.md).
 - `training/` — versioned training bodies, configs and Kaggle/Colab
   launchers; `notebooks/` retains the earlier Kaggle detector notebook.
   [The training guide](docs/TREINO.md) covers dataset integrity, the
@@ -263,7 +280,18 @@ never enter this repository.
   are in `design.md` and `AGENTS.md`.
 - `docs/` — [docs/SETUP_WINDOWS.md](docs/SETUP_WINDOWS.md) and
   [docs/TREINO.md](docs/TREINO.md), the living documents besides
-  this README and [VISION.md](VISION.md).
+  this README and [VISION.md](VISION.md), plus dated records kept as
+  evidence. The index is [docs/README.md](docs/README.md).
+- `examples/` — sample vector-bridge outputs (SVG, DXF and the proof
+  JSON), kept as reference outputs of `tools/export_vectors.py`.
+
+Root documents, each with one job: [VISION.md](VISION.md) — the
+larger vision this capture layer serves;
+[SECURITY_MODEL.md](SECURITY_MODEL.md) — the trust zones for code
+that touches private captures; `design.md` — the website's design
+source of truth; `AGENTS.md` — repository guidance for automated
+contributors. `.replit` is the website's static deployment config:
+it builds `site/` and serves `site/dist`.
 
 ## Development
 
