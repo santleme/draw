@@ -72,7 +72,9 @@ de validação da mesma sessão.
   o motivo no log; se a compilação quebra no 1º passo (traçado ou backend),
   o dynamo cai para eager naquele trecho e loga o erro
   (`suppress_errors`). O recibo registra `efficiency.compile_status`
-  (`compiled`, `eager_fallback` ou `off`). O 1º bloco/época inclui o tempo
+  (`compiled`, `eager_fallback` na chamada, `eager_fallback_runtime` quando
+  o dynamo recusou algum trecho no treino — motivo em
+  `compile_fallback_reason` — ou `off`). O 1º bloco/época inclui o tempo
   de compilação: compare compile × eager pelo estado estacionário
   (`steps_steady_s_per_step` em `metrics.json` no modo steps; `epoch_s`
   das épocas seguintes no `history`), não pelo 1º passo.

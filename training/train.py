@@ -39,6 +39,7 @@ métricas possam ser testados sem GPU e sem torch instalado.
 
 import argparse
 import json
+import logging
 import math
 import os
 import sys
@@ -1357,6 +1358,31 @@ def resolve_compile(cli_value, tr, device):
     return bool(tr.get("compile", torch_device_is_accelerated(device)))
 
 
+class _CompileFallbackLog(logging.Handler):
+    """Guarda os avisos do dynamo de frame que caiu para eager."""
+
+    def __init__(self):
+        super().__init__(logging.WARNING)
+        self.messages = []
+
+    def emit(self, record):
+        self.messages.append(record.getMessage().splitlines()[0][:300])
+
+
+_COMPILE_FALLBACK_LOG = _CompileFallbackLog()
+
+
+def compile_runtime_status(status):
+    """``(status, motivo)`` depois de passos reais.
+
+    ``"compiled"`` vira ``"eager_fallback_runtime"`` quando o dynamo
+    recusou algum frame (``suppress_errors``) desde o ``apply_compile``.
+    """
+    if status == "compiled" and _COMPILE_FALLBACK_LOG.messages:
+        return "eager_fallback_runtime", _COMPILE_FALLBACK_LOG.messages[0]
+    return status, None
+
+
 def apply_compile(torch, model, device, backend=None):
     """``torch.compile(model)`` com fallback seguro para eager.
 
@@ -1384,6 +1410,10 @@ def apply_compile(torch, model, device, backend=None):
             file=sys.stderr,
         )
         return model, "eager_fallback"
+    _COMPILE_FALLBACK_LOG.messages.clear()
+    dynamo_log = logging.getLogger("torch._dynamo.convert_frame")
+    if _COMPILE_FALLBACK_LOG not in dynamo_log.handlers:
+        dynamo_log.addHandler(_COMPILE_FALLBACK_LOG)
     print(
         "torch.compile: LIGADO (modo default; erro de compilação no 1º passo "
         "cai para eager)"
@@ -2368,6 +2398,8 @@ def _smoke_compile_and_channels_last(torch):
         compiled, status = apply_compile(torch, net, "cpu", backend=_broken_backend)
         assert status == "compiled", status
         out = compiled(x)
+        status, reason = compile_runtime_status(status)
+        assert status == "eager_fallback_runtime" and reason, (status, reason)
         out.sum().backward()
         assert torch.isfinite(out).all(), "fallback tardio do compile não finito"
         assert torch.allclose(out.detach(), eager_out, atol=1e-6), (
@@ -3137,10 +3169,17 @@ def main(argv=None):
                     "pair_batches_epoch0": epoch_stats.get("pair_batches", 0),
                     "pairs_total": len(pair_loader.dataset),
                 }
+            compile_status, compile_fallback = compile_runtime_status(compile_status)
+            if compile_fallback:
+                print(
+                    f"AVISO: torch.compile caiu para eager no treino ({compile_fallback})",
+                    file=sys.stderr,
+                )
             receipt["efficiency"] = {
                 "cache_mode": cache_mode,
                 "compile": compile_enabled,
                 "compile_status": compile_status,
+                "compile_fallback_reason": compile_fallback,
                 "channels_last": channels_last,
                 "ema_decay": ema.decay if ema is not None else None,
             }
@@ -3261,10 +3300,19 @@ def main(argv=None):
                         "pair_batches_block0": block_stats.get("pair_batches", 0),
                         "pairs_total": len(pair_buffer),
                     }
+                compile_status, compile_fallback = compile_runtime_status(
+                    compile_status
+                )
+                if compile_fallback:
+                    print(
+                        f"AVISO: torch.compile caiu para eager no treino ({compile_fallback})",
+                        file=sys.stderr,
+                    )
                 receipt["efficiency"] = {
                     "cache_mode": "ram_buffer",
                     "compile": compile_enabled,
                     "compile_status": compile_status,
+                    "compile_fallback_reason": compile_fallback,
                     "channels_last": channels_last,
                     "ema_decay": ema.decay if ema is not None else None,
                 }
@@ -3356,6 +3404,7 @@ def main(argv=None):
     final_metrics["onnx_validation"] = onnx_check
     final_metrics["delivery_status"] = onnx_delivery_status(onnx_check)
     final_metrics["history"] = history
+    final_metrics["compile_status"] = compile_runtime_status(compile_status)[0]
     if steps_steady_s_per_step is not None:
         final_metrics["steps_steady_s_per_step"] = steps_steady_s_per_step
     final_metrics["train_pixel_counts"] = counts.tolist()

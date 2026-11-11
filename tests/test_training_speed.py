@@ -83,8 +83,22 @@ def test_apply_compile_falha_no_primeiro_passo_cai_para_eager(monkeypatch):
         assert status == "compiled"
         out = compiled(x)
         out.sum().backward()
+        status, reason = T.compile_runtime_status(status)
+        assert status == "eager_fallback_runtime"
+        assert "backend quebrado" in reason or "CONVERT" in reason, reason
         assert torch.allclose(out.detach(), eager, atol=1e-6)
         assert all(torch.isfinite(p.grad).all() for p in net.parameters())
+    finally:
+        torch._dynamo.reset()
+
+
+def test_compile_runtime_status_sem_falha_segue_compiled():
+    net = _net()
+    compiled, status = T.apply_compile(torch, net, "cpu", backend="eager")
+    try:
+        compiled(torch.randn(1, 3, 8, 8))
+        assert T.compile_runtime_status(status) == ("compiled", None)
+        assert T.compile_runtime_status("off") == ("off", None)
     finally:
         torch._dynamo.reset()
 

@@ -146,7 +146,9 @@ can preserve them.
   steady-state step time (`steps_steady_s_per_step` in steps mode, later
   epochs' `epoch_s` in epoch mode). Reuse a fixed shape to
   avoid recompilation. Eager stays one flag away, and compile failures fall
-  back to eager automatically (`efficiency.compile_status` in the receipt).
+  back to eager automatically (`efficiency.compile_status` is
+  `eager_fallback_runtime`, with `compile_fallback_reason`, when Dynamo
+  rejected a frame during training).
 - For cheap hypothesis checks, use steps mode (`--mode steps --max-steps 300
   --eval-interval-steps 50 --patience 2`) before paying for a full run; see
   `docs/TREINO.md`, "Reduzindo tempo por experimento".
