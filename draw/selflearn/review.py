@@ -86,19 +86,23 @@ def status(
     for row in holdout_pages(pool):
         sid, gen = row["session_id"], row["generation"]
         key = _key(sid, gen)
-        block = sessions.setdefault(sid, {"pages": 0, "reviewed": [], "pending": []})
+        block = sessions.setdefault(
+            sid, {"pages": 0, "reviewed": [], "pending": [], "missing_label": []}
+        )
         block["pages"] += 1
         if bool(reviews.get(key, False)):
             block["reviewed"].append(gen)
             if not (_gen_dir(pool, sid, gen) / REVIEWED_LABEL).is_file():
+                block["missing_label"].append(gen)
                 problems.append(
                     f"{key}: marcada em reviews.json sem {REVIEWED_LABEL} "
-                    "(revisao antiga ou manual); nao exporta ate remarcar"
+                    "(revisao antiga ou manual); nao completa a sessao nem "
+                    "exporta ate remarcar"
                 )
         else:
             block["pending"].append(gen)
     for block in sessions.values():
-        block["complete"] = not block["pending"]
+        block["complete"] = not block["pending"] and not block["missing_label"]
     complete = [sid for sid, b in sessions.items() if b["complete"]]
     reviewed_pages = sum(len(b["reviewed"]) for b in sessions.values())
     complete_pages = sum(sessions[sid]["pages"] for sid in complete)

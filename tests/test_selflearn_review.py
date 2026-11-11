@@ -104,6 +104,14 @@ def test_legacy_review_without_label_file_is_loud(tmp_path):
     report = review.status(pool)
     assert report["pages_reviewed"] == 1
     assert any(key in p for p in report["problems"])
+    sid = row["session_id"]
+    others = [r for r in review.holdout_pages(pool) if r["session_id"] == sid][1:]
+    for r in others:
+        review.mark_reviewed(pool, sid, r["generation"], accept_draft=True)
+    # todas marcadas, mas uma sem rotulo: a sessao nao completa
+    assert not review.status(pool)["sessions"][sid]["complete"]
+    review.mark_reviewed(pool, sid, row["generation"], accept_draft=True)
+    assert review.status(pool)["sessions"][sid]["complete"]
 
 
 def test_export_only_complete_sessions_and_loads_in_train_round_format(tmp_path):
