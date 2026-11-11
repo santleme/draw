@@ -58,6 +58,61 @@ VRAM; em TPU, cada adaptador mantém seu dimensionamento próprio.
   `training/train_torchtpu.py`, via `training/run_t7.py`, atende TorchTPU.
   Ambos reusam componentes de `training/train.py`.
 
+### Reduzindo tempo por experimento
+
+Objetivo: menos tempo de acelerador por hipótese validada. Nenhum destes
+ajustes vale por suposição — o veredito é o `receipt.json` e as métricas
+de validação da mesma sessão.
+
+- **`torch.compile` ligado por padrão em CUDA.** Sem `training.compile`
+  na config, o `train.py` compila o modelo de treino em CUDA e fica em
+  eager em CPU. Saída para eager: `--no-compile` ou `"compile": false`
+  (as configs t9–t15 fixam `false` de propósito e seguem assim). Fallback
+  seguro: se `torch.compile` falha na chamada, o treino segue em eager com
+  o motivo no log; se a compilação quebra no 1º passo (traçado ou backend),
+  o dynamo cai para eager naquele trecho e loga o erro
+  (`suppress_errors`). O recibo registra `efficiency.compile_status`
+  (`compiled`, `eager_fallback` ou `off`). O 1º bloco/época inclui o tempo
+  de compilação: compare compile × eager pelo estado estacionário
+  (`steps_steady_s_per_step` em `metrics.json` no modo steps; `epoch_s`
+  das épocas seguintes no `history`), não pelo 1º passo.
+- **`channels_last` opt-in.** `--channels-last` ou
+  `"channels_last": true` no bloco `training` põe os pesos 4D e cada lote
+  de entrada (treino, passos, validação, sonda de batch e régua de
+  flicker) em `channels_last`; antes do export ONNX o modelo volta ao
+  layout contíguo. O SegFormer é pesado em convolução, então o ganho com
+  BF16 é plausível, mas **deve ser medido, não assumido**: rode A/B na
+  mesma sessão (mesmo batch, mesma precisão) e só adote se o s/passo cair
+  sem perda em `val_mean_iou` por classe. O recibo grava
+  `efficiency.channels_last`.
+- **Modo steps para hipóteses baratas.** `--mode steps` troca as épocas
+  por `--max-steps` passos sobre buffers em RAM, avaliando a cada
+  `--eval-interval-steps` passos; `--patience N` para após N blocos sem
+  melhora de `val_mean_iou` (no modo épocas, N épocas). Todas as flags
+  também existem no `training/run.py` e gravam no
+  `training_config.json`. `training.profile_window_steps: [início, fim]`
+  liga o perfil por fase (`phase_profile_ms` no recibo: sample, augment,
+  forward, loss, backward, optim_ema, temporal). Exemplo de hipótese barata:
+
+  ```bash
+  python training/run.py --backend auto --config training/configs/base.json \
+    --data-dir dataset/synthetic --out-dir out/hipotese-a \
+    --mode steps --max-steps 300 --eval-interval-steps 50 --patience 2
+  ```
+
+  Um sinal que não aparece em 300 passos com avaliação a cada 50
+  dificilmente justifica uma corrida longa; a hipótese que sobrevive
+  sobe para `max_steps` cheio (padrão 1500) ou para o modo épocas.
+- **Batch pela VRAM.** `--batch-size auto` no `run.py` (padrão) ou
+  `--probe-batch` / `"batch_size": "auto"` no `train.py` mede o passo
+  real e escolhe o batch; em CPU é no-op.
+- **Leia o recibo da 1ª época/bloco antes de deixar a corrida seguir.**
+  `receipt.json` em `--out-dir` traz `s_per_step`, `samples_s`,
+  `projected_total_min`, pico/total de VRAM e utilização da GPU (pynvml).
+  Utilização baixa ou VRAM de pico muito abaixo do total indica
+  subutilização: suba o batch (sonda), confira o loader (`num_workers`,
+  `fast_loader`) e o `phase_profile_ms` antes de pagar a corrida inteira.
+
 ### Corpo 3 classes (tinta × impresso): migrado (2026-11-05)
 
 A corrida de 3 classes (fundo × impresso × tinta) **não** é uma
