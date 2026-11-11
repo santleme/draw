@@ -261,3 +261,22 @@ def test_check_models_fails_on_unregistered_file(tmp_path, monkeypatch, capsys):
     )
     assert app._check_models() is False
     assert "FAIL: intruso.onnx" in capsys.readouterr().out
+
+
+def test_check_models_fails_on_unregistered_file_without_manifest_entries(
+    tmp_path, monkeypatch, capsys
+):
+    from draw import app
+
+    monkeypatch.delenv("DRAW_MODEL_STRICT", raising=False)
+    extra = _model(tmp_path, "intruso.onnx", b"x")
+    monkeypatch.setattr(
+        app.manifest_module,
+        "load_manifest",
+        lambda path=None: (tmp_path / "MANIFEST.json", {}),
+    )
+    monkeypatch.setattr(
+        app.manifest_module, "unregistered_model_files", lambda *a, **k: [extra]
+    )
+    assert app._check_models() is False
+    assert "FAIL: intruso.onnx" in capsys.readouterr().out

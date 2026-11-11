@@ -301,12 +301,6 @@ def _check_models():
     e AVISO com DRAW_MODEL_STRICT=0.
     """
     manifest_path, models = manifest_module.load_manifest()
-    if not models:
-        print(
-            f"AVISO: {manifest_path} sem modelos registrados; "
-            "nenhum binario foi conferido."
-        )
-        return True
     ok = True
     strict = manifest_module.strict_enabled()
     for extra in manifest_module.unregistered_model_files():
@@ -316,6 +310,12 @@ def _check_models():
             "manifesto; a carga dele e recusada no modo estrito."
         )
         ok = ok and not strict
+    if not models:
+        print(
+            f"AVISO: {manifest_path} sem modelos registrados; "
+            "nenhum binario foi conferido."
+        )
+        return ok
     for name in sorted(models):
         path = Path(__file__).resolve().parent.parent / "models" / name
         if not path.exists():
