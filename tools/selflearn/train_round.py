@@ -48,10 +48,17 @@ from torch import nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from draw.safe_io import (  # noqa: E402
+    InputLimitError,
+    iter_jsonl,
+    read_image,
+    read_json,
+)
 from draw.selflearn import conformal, drift  # noqa: E402
 from draw.selflearn.gate import MIN_HOLDOUT_PAGES, MIN_HOLDOUT_SESSIONS  # noqa: E402
 from draw.selflearn.split import (  # noqa: E402
     HOLDOUT,
+    LeakageError,
     assert_no_leakage,
     guard_holdout_example,
     guard_pseudo_labeling,
@@ -312,13 +319,15 @@ def _manifest_rows(root):
             f"{root}: manifest.jsonl obrigatório para provar session_id/origem/split"
         )
     rows = {}
-    for line_number, line in enumerate(
-        path.read_text(encoding="utf-8").splitlines(), 1
-    ):
-        if not line.strip():
-            continue
-        row = json.loads(line)
-        name = Path(row.get("file", "")).stem
+    try:
+        numbered = list(iter_jsonl(path))
+    except InputLimitError as error:
+        raise ValueError(str(error)) from error
+    for line_number, row in numbered:
+        file_name = row.get("file", "")
+        if not isinstance(file_name, str):
+            raise ValueError(f"{path}:{line_number}: file precisa ser texto")
+        name = Path(file_name).stem
         if not name:
             raise ValueError(f"{path}:{line_number}: linha sem file")
         if name in rows:
@@ -336,15 +345,15 @@ def load_pages(root, with_mask, holdout=False, holdout_session_ids=()):
         row = rows.get(path.stem)
         if row is None:
             raise ValueError(f"{path}: arquivo ausente do manifest.jsonl")
-        img = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        img = read_image(path, cv2.IMREAD_COLOR)
         if img is None:
-            raise ValueError(f"imagem ilegível: {path}")
+            raise ValueError(f"imagem ilegível, malformada ou acima do limite: {path}")
         # Contrato do PageCleanInk: BGR / 255, sem conversão para RGB.
         img = img.astype(np.float32) / 255.0
         mask = None
         if with_mask:
             mpath = root / "mask" / path.name
-            raw = cv2.imread(str(mpath), cv2.IMREAD_GRAYSCALE)
+            raw = read_image(mpath, cv2.IMREAD_GRAYSCALE)
             if raw is None:
                 raise ValueError(f"máscara ausente/ilegível para {path}: {mpath}")
             if raw.shape != img.shape[:2]:
@@ -399,10 +408,9 @@ def ema_decay_at_step(step, base=EMA_DECAY, warmup=EMA_WARMUP_STEPS):
 
 
 def _load_student_checkpoint(student, checkpoint, device):
-    try:
-        payload = torch.load(checkpoint, map_location=device, weights_only=True)
-    except TypeError:
-        payload = torch.load(checkpoint, map_location=device)
+    # Só tensores: sem fallback para o unpickler completo, que
+    # executaria código de um checkpoint hostil.
+    payload = torch.load(checkpoint, map_location=device, weights_only=True)
     state = payload.get("student", payload) if isinstance(payload, dict) else payload
     student.load_state_dict(state)
     previous_holdout = (
@@ -913,12 +921,29 @@ def make_synthetic(root, n_labeled=24, n_unlabeled=16, n_holdout=8, size=64, see
     return root
 
 
+def sealed_holdout_ids(ledger_path):
+    """Sessões seladas como holdout no split.json do pool."""
+    try:
+        ledger = read_json(ledger_path)
+    except InputLimitError as error:
+        raise ValueError(str(error)) from error
+    assignments = ledger.get("assignments") if isinstance(ledger, dict) else None
+    if not isinstance(assignments, dict):
+        raise ValueError(f"{ledger_path}: ledger sem 'assignments'")
+    return {sid for sid, side in assignments.items() if side == HOLDOUT}
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--smoke", action="store_true")
     ap.add_argument("--labeled-dir")
     ap.add_argument("--unlabeled-dir")
     ap.add_argument("--holdout-dir")
+    ap.add_argument(
+        "--split-ledger",
+        help="split.json do pool (draw/selflearn/process.py): sessoes seladas "
+        "como holdout nunca entram no treino, e o holdout precisa ser selado",
+    )
     ap.add_argument("--init-checkpoint")
     ap.add_argument("--allow-random-init", action="store_true")
     ap.add_argument(
@@ -978,6 +1003,12 @@ def main(argv=None):
         ap.error("use --init-checkpoint ou autorize --allow-random-init explicitamente")
     holdout = load_pages(args.holdout_dir, with_mask=True, holdout=True)
     holdout_ids = [page.session_id for page in holdout]
+    if args.split_ledger:
+        sealed = sealed_holdout_ids(args.split_ledger)
+        unsealed = sorted(set(holdout_ids) - sealed)
+        if unsealed:
+            raise LeakageError(f"holdout com sessoes nao seladas no ledger: {unsealed}")
+        holdout_ids = sorted(set(holdout_ids) | sealed)
     labeled = load_pages(
         args.labeled_dir, with_mask=True, holdout_session_ids=holdout_ids
     )
