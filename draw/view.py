@@ -95,78 +95,71 @@ def _draw_pill(img, x, y, w, h, bg_color, border_color=None, radius=6, alpha=0.8
         )
 
 
-def _draw_sheet_reticle(status, corners, color=COLOR_ACCENT_YELLOW, bracket_len=24):
-    """Desenha cantoneiras em L e contorno na folha rastreada."""
-    if corners is None or len(corners) != 4:
-        return
-    poly = corners.astype(np.int32).reshape((-1, 1, 2))
-    cv2.polylines(status, [poly], True, color, 2, cv2.LINE_AA)
-
-    for i, pt in enumerate(corners):
-        x, y = int(pt[0]), int(pt[1])
-        p_prev = corners[(i - 1) % 4]
-        p_next = corners[(i + 1) % 4]
-
-        v1 = p_prev - pt
-        v2 = p_next - pt
-        n1 = v1 / (np.linalg.norm(v1) + 1e-6)
-        n2 = v2 / (np.linalg.norm(v2) + 1e-6)
-
-        arm1 = (pt + n1 * bracket_len).astype(int)
-        arm2 = (pt + n2 * bracket_len).astype(int)
-
-        cv2.line(status, (x, y), tuple(arm1), color, 2, cv2.LINE_AA)
-        cv2.line(status, (x, y), tuple(arm2), color, 2, cv2.LINE_AA)
-        cv2.circle(status, (x, y), 3, COLOR_TEXT_BRIGHT, -1, cv2.LINE_AA)
+_STUDIO_TEMPLATES = {}
 
 
-def _draw_status_badge(status, text, status_color=None):
-    """Desenha o badge de status da camera no canto inferior esquerdo."""
-    if not text:
-        return
-    badge_w = max(160, int(len(text) * 8.5 + 46))
-    badge_h = 26
-    by = status.shape[0] - badge_h - 16
-    bx = 16
-    dot_color = status_color if status_color is not None else COLOR_ACCENT_GREEN
-    _draw_pill(
-        status,
-        bx,
-        by,
-        badge_w,
-        badge_h,
-        (20, 22, 21),
-        COLOR_BORDER_CARD,
-        radius=13,
-        alpha=0.88,
-    )
-    cv2.circle(status, (bx + 14, by + 13), 4, dot_color, -1, cv2.LINE_AA)
-    cv2.putText(
-        status,
-        text,
-        (bx + 26, by + 17),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.38,
-        COLOR_TEXT_BRIGHT,
-        1,
-        cv2.LINE_AA,
-    )
+def _studio_template(cam_shape, canvas_shape, show_base):
+    """Cromagem estatica da janela e geometria dos dois viewports.
 
-
-def _compose_view(camera_img, canvas_img, show_base=False):
-    """Janela unica: camera e folha digital em viewports dedicados simetricos.
-
-    Tamanho final fixo (1600x640), garantindo contraste, legibilidade,
-    enquadramento simetrico da folha no mesmo padrao da camera e sem mutacao.
-    show_base liga o botao [C] Base do rodape: a tecla so tem efeito no
-    modo baseline (session_ink), entao fora dele o botao nao aparece.
+    Header, rodape, botoes e molduras nao mudam entre quadros: sao
+    desenhados uma vez por combinacao de (forma da camera, forma do
+    canvas, show_base) e copiados a cada quadro. Sem o cache, compor a
+    vista redesenhava textos e pilulas a cada quadro do laco.
     """
+    key = (cam_shape, canvas_shape, show_base)
+    cached = _STUDIO_TEMPLATES.get(key)
+    if cached is not None:
+        return cached
+
     target_w, target_h = 1600, 640
     header_h = 44
     footer_h = 36
     panel_h = target_h - header_h - footer_h - 8  # 552px
     panel_y = header_h + 4
     split_x = 1120
+
+    # Geometria dos viewports (so depende das formas de entrada)
+    cam_area_x = 12
+    cam_area_w = split_x - cam_area_x - 12
+    cam_h, cam_w = cam_shape[:2]
+    aspect_cam = cam_w / max(1, cam_h)
+    inner_cam_h = panel_h - 8
+    inner_cam_w = int(inner_cam_h * aspect_cam)
+    if inner_cam_w > cam_area_w - 8:
+        inner_cam_w = cam_area_w - 8
+        inner_cam_h = int(inner_cam_w / aspect_cam)
+    cam_x = cam_area_x + (cam_area_w - inner_cam_w) // 2
+    cam_y = panel_y + (panel_h - inner_cam_h) // 2
+
+    canvas_area_x = split_x + 12
+    canvas_area_w = target_w - canvas_area_x - 12
+    canvas_h, canvas_w = canvas_shape[:2]
+    aspect_sheet = canvas_w / max(1, canvas_h)
+    inner_sheet_h = panel_h - 8
+    inner_sheet_w = int(inner_sheet_h * aspect_sheet)
+    if inner_sheet_w > canvas_area_w - 16:
+        inner_sheet_w = canvas_area_w - 16
+        inner_sheet_h = int(inner_sheet_w / aspect_sheet)
+    sheet_x = canvas_area_x + (canvas_area_w - inner_sheet_w) // 2
+    sheet_y = panel_y + (panel_h - inner_sheet_h) // 2
+
+    geometry = {
+        "panel_y": panel_y,
+        "panel_h": panel_h,
+        "split_x": split_x,
+        "cam_area_x": cam_area_x,
+        "cam_area_w": cam_area_w,
+        "cam_x": cam_x,
+        "cam_y": cam_y,
+        "inner_cam_w": inner_cam_w,
+        "inner_cam_h": inner_cam_h,
+        "canvas_area_x": canvas_area_x,
+        "canvas_area_w": canvas_area_w,
+        "sheet_x": sheet_x,
+        "sheet_y": sheet_y,
+        "inner_sheet_w": inner_sheet_w,
+        "inner_sheet_h": inner_sheet_h,
+    }
 
     studio = np.empty((target_h, target_w, 3), dtype=np.uint8)
     # Lado esquerdo: dark studio
@@ -175,13 +168,10 @@ def _compose_view(camera_img, canvas_img, show_base=False):
     studio[:, split_x:] = COLOR_BG_CANVAS_SLOT
 
     # 1. Barra Superior (Header Studio)
-    # Header esquerdo (dark)
     cv2.rectangle(studio, (0, 0), (split_x, header_h), COLOR_SURFACE_BAR, -1)
     cv2.line(
         studio, (0, header_h), (split_x, header_h), COLOR_BORDER_SUBTLE, 1, cv2.LINE_AA
     )
-
-    # Header direito
     cv2.rectangle(studio, (split_x, 0), (target_w, header_h), COLOR_PAPER_BAR, -1)
     cv2.line(
         studio,
@@ -191,13 +181,13 @@ def _compose_view(camera_img, canvas_img, show_base=False):
         1,
         cv2.LINE_AA,
     )
-
     # Divisor vertical entre camera e canvas
     cv2.line(
         studio, (split_x, 0), (split_x, target_h), COLOR_BORDER_SUBTLE, 1, cv2.LINE_AA
     )
-
-    # Logo DRAW e badge STUDIO
+    # Logo DRAW e badge STUDIO. Sem indicador de "ao vivo": o estado da
+    # captura nao e conhecido aqui, e um selo estatico seguiria dizendo
+    # que esta ao vivo sobre os quadros de erro/fonte morta.
     cv2.putText(
         studio,
         "DRAW",
@@ -220,19 +210,6 @@ def _compose_view(camera_img, canvas_img, show_base=False):
         cv2.LINE_AA,
     )
 
-    # Centro: Indicador de captura ao vivo
-    cv2.circle(studio, (680, 22), 4, COLOR_ACCENT_GREEN, -1, cv2.LINE_AA)
-    cv2.putText(
-        studio,
-        "CAPTURA AO VIVO",
-        (694, 26),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.38,
-        COLOR_TEXT_SOFT,
-        1,
-        cv2.LINE_AA,
-    )
-
     # 2. Barra Inferior (Footer limpo)
     cv2.rectangle(
         studio, (0, target_h - footer_h), (split_x, target_h), COLOR_SURFACE_BAR, -1
@@ -245,8 +222,6 @@ def _compose_view(camera_img, canvas_img, show_base=False):
         1,
         cv2.LINE_AA,
     )
-
-    # Footer direito
     cv2.rectangle(
         studio,
         (split_x, target_h - footer_h),
@@ -271,7 +246,7 @@ def _compose_view(camera_img, canvas_img, show_base=False):
     btn_h = 22
     btn_y = target_h - footer_h + (footer_h - btn_h) // 2
     btn_x = 12
-    for key, label in buttons:
+    for btn_key, btn_label in buttons:
         bw = 94
         _draw_pill(
             studio,
@@ -286,7 +261,7 @@ def _compose_view(camera_img, canvas_img, show_base=False):
         )
         cv2.putText(
             studio,
-            key,
+            btn_key,
             (btn_x + 9, btn_y + 15),
             cv2.FONT_HERSHEY_DUPLEX,
             0.38,
@@ -296,7 +271,7 @@ def _compose_view(camera_img, canvas_img, show_base=False):
         )
         cv2.putText(
             studio,
-            label,
+            btn_label,
             (btn_x + 40, btn_y + 15),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.38,
@@ -306,9 +281,7 @@ def _compose_view(camera_img, canvas_img, show_base=False):
         )
         btn_x += bw + 8
 
-    # 4. Viewport da Camera (largura total do lado esquerdo)
-    cam_area_x = 12
-    cam_area_w = split_x - cam_area_x - 12
+    # 4. Molduras dos viewports e sombra da folha
     cv2.rectangle(
         studio,
         (cam_area_x, panel_y),
@@ -324,23 +297,57 @@ def _compose_view(camera_img, canvas_img, show_base=False):
         1,
         cv2.LINE_AA,
     )
+    cv2.rectangle(
+        studio,
+        (canvas_area_x, panel_y),
+        (canvas_area_x + canvas_area_w, panel_y + panel_h),
+        COLOR_CANVAS_SLOT_CONTAINER,
+        -1,
+    )
+    cv2.rectangle(
+        studio,
+        (canvas_area_x, panel_y),
+        (canvas_area_x + canvas_area_w, panel_y + panel_h),
+        COLOR_CANVAS_BORDER,
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.rectangle(
+        studio,
+        (sheet_x - 2, sheet_y - 2),
+        (sheet_x + inner_sheet_w + 2, sheet_y + inner_sheet_h + 2),
+        (60, 64, 62),
+        -1,
+    )
 
-    cam_h, cam_w = camera_img.shape[:2]
-    aspect_cam = cam_w / max(1, cam_h)
-    inner_cam_h = panel_h - 8
-    inner_cam_w = int(inner_cam_h * aspect_cam)
-    if inner_cam_w > cam_area_w - 8:
-        inner_cam_w = cam_area_w - 8
-        inner_cam_h = int(inner_cam_w / aspect_cam)
+    if len(_STUDIO_TEMPLATES) >= 4:
+        _STUDIO_TEMPLATES.clear()
+    _STUDIO_TEMPLATES[key] = (studio, geometry)
+    return studio, geometry
 
-    cam_resized = cv2.resize(camera_img, (inner_cam_w, inner_cam_h))
-    cam_x = cam_area_x + (cam_area_w - inner_cam_w) // 2
-    cam_y = panel_y + (panel_h - inner_cam_h) // 2
-    studio[cam_y : cam_y + inner_cam_h, cam_x : cam_x + inner_cam_w] = cam_resized
+
+def _compose_view(camera_img, canvas_img, show_base=False):
+    """Janela unica: camera e folha digital em viewports dedicados simetricos.
+
+    Tamanho final fixo (1600x640), garantindo contraste, legibilidade,
+    enquadramento simetrico da folha no mesmo padrao da camera e sem mutacao.
+    show_base liga o botao [C] Base do rodape: a tecla so tem efeito no
+    modo baseline (session_ink), entao fora dele o botao nao aparece.
+    A cromagem estatica vem do cache de _studio_template; por quadro
+    restam os dois resizes, as colagens e as bordas sobre as imagens.
+    """
+    template, geo = _studio_template(camera_img.shape, canvas_img.shape, show_base)
+    studio = template.copy()
+
+    cam_resized = cv2.resize(camera_img, (geo["inner_cam_w"], geo["inner_cam_h"]))
+    cam_x, cam_y = geo["cam_x"], geo["cam_y"]
+    studio[cam_y : cam_y + geo["inner_cam_h"], cam_x : cam_x + geo["inner_cam_w"]] = (
+        cam_resized
+    )
     cv2.rectangle(
         studio,
         (cam_x, cam_y),
-        (cam_x + inner_cam_w, cam_y + inner_cam_h),
+        (cam_x + geo["inner_cam_w"], cam_y + geo["inner_cam_h"]),
         (50, 56, 54),
         1,
         cv2.LINE_AA,
@@ -349,7 +356,7 @@ def _compose_view(camera_img, canvas_img, show_base=False):
     # Pilula CAMERA no canto superior direito da imagem: o canto esquerdo
     # e onde o app desenha o texto de status ("Folha detectada", "Mostre
     # uma folha...") sobre o quadro, e a pilula ali cobria o comeco dele.
-    pill_x = cam_x + inner_cam_w - 102
+    pill_x = cam_x + geo["inner_cam_w"] - 102
     pill_y = cam_y + 12
     _draw_pill(
         studio,
@@ -376,52 +383,16 @@ def _compose_view(camera_img, canvas_img, show_base=False):
         cv2.LINE_AA,
     )
 
-    # 5. Viewport da Folha Digital (Container dedicado no mesmo padrão da câmera!)
-    canvas_area_x = split_x + 12
-    canvas_area_w = target_w - canvas_area_x - 12
-    cv2.rectangle(
-        studio,
-        (canvas_area_x, panel_y),
-        (canvas_area_x + canvas_area_w, panel_y + panel_h),
-        COLOR_CANVAS_SLOT_CONTAINER,
-        -1,
-    )
-    cv2.rectangle(
-        studio,
-        (canvas_area_x, panel_y),
-        (canvas_area_x + canvas_area_w, panel_y + panel_h),
-        COLOR_CANVAS_BORDER,
-        1,
-        cv2.LINE_AA,
-    )
-
-    canvas_h, canvas_w = canvas_img.shape[:2]
-    aspect_sheet = canvas_w / max(1, canvas_h)
-    inner_sheet_h = panel_h - 8
-    inner_sheet_w = int(inner_sheet_h * aspect_sheet)
-    if inner_sheet_w > canvas_area_w - 16:
-        inner_sheet_w = canvas_area_w - 16
-        inner_sheet_h = int(inner_sheet_w / aspect_sheet)
-
-    sheet_resized = cv2.resize(canvas_img, (inner_sheet_w, inner_sheet_h))
-    sheet_x = canvas_area_x + (canvas_area_w - inner_sheet_w) // 2
-    sheet_y = panel_y + (panel_h - inner_sheet_h) // 2
-
-    # Sombra sutil de apoio do papel
-    cv2.rectangle(
-        studio,
-        (sheet_x - 2, sheet_y - 2),
-        (sheet_x + inner_sheet_w + 2, sheet_y + inner_sheet_h + 2),
-        (60, 64, 62),
-        -1,
-    )
-    studio[sheet_y : sheet_y + inner_sheet_h, sheet_x : sheet_x + inner_sheet_w] = (
-        sheet_resized
-    )
+    sheet_resized = cv2.resize(canvas_img, (geo["inner_sheet_w"], geo["inner_sheet_h"]))
+    sheet_x, sheet_y = geo["sheet_x"], geo["sheet_y"]
+    studio[
+        sheet_y : sheet_y + geo["inner_sheet_h"],
+        sheet_x : sheet_x + geo["inner_sheet_w"],
+    ] = sheet_resized
     cv2.rectangle(
         studio,
         (sheet_x, sheet_y),
-        (sheet_x + inner_sheet_w, sheet_y + inner_sheet_h),
+        (sheet_x + geo["inner_sheet_w"], sheet_y + geo["inner_sheet_h"]),
         (180, 185, 182),
         1,
         cv2.LINE_AA,

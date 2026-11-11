@@ -62,3 +62,26 @@ def test_message_view_paints_over_a_copy():
 def test_message_view_without_a_last_frame_uses_the_view_size():
     view = view_module._message_view(None, "falhou", ["linha"])
     assert view.shape == (640, 1280, 3)
+
+
+def test_base_button_only_appears_in_baseline_mode():
+    cam = _camera()
+    canvas = np.full((1200, 850, 3), 255, np.uint8)
+    default = view_module._compose_view(cam, canvas)
+    baseline = view_module._compose_view(cam, canvas, show_base=True)
+    footer = slice(600, 640)
+    assert not np.array_equal(default[footer], baseline[footer])
+    # E o modo padrao continua estavel depois de o baseline ter rodado:
+    # os templates em cache nao se contaminam entre modos.
+    again = view_module._compose_view(cam, canvas)
+    assert np.array_equal(default, again)
+
+
+def test_composed_view_does_not_share_the_cached_template():
+    cam = _camera()
+    canvas = np.full((1200, 850, 3), 255, np.uint8)
+    first = view_module._compose_view(cam, canvas)
+    snapshot = first.copy()
+    first[:] = 0  # o chamador pode pintar sobre a vista devolvida
+    second = view_module._compose_view(cam, canvas)
+    assert np.array_equal(second, snapshot)
