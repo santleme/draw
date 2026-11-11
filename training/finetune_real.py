@@ -52,6 +52,7 @@ import torch.nn.functional as F
 T0 = time.time()
 PATCH = 256
 
+
 # ------------------------------------------------------------------
 # Arquitetura: U-Net da v2 (linhagem page-clean), base 8.
 # Transcricao de training/train_body_tri.py (Block/UNet). Os asserts
@@ -61,8 +62,13 @@ class Block(nn.Module):
     def __init__(self, a, b):
         super().__init__()
         self.c = nn.Sequential(
-            nn.Conv2d(a, b, 3, padding=1), nn.BatchNorm2d(b), nn.ReLU(),
-            nn.Conv2d(b, b, 3, padding=1), nn.BatchNorm2d(b), nn.ReLU())
+            nn.Conv2d(a, b, 3, padding=1),
+            nn.BatchNorm2d(b),
+            nn.ReLU(),
+            nn.Conv2d(b, b, 3, padding=1),
+            nn.BatchNorm2d(b),
+            nn.ReLU(),
+        )
 
     def forward(self, x):
         return self.c(x)
@@ -88,14 +94,11 @@ class UNet(nn.Module):
         s2 = self.d2(self.pool(s1))
         s3 = self.d3(self.pool(s2))
         b = self.d4(self.pool(s3))
-        y = F.interpolate(b, scale_factor=2, mode="bilinear",
-                          align_corners=False)
+        y = F.interpolate(b, scale_factor=2, mode="bilinear", align_corners=False)
         y3 = self.u3(torch.cat([y, s3], 1))
-        y = F.interpolate(y3, scale_factor=2, mode="bilinear",
-                          align_corners=False)
+        y = F.interpolate(y3, scale_factor=2, mode="bilinear", align_corners=False)
         y2 = self.u2(torch.cat([y, s2], 1))
-        y = F.interpolate(y2, scale_factor=2, mode="bilinear",
-                          align_corners=False)
+        y = F.interpolate(y2, scale_factor=2, mode="bilinear", align_corners=False)
         y1 = self.u1(torch.cat([y, s1], 1))
         return self.head(y1), [s1, s2, s3, b, y3, y2, y1]
 
@@ -138,14 +141,11 @@ class FoldUNet(nn.Module):
         s2 = self.d2(self.pool(s1))
         s3 = self.d3(self.pool(s2))
         b = self.d4(self.pool(s3))
-        y = F.interpolate(b, scale_factor=2, mode="bilinear",
-                          align_corners=False)
+        y = F.interpolate(b, scale_factor=2, mode="bilinear", align_corners=False)
         y3 = self.u3(torch.cat([y, s3], 1))
-        y = F.interpolate(y3, scale_factor=2, mode="bilinear",
-                          align_corners=False)
+        y = F.interpolate(y3, scale_factor=2, mode="bilinear", align_corners=False)
         y2 = self.u2(torch.cat([y, s2], 1))
-        y = F.interpolate(y2, scale_factor=2, mode="bilinear",
-                          align_corners=False)
+        y = F.interpolate(y2, scale_factor=2, mode="bilinear", align_corners=False)
         y1 = self.u1(torch.cat([y, s1], 1))
         return self.head(y1), [s1, s2, s3, b, y3, y2, y1]
 
@@ -154,8 +154,10 @@ class FoldUNet(nn.Module):
 
 
 BASE = 8  # largura do w8 (TEACHER_BASE da linhagem)
-W8_RELEASE_URL = ("https://github.com/santleme/draw/releases/download/"
-                  "models-2026-11-06/page_clean_unet.onnx")
+W8_RELEASE_URL = (
+    "https://github.com/santleme/draw/releases/download/"
+    "models-2026-11-06/page_clean_unet.onnx"
+)
 
 
 def log(msg):
@@ -172,17 +174,26 @@ def _foldunet_from_onnx(path):
     import re
 
     import onnx as onnx_lib
+
     m = onnx_lib.load(path)
     tensors = {}
     for t in m.graph.initializer:
-        tensors[t.name] = torch.from_numpy(
-            onnx_lib.numpy_helper.to_array(t).copy())
-    names = sorted((n for n in tensors if n.startswith("onnx::Conv_")),
-                   key=lambda n: int(re.search(r"(\d+)$", n).group(1)))
+        tensors[t.name] = torch.from_numpy(onnx_lib.numpy_helper.to_array(t).copy())
+    names = sorted(
+        (n for n in tensors if n.startswith("onnx::Conv_")),
+        key=lambda n: int(re.search(r"(\d+)$", n).group(1)),
+    )
     assert len(names) == 28, len(names)
     fold = FoldUNet(BASE)
-    blocks = [(fold.d1, 0), (fold.d2, 2), (fold.d3, 4), (fold.d4, 6),
-              (fold.u3, 8), (fold.u2, 10), (fold.u1, 12)]
+    blocks = [
+        (fold.d1, 0),
+        (fold.d2, 2),
+        (fold.d3, 4),
+        (fold.d4, 6),
+        (fold.u3, 8),
+        (fold.u2, 10),
+        (fold.u1, 12),
+    ]
     with torch.no_grad():
         for blk, i in blocks:
             blk.c1.weight.copy_(tensors[names[2 * i]])
@@ -199,9 +210,15 @@ def _unfold_to_unet(fold):
     identidade (a menos do eps), entao o UNet nasce com a mesma
     funcao do modelo dobrado e ganha BN treinavel pro fine-tune."""
     unf = UNet(base=BASE, out_ch=1)
-    pairs = ((unf.d1, fold.d1), (unf.d2, fold.d2), (unf.d3, fold.d3),
-             (unf.d4, fold.d4), (unf.u3, fold.u3), (unf.u2, fold.u2),
-             (unf.u1, fold.u1))
+    pairs = (
+        (unf.d1, fold.d1),
+        (unf.d2, fold.d2),
+        (unf.d3, fold.d3),
+        (unf.d4, fold.d4),
+        (unf.u3, fold.u3),
+        (unf.u2, fold.u2),
+        (unf.u1, fold.u1),
+    )
     with torch.no_grad():
         for dst, srcf in pairs:
             dst.c[0].weight.copy_(srcf.c1.weight)
@@ -220,6 +237,7 @@ def _unfold_to_unet(fold):
 
 def _download(url, dest):
     import urllib.request
+
     log(f"baixando {url}")
     urllib.request.urlretrieve(url, dest)
     return dest
@@ -233,17 +251,15 @@ def build_init_model(input_bases, work_dir):
     pt_hits = []
     onnx_hits = []
     for base in input_bases:
-        pt_hits += glob.glob(f"{base}/**/page_clean_student_w8.pt",
-                             recursive=True)
-        onnx_hits += glob.glob(f"{base}/**/page_clean_student_w8.onnx",
-                               recursive=True)
-        onnx_hits += glob.glob(f"{base}/**/page_clean_unet.onnx",
-                               recursive=True)
+        pt_hits += glob.glob(f"{base}/**/page_clean_student_w8.pt", recursive=True)
+        onnx_hits += glob.glob(f"{base}/**/page_clean_student_w8.onnx", recursive=True)
+        onnx_hits += glob.glob(f"{base}/**/page_clean_unet.onnx", recursive=True)
     if pt_hits:
         sd = torch.load(pt_hits[0], map_location="cpu")
         missing, unexpected = model.load_state_dict(sd, strict=False)
         assert not missing and not unexpected, (
-            f"state_dict do w8 nao casa strict: {missing} {unexpected}")
+            f"state_dict do w8 nao casa strict: {missing} {unexpected}"
+        )
         log(f"init: .pt do w8 carregado strict de {pt_hits[0]}")
         return model, {"init_kind": "pt", "init_path": pt_hits[0]}
     if not onnx_hits:
@@ -264,28 +280,35 @@ def find_package(data_dir):
         return data_dir
     for cand in glob.glob("/kaggle/input/**/manifest.jsonl", recursive=True):
         root = os.path.dirname(cand)
-        if os.path.isdir(f"{root}/label3") and os.path.exists(
-                f"{root}/sessions.json"):
+        if os.path.isdir(f"{root}/label3") and os.path.exists(f"{root}/sessions.json"):
             return root
     raise SystemExit("pacote drawfmt nao encontrado (use --data-dir)")
 
 
 class Page:
-    __slots__ = ("pair_id", "session_id", "route", "img", "lab", "valid",
-                 "paper_level", "ink_coords", "dark_coords")
+    __slots__ = (
+        "pair_id",
+        "session_id",
+        "route",
+        "img",
+        "lab",
+        "valid",
+        "paper_level",
+        "ink_coords",
+        "dark_coords",
+    )
 
     def __init__(self, root, entry):
         import cv2
+
         self.pair_id = entry["pair_id"]
         self.session_id = entry["session_id"]
         self.route = entry["route"]
         self.img = cv2.imread(f"{root}/input/{self.pair_id}.png")
         assert self.img is not None, self.pair_id
-        self.lab = cv2.imread(f"{root}/label3/{self.pair_id}.png",
-                              cv2.IMREAD_UNCHANGED)
-        ign = cv2.imread(f"{root}/ignore/{self.pair_id}.png",
-                         cv2.IMREAD_UNCHANGED)
-        self.valid = (ign == 0)
+        self.lab = cv2.imread(f"{root}/label3/{self.pair_id}.png", cv2.IMREAD_UNCHANGED)
+        ign = cv2.imread(f"{root}/ignore/{self.pair_id}.png", cv2.IMREAD_UNCHANGED)
+        self.valid = ign == 0
         gray = cv2.cvtColor(self.img, cv2.COLOR_BGR2GRAY)
         self.paper_level = float(np.percentile(gray, 85))
         ink = ((self.lab == 1) | (self.lab == 2)) & self.valid
@@ -314,8 +337,10 @@ def photometric(patch, paper_level, rng):
         x = x + rng.normal(0, float(rng.uniform(0.5, 4.0)), x.shape)
     if rng.random() < 0.12:
         import cv2
-        x = cv2.GaussianBlur(np.clip(x, 0, 255).astype(np.uint8), (3, 3), 0
-                             ).astype(np.float32)
+
+        x = cv2.GaussianBlur(np.clip(x, 0, 255).astype(np.uint8), (3, 3), 0).astype(
+            np.float32
+        )
     return np.clip(x, 0, 255)
 
 
@@ -344,21 +369,22 @@ def sample_patch(page, rng, ink_frac=0.55, dark_frac=0.20):
         coords = page.dark_coords
     if coords is not None:
         cy, cx = coords[int(rng.integers(0, len(coords)))]
-        y = int(np.clip(cy - PATCH // 2 + rng.integers(-64, 65),
-                        0, h - PATCH))
-        x = int(np.clip(cx - PATCH // 2 + rng.integers(-64, 65),
-                        0, w - PATCH))
+        y = int(np.clip(cy - PATCH // 2 + rng.integers(-64, 65), 0, h - PATCH))
+        x = int(np.clip(cx - PATCH // 2 + rng.integers(-64, 65), 0, w - PATCH))
     else:
         y = int(rng.integers(0, h - PATCH + 1))
         x = int(rng.integers(0, w - PATCH + 1))
-    img = page.img[y:y + PATCH, x:x + PATCH]
-    lab = page.lab[y:y + PATCH, x:x + PATCH]
-    valid = page.valid[y:y + PATCH, x:x + PATCH]
+    img = page.img[y : y + PATCH, x : x + PATCH]
+    lab = page.lab[y : y + PATCH, x : x + PATCH]
+    valid = page.valid[y : y + PATCH, x : x + PATCH]
     img, lab, valid = geometric(img, lab, valid, rng)
     img = photometric(img, page.paper_level, rng)
     target = ((lab == 1) | (lab == 2)).astype(np.float32)
-    return (img.transpose(2, 0, 1).astype(np.float32) / 255.0,
-            target[None], valid[None].astype(np.float32))
+    return (
+        img.transpose(2, 0, 1).astype(np.float32) / 255.0,
+        target[None],
+        valid[None].astype(np.float32),
+    )
 
 
 # ------------------------------------------------------------------
@@ -366,8 +392,11 @@ def sample_patch(page, rng, ink_frac=0.55, dark_frac=0.20):
 # ------------------------------------------------------------------
 def masked_loss(logits, target, valid):
     bce = F.binary_cross_entropy_with_logits(
-        logits, target, reduction="none",
-        pos_weight=torch.tensor(8.0, device=logits.device))
+        logits,
+        target,
+        reduction="none",
+        pos_weight=torch.tensor(8.0, device=logits.device),
+    )
     bce = (bce * valid).sum() / valid.sum().clamp(min=1)
     p = torch.sigmoid(logits) * valid
     t = target * valid
@@ -386,7 +415,7 @@ def page_prob(model, img_bgr, dev):
     tiles, pos = [], []
     for y in range(0, h, PATCH):
         for x in range(0, w, PATCH):
-            tile = img_bgr[y:y + PATCH, x:x + PATCH]
+            tile = img_bgr[y : y + PATCH, x : x + PATCH]
             pad_h, pad_w = PATCH - tile.shape[0], PATCH - tile.shape[1]
             if pad_h or pad_w:
                 tile = np.pad(tile, [(0, pad_h), (0, pad_w), (0, 0)])
@@ -394,11 +423,11 @@ def page_prob(model, img_bgr, dev):
             pos.append((y, x))
     logits = np.zeros((h, w), np.float32)
     for i in range(0, len(tiles), 16):
-        batch = torch.from_numpy(np.stack(tiles[i:i + 16])).to(dev)
+        batch = torch.from_numpy(np.stack(tiles[i : i + 16])).to(dev)
         out = model(batch).cpu().numpy()[:, 0]
-        for j, (y, x) in enumerate(pos[i:i + 16]):
+        for j, (y, x) in enumerate(pos[i : i + 16]):
             hh, ww = min(PATCH, h - y), min(PATCH, w - x)
-            logits[y:y + hh, x:x + ww] = out[j, :hh, :ww]
+            logits[y : y + hh, x : x + ww] = out[j, :hh, :ww]
     return 1.0 / (1.0 + np.exp(-logits))
 
 
@@ -452,21 +481,35 @@ class UtilSampler:
         while not self._stop.is_set():
             try:
                 out = subprocess.run(
-                    ["nvidia-smi",
-                     "--query-gpu=utilization.gpu,memory.used",
-                     "--format=csv,noheader,nounits"],
-                    capture_output=True, text=True, timeout=10).stdout
+                    [
+                        "nvidia-smi",
+                        "--query-gpu=utilization.gpu,memory.used",
+                        "--format=csv,noheader,nounits",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                ).stdout
                 util, mem = out.strip().splitlines()[0].split(",")
-                self.samples.append({"t": time.time() - T0,
-                                     "gpu_util_pct": float(util),
-                                     "gpu_mem_mib": float(mem)})
+                self.samples.append(
+                    {
+                        "t": time.time() - T0,
+                        "gpu_util_pct": float(util),
+                        "gpu_mem_mib": float(mem),
+                    }
+                )
             except Exception:
                 try:
                     import torch as _t
+
                     if _t.cuda.is_available():
                         self.samples.append(
-                            {"t": time.time() - T0, "gpu_util_pct": None,
-                             "gpu_mem_mib": _t.cuda.memory_allocated() / 2**20})
+                            {
+                                "t": time.time() - T0,
+                                "gpu_util_pct": None,
+                                "gpu_mem_mib": _t.cuda.memory_allocated() / 2**20,
+                            }
+                        )
                 except Exception:
                     pass
             self._stop.wait(0.25)
@@ -479,13 +522,16 @@ class UtilSampler:
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=5)
-        utils = [s["gpu_util_pct"] for s in self.samples
-                 if s.get("gpu_util_pct") is not None]
+        utils = [
+            s["gpu_util_pct"] for s in self.samples if s.get("gpu_util_pct") is not None
+        ]
         mems = [s["gpu_mem_mib"] for s in self.samples]
-        return {"n_samples": len(self.samples),
-                "mean_gpu_util_pct": float(np.mean(utils)) if utils else None,
-                "peak_gpu_mem_mib": float(np.max(mems)) if mems else None,
-                "samples": self.samples}
+        return {
+            "n_samples": len(self.samples),
+            "mean_gpu_util_pct": float(np.mean(utils)) if utils else None,
+            "peak_gpu_mem_mib": float(np.max(mems)) if mems else None,
+            "samples": self.samples,
+        }
 
 
 # ------------------------------------------------------------------
@@ -495,7 +541,9 @@ def main():
     ap.add_argument("--data-dir", default=None)
     ap.add_argument("--out-dir", default=None)
     ap.add_argument("--smoke", action="store_true")
-    args, _unknown_args = ap.parse_known_args()  # notebook (papermill) injeta argv do Jupyter: -f, --HistoryManager...
+    args, _unknown_args = (
+        ap.parse_known_args()
+    )  # notebook (papermill) injeta argv do Jupyter: -f, --HistoryManager...
 
     cfg = {}
     cfg_path = args.config
@@ -507,13 +555,18 @@ def main():
     os.makedirs(work, exist_ok=True)
     smoke = bool(args.smoke or cfg.get("smoke"))
     if smoke:
-        cfg = {**cfg, "epochs": int(cfg.get("smoke_epochs", 2)),
-               "patches_per_page": int(cfg.get("smoke_patches_per_page", 8)),
-               "max_train_pages": int(cfg.get("smoke_pages", 12))}
+        cfg = {
+            **cfg,
+            "epochs": int(cfg.get("smoke_epochs", 2)),
+            "patches_per_page": int(cfg.get("smoke_patches_per_page", 8)),
+            "max_train_pages": int(cfg.get("smoke_pages", 12)),
+        }
 
     dev = "cuda" if torch.cuda.is_available() else "cpu"
-    log(f"torch {torch.__version__} device={dev} "
-        f"{torch.cuda.get_device_name(0) if dev == 'cuda' else ''}")
+    log(
+        f"torch {torch.__version__} device={dev} "
+        f"{torch.cuda.get_device_name(0) if dev == 'cuda' else ''}"
+    )
     torch.manual_seed(int(cfg.get("seed", 42)))
     rng = np.random.default_rng(int(cfg.get("seed", 42)))
 
@@ -521,19 +574,25 @@ def main():
     manifest = [json.loads(ln) for ln in open(f"{root}/manifest.jsonl")]
     sessions = json.load(open(f"{root}/sessions.json"))
     holdout_sessions = set(sessions.get("holdout", []))
-    assert not any(e["session_id"] in holdout_sessions for e in manifest), \
+    assert not any(e["session_id"] in holdout_sessions for e in manifest), (
         "pacote contem sessao selada — abortando"
+    )
     train_sessions = set(cfg.get("train_sessions", sessions.get("train", [])))
     ruler_entries = [e for e in manifest if e["route"] == "temporal"]
-    train_entries = [e for e in manifest
-                     if e["session_id"] in train_sessions
-                     and e["route"] != "temporal"]
-    log(f"pacote {root}: treino {len(train_entries)} pares "
+    train_entries = [
+        e
+        for e in manifest
+        if e["session_id"] in train_sessions and e["route"] != "temporal"
+    ]
+    log(
+        f"pacote {root}: treino {len(train_entries)} pares "
         f"(sessoes {sorted(train_sessions)}), regua temporal "
-        f"{len(ruler_entries)} pares (fora do treino)")
+        f"{len(ruler_entries)} pares (fora do treino)"
+    )
     assert train_entries, "nenhum par de treino"
-    assert not {e['pair_id'] for e in train_entries} & \
-        {e['pair_id'] for e in ruler_entries}, "regua vazou pro treino"
+    assert not {e["pair_id"] for e in train_entries} & {
+        e["pair_id"] for e in ruler_entries
+    }, "regua vazou pro treino"
 
     pages = load_pages(root, train_entries)
     ruler_pages = load_pages(root, ruler_entries)
@@ -544,16 +603,16 @@ def main():
     for p in pages:
         by_session.setdefault(p.session_id, []).append(p)
     main_session = max(by_session, key=lambda s: len(by_session[s]))
-    session_pages = sorted(by_session[main_session],
-                           key=lambda p: p.pair_id)
-    val_pages = (session_pages[-n_val:]
-                 if len(session_pages) > n_val + 5 else [])
+    session_pages = sorted(by_session[main_session], key=lambda p: p.pair_id)
+    val_pages = session_pages[-n_val:] if len(session_pages) > n_val + 5 else []
     train_pages = [p for p in pages if p not in val_pages]
     if cfg.get("max_train_pages"):
         train_pages = train_pages[: int(cfg["max_train_pages"])]
         val_pages = val_pages[:2]
-    log(f"paginas: treino {len(train_pages)}, val-monitor "
-        f"{len(val_pages)}, regua {len(ruler_pages)}")
+    log(
+        f"paginas: treino {len(train_pages)}, val-monitor "
+        f"{len(val_pages)}, regua {len(ruler_pages)}"
+    )
 
     input_bases = ["/kaggle/input", root]
     model, init_info = build_init_model(input_bases, work)
@@ -576,8 +635,10 @@ def main():
                 torch.cuda.reset_peak_memory_stats()
                 del xb, yb, vb, loss
                 torch.cuda.empty_cache()
-                log(f"sonda lote {cand}: pico {used / 2**30:.2f} GiB "
-                    f"de {total / 2**30:.1f}")
+                log(
+                    f"sonda lote {cand}: pico {used / 2**30:.2f} GiB "
+                    f"de {total / 2**30:.1f}"
+                )
                 if used <= 0.80 * total:
                     batch = cand
                     break
@@ -591,8 +652,9 @@ def main():
     lr = float(cfg.get("lr", 2e-4))
     steps_per_epoch = max(1, math.ceil(len(train_pages) * pp / batch))
     total_steps = steps_per_epoch * epochs
-    opt = torch.optim.AdamW(model.parameters(), lr=lr,
-                            weight_decay=float(cfg.get("wd", 1e-4)))
+    opt = torch.optim.AdamW(
+        model.parameters(), lr=lr, weight_decay=float(cfg.get("wd", 1e-4))
+    )
     warmup = max(10, total_steps // 20)
 
     def lr_at(step):
@@ -603,13 +665,17 @@ def main():
 
     use_amp = dev == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-    metrics = {"recipe": "finetune_real w8 + pares reais drawfmt",
-               "run_kind": "smoke" if smoke else "full",
-               "planned_epochs": epochs, "init": init_info,
-               "train_pairs": [p.pair_id for p in train_pages],
-               "val_monitor_pairs": [p.pair_id for p in val_pages],
-               "ruler_pairs": [p.pair_id for p in ruler_pages],
-               "batch": batch, "history": []}
+    metrics = {
+        "recipe": "finetune_real w8 + pares reais drawfmt",
+        "run_kind": "smoke" if smoke else "full",
+        "planned_epochs": epochs,
+        "init": init_info,
+        "train_pairs": [p.pair_id for p in train_pages],
+        "val_monitor_pairs": [p.pair_id for p in val_pages],
+        "ruler_pairs": [p.pair_id for p in ruler_pages],
+        "batch": batch,
+        "history": [],
+    }
 
     def save_metrics():
         with open(f"{work}/metrics.json", "w") as f:
@@ -629,7 +695,7 @@ def main():
             rng.shuffle(plan)
             ep_loss, ep_steps, t_ep = 0.0, 0, time.time()
             for i in range(0, len(plan), batch):
-                chunk = plan[i:i + batch]
+                chunk = plan[i : i + batch]
                 xs, ys, vs = zip(*(sample_patch(p, rng) for p in chunk))
                 xb = torch.from_numpy(np.stack(xs)).to(dev, non_blocking=True)
                 yb = torch.from_numpy(np.stack(ys)).to(dev, non_blocking=True)
@@ -648,9 +714,11 @@ def main():
                 ep_steps += 1
                 step += 1
                 if ep_steps == 1 or ep_steps % 20 == 0:
-                    log(f"ep {epoch} passo {ep_steps}/{steps_per_epoch} "
+                    log(
+                        f"ep {epoch} passo {ep_steps}/{steps_per_epoch} "
                         f"loss {ep_loss / ep_steps:.4f} "
-                        f"lr {opt.param_groups[0]['lr']:.2e}")
+                        f"lr {opt.param_groups[0]['lr']:.2e}"
+                    )
             # val-monitor: Dice@0,5 nas paginas separadas
             dice = None
             if val_pages:
@@ -662,9 +730,13 @@ def main():
                     inter += int((pred & gt).sum())
                     union += int((pred | gt).sum())
                 dice = (2 * inter) / max(1, inter + union)
-            rec = {"epoch": epoch, "loss": ep_loss / max(1, ep_steps),
-                   "steps": ep_steps, "seconds": time.time() - t_ep,
-                   "val_monitor_dice": dice}
+            rec = {
+                "epoch": epoch,
+                "loss": ep_loss / max(1, ep_steps),
+                "steps": ep_steps,
+                "seconds": time.time() - t_ep,
+                "val_monitor_dice": dice,
+            }
             metrics["history"].append(rec)
             log(f"ep {epoch} fim: {rec}")
             torch.save(model.state_dict(), f"{work}/last.pt")
@@ -677,9 +749,9 @@ def main():
         util = sampler.stop()
         with open(f"{work}/util.json", "w") as f:
             json.dump(util, f, indent=2)
-        metrics["util"] = {k: util[k] for k in
-                           ("n_samples", "mean_gpu_util_pct",
-                            "peak_gpu_mem_mib")}
+        metrics["util"] = {
+            k: util[k] for k in ("n_samples", "mean_gpu_util_pct", "peak_gpu_mem_mib")
+        }
         metrics["train_seconds"] = time.time() - t_start
         save_metrics()
     log(f"utilizacao: {metrics['util']}")
@@ -687,8 +759,7 @@ def main():
     # export: melhor (se houve val) senao o ultimo; BN dobrado pro
     # contrato do app (grafo Conv+Relu como o do w8)
     if os.path.exists(f"{work}/best.pt"):
-        model.load_state_dict(torch.load(f"{work}/best.pt",
-                                         map_location="cpu"))
+        model.load_state_dict(torch.load(f"{work}/best.pt", map_location="cpu"))
     model = model.to(dev).eval()
     fold = _fold_from_unet(model)
     onnx_out = f"{work}/page_clean_finetune_real_v1.onnx"
@@ -696,15 +767,14 @@ def main():
     metrics["onnx"] = {"path": onnx_out}
     try:
         import onnxruntime as ort
+
         rng2 = np.random.default_rng(7)
         xt = rng2.random((1, 3, PATCH, PATCH)).astype(np.float32)
         with torch.no_grad():
             ref = fold(torch.from_numpy(xt).to(dev)).cpu().numpy()
-        sess = ort.InferenceSession(onnx_out, providers=[
-            "CPUExecutionProvider"])
+        sess = ort.InferenceSession(onnx_out, providers=["CPUExecutionProvider"])
         got = sess.run(None, {"page": xt})[0]
-        metrics["onnx"]["max_abs_diff_torch_vs_ort"] = float(
-            np.abs(ref - got).max())
+        metrics["onnx"]["max_abs_diff_torch_vs_ort"] = float(np.abs(ref - got).max())
         log(f"export ok: {metrics['onnx']}")
     except Exception as e:  # noqa: BLE001
         metrics["onnx"]["agreement_error"] = str(e)
@@ -715,18 +785,23 @@ def main():
     metrics["ruler_temporal"] = ruler
     save_metrics()
     log(f"regua temporal (candidato): {json.dumps(ruler)[:400]}")
-    w8_note = {"median_prob_agg": 0.0040, "recall05_agg": 0.12,
-               "fonte": "frente 29 (w8 de producao sobre o mesmo GT)"}
+    w8_note = {
+        "median_prob_agg": 0.0040,
+        "recall05_agg": 0.12,
+        "fonte": "frente 29 (w8 de producao sobre o mesmo GT)",
+    }
     log(f"regua temporal (w8, referencia): {w8_note}")
     if smoke:
         metrics["smoke_finished"] = True
         save_metrics()
-        ok = (metrics["onnx"].get("max_abs_diff_torch_vs_ort", 9) < 1e-3
-              and (dev != "cuda"
-                   or (util["n_samples"] > 0
-                       and (util["mean_gpu_util_pct"] or 0) > 0)))
-        print(f"SMOKE {'OK' if ok else 'FALHOU'}: {json.dumps(metrics['util'])}",
-              flush=True)
+        ok = metrics["onnx"].get("max_abs_diff_torch_vs_ort", 9) < 1e-3 and (
+            dev != "cuda"
+            or (util["n_samples"] > 0 and (util["mean_gpu_util_pct"] or 0) > 0)
+        )
+        print(
+            f"SMOKE {'OK' if ok else 'FALHOU'}: {json.dumps(metrics['util'])}",
+            flush=True,
+        )
         return 0 if ok else 1
     metrics["finished"] = True
     save_metrics()
@@ -738,19 +813,24 @@ def _fold_from_unet(model):
     """Dobra o BN de cada Block nas convolucoes (eval): devolve o
     FoldUNet equivalente, o formato do ONNX de producao."""
     fold = FoldUNet(BASE)
-    pairs = ((model.d1, fold.d1), (model.d2, fold.d2),
-             (model.d3, fold.d3), (model.d4, fold.d4),
-             (model.u3, fold.u3), (model.u2, fold.u2),
-             (model.u1, fold.u1))
+    pairs = (
+        (model.d1, fold.d1),
+        (model.d2, fold.d2),
+        (model.d3, fold.d3),
+        (model.d4, fold.d4),
+        (model.u3, fold.u3),
+        (model.u2, fold.u2),
+        (model.u1, fold.u1),
+    )
     with torch.no_grad():
         for src, dst in pairs:
-            for conv_s, bn_s, conv_d in ((src.c[0], src.c[1], dst.c1),
-                                         (src.c[3], src.c[4], dst.c2)):
-                scale = bn_s.weight / torch.sqrt(
-                    bn_s.running_var + bn_s.eps)
+            for conv_s, bn_s, conv_d in (
+                (src.c[0], src.c[1], dst.c1),
+                (src.c[3], src.c[4], dst.c2),
+            ):
+                scale = bn_s.weight / torch.sqrt(bn_s.running_var + bn_s.eps)
                 conv_d.weight.copy_(conv_s.weight * scale.view(-1, 1, 1, 1))
-                conv_d.bias.copy_(
-                    (conv_s.bias - bn_s.running_mean) * scale + bn_s.bias)
+                conv_d.bias.copy_((conv_s.bias - bn_s.running_mean) * scale + bn_s.bias)
         fold.head.weight.copy_(model.head.weight)
         fold.head.bias.copy_(model.head.bias)
     return fold.to(next(model.parameters()).device).eval()
@@ -759,16 +839,29 @@ def _fold_from_unet(model):
 def _export_onnx(fold, path, dev):
     dummy = torch.zeros(1, 3, PATCH, PATCH, device=dev)
     try:
-        torch.onnx.export(fold, dummy, path, input_names=["page"],
-                          output_names=["ink_logits"],
-                          dynamic_axes={"page": {2: "h", 3: "w"}},
-                          opset_version=17, dynamo=False)
+        torch.onnx.export(
+            fold,
+            dummy,
+            path,
+            input_names=["page"],
+            output_names=["ink_logits"],
+            dynamic_axes={"page": {2: "h", 3: "w"}},
+            opset_version=17,
+            dynamo=False,
+        )
     except Exception:
-        torch.onnx.export(fold, dummy, path, input_names=["page"],
-                          output_names=["ink_logits"],
-                          dynamic_axes={"page": {2: "h", 3: "w"}},
-                          opset_version=14, dynamo=False)
+        torch.onnx.export(
+            fold,
+            dummy,
+            path,
+            input_names=["page"],
+            output_names=["ink_logits"],
+            dynamic_axes={"page": {2: "h", 3: "w"}},
+            opset_version=14,
+            dynamo=False,
+        )
     import onnx as onnx_lib
+
     m = onnx_lib.load(path)
     dims = m.graph.output[0].type.tensor_type.shape.dim
     dims[2].dim_value = PATCH

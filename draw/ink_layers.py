@@ -1589,9 +1589,7 @@ class _PageCleanWorker:
             self._arb_close_event()
         self._anchor_corners = new_anchor
         if reg_anchor_median:
-            self._anchor_samples = [
-                quad.copy() for quad in self._follow_streak_quads
-            ]
+            self._anchor_samples = [quad.copy() for quad in self._follow_streak_quads]
         if reg_deadband:
             self._reg_frozen_corners = new_anchor.copy()
             self._reg_deadband_over = 0
@@ -1743,9 +1741,7 @@ class _PageCleanWorker:
             return False
         self._identity_reference = confirmed.copy()
         self._identity_reference_corners = (
-            None
-            if self._anchor_corners is None
-            else self._anchor_corners.copy()
+            None if self._anchor_corners is None else self._anchor_corners.copy()
         )
         self._identity_recovery_requested = True
         self._identity_defer_count = 0
@@ -2421,18 +2417,13 @@ class _PageCleanWorker:
                         follow_reference = (
                             None
                             if ecc_reference is None
-                            else self._accumulator._confirmed.astype(np.float32)
-                            / 255.0
+                            else self._accumulator._confirmed.astype(np.float32) / 255.0
                         )
                         registered_prob, registered_visible, ecc_info = (
                             _register_ink_probability(
                                 prob,
                                 self._anchor_corners,
-                                (
-                                    self._reg_frozen_corners
-                                    if reg_deadband
-                                    else corners
-                                ),
+                                (self._reg_frozen_corners if reg_deadband else corners),
                                 follow_reference,
                                 visible,
                             )

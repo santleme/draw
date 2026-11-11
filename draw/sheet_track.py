@@ -330,10 +330,7 @@ class _SheetTracker:
                     # sustentou pelo tempo de persistencia.
                     self._pending_sustain_count += 1
                 else:
-                    if (
-                        self._pending is not None
-                        and self._pending_sustain_count >= 2
-                    ):
+                    if self._pending is not None and self._pending_sustain_count >= 2:
                         # Candidato ESTABELECIDO substituido no meio
                         # do episodio: transicao descontinua. (A
                         # troca nas primeiras deteccoes e o transi-

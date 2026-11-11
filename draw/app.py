@@ -959,11 +959,8 @@ def run(
                     if (
                         ink_worker is not None
                         and ink_session_open
-                        and os.environ.get("DRAW_IDENTITY_WATCH", "").strip()
-                        == "1"
-                        and (tracker.last_big_jump or {}).get(
-                            "episode_discontinuous"
-                        )
+                        and os.environ.get("DRAW_IDENTITY_WATCH", "").strip() == "1"
+                        and (tracker.last_big_jump or {}).get("episode_discontinuous")
                     ):
                         # Salto grande de pose com a folha presente
                         # E episodio descontínuo (frentes 28/32): so
@@ -1239,9 +1236,7 @@ def run(
                     # perde) e a geracao nova comeca, como na
                     # virada U3 — sem isto, virar a pagina somava
                     # as duas no mesmo canvas.
-                    identity_split = ink_worker.take_identity_split(
-                        clean_generation
-                    )
+                    identity_split = ink_worker.take_identity_split(clean_generation)
                     if identity_split is not None:
                         split_canvas, _split_reason = identity_split
                         if clean_mask is not None:
@@ -1252,9 +1247,7 @@ def run(
                             png_writer.save(
                                 split_path,
                                 ink_module.render_canvas(split_canvas),
-                                lambda path: print(
-                                    f"Pagina anterior salva em {path}"
-                                ),
+                                lambda path: print(f"Pagina anterior salva em {path}"),
                             )
                         clean_generation = ink_worker.new_generation()
                         clean_display_version = 0
