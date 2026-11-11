@@ -1,6 +1,6 @@
 # Draw training: performance and quality guide
 
-Last reviewed: 2026-11-06
+Last reviewed: 2026-11-11
 
 This guide is about useful model quality per accelerator-hour. Filling VRAM or
 keeping a TPU busy is not itself a training objective. We accept a speed change
@@ -15,10 +15,16 @@ metrics and the exported model contract.
 - CUDA baseline: BF16 where supported, otherwise FP16 with GradScaler;
   `num_workers=4`, pinned memory, persistent workers and prefetching are already
   enabled by `training/train.py`.
-- The CUDA/CPU adapter supports opt-in `torch.compile` via
-  `training.compile` or `--compile` / `--no-compile`; it is off in the base
-  config. `channels_last` is not enabled. Both still require benchmarking,
-  not assumed wins. The TorchTPU body has a separate compile path; its
+- The CUDA/CPU adapter enables `torch.compile` by default on CUDA (eager on
+  CPU) when the config does not set `training.compile`; `--no-compile` or
+  `"compile": false` keeps eager (configs t9–t15 pin `false`). Compilation is
+  wrapped with a safe eager fallback: a failure at the `torch.compile` call is
+  logged and training continues eager; a first-step trace/backend failure falls
+  back to eager per frame (`torch._dynamo.config.suppress_errors`). The receipt
+  records `efficiency.compile_status`. `channels_last` is a supported
+  experiment behind `training.channels_last` / `--channels-last` (off by
+  default). Both still require benchmarking, not assumed wins. The TorchTPU
+  body has a separate compile path; its
   `run_t7.py` launcher gates training on a smoke, then tries compilation
   with scoped-VMEM retries and an eager fallback for E1001 failures.
 - The universal launcher can select CUDA with `--backend auto` or `--backend
@@ -130,13 +136,22 @@ can preserve them.
   hurt a Kaggle host with only a few CPU cores or saturate storage/CPU
   augmentation. Read the assigned CPU count from the runtime before sweeping.
 - Benchmark `channels_last` with BF16 as a separate experiment because the
-  model is convolution-heavy. Check output parity and class metrics before
-  adopting it.
-- Benchmark `torch.compile` (`--compile`, or `training.compile` in the config)
-  only after eager baseline is healthy. Include
-  compilation startup in total wall time and reuse a fixed shape to avoid
-  recompilation. Keep eager as fallback if the compile gains do not repay
-  startup or if compilation fails.
+  model is convolution-heavy: `--channels-last` (or
+  `"training": {"channels_last": true}`) converts the model weights and every
+  input batch, and reverts to contiguous before ONNX export. Check output
+  parity and class metrics before adopting it; measure, do not assume.
+- `torch.compile` is on by default on CUDA; benchmark it against
+  `--no-compile` once the eager baseline is healthy. Include compilation
+  startup in total wall time (it lands in the first epoch/block) and compare
+  steady-state step time (`steps_steady_s_per_step` in steps mode, later
+  epochs' `epoch_s` in epoch mode). Reuse a fixed shape to
+  avoid recompilation. Eager stays one flag away, and compile failures fall
+  back to eager automatically (`efficiency.compile_status` is
+  `eager_fallback_runtime`, with `compile_fallback_reason`, when Dynamo
+  rejected a frame during training).
+- For cheap hypothesis checks, use steps mode (`--mode steps --max-steps 300
+  --eval-interval-steps 50 --patience 2`) before paying for a full run; see
+  `docs/TREINO.md`, "Reduzindo tempo por experimento".
 - The current multi-GPU fallback is `DataParallel`. If the runtime exposes
   multiple GPUs and scaling matters, compare it with `DistributedDataParallel`
   in a separate adapter; do not assume a second GPU halves time.

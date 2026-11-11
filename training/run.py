@@ -123,6 +123,14 @@ def build_command(args: argparse.Namespace, backend: str) -> list[str]:
             cmd += ["--precision", args.precision]
         if getattr(args, "compile", None) is not None:
             cmd.append("--compile" if args.compile else "--no-compile")
+        if getattr(args, "channels_last", None) is not None:
+            cmd.append(
+                "--channels-last" if args.channels_last else "--no-channels-last"
+            )
+        for flag in ("mode", "max_steps", "eval_interval_steps", "patience"):
+            value = getattr(args, flag, None)
+            if value is not None:
+                cmd += ["--" + flag.replace("_", "-"), str(value)]
         if args.smoke:
             cmd += ["--smoke", "--smoke-dir", args.smoke_dir]
         return cmd
@@ -274,6 +282,43 @@ def main(argv: list[str] | None = None) -> int:
         dest="compile",
         action="store_false",
         help="Só rota CUDA/CPU: desliga torch.compile.",
+    )
+    parser.add_argument(
+        "--channels-last",
+        dest="channels_last",
+        action="store_true",
+        default=None,
+        help="Só rota CUDA/CPU: experimento channels_last (meça antes de adotar).",
+    )
+    parser.add_argument(
+        "--no-channels-last",
+        dest="channels_last",
+        action="store_false",
+        help="Só rota CUDA/CPU: desliga channels_last.",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("epochs", "steps"),
+        default=None,
+        help="Só rota CUDA/CPU: training.mode (steps = iteração rápida).",
+    )
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help="Só rota CUDA/CPU: training.max_steps do modo steps.",
+    )
+    parser.add_argument(
+        "--eval-interval-steps",
+        type=int,
+        default=None,
+        help="Só rota CUDA/CPU: passos por bloco de avaliação no modo steps.",
+    )
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=None,
+        help="Só rota CUDA/CPU: early_stopping.patience_epochs (épocas ou blocos).",
     )
     parser.add_argument(
         "--smoke",

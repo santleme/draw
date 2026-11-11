@@ -39,6 +39,7 @@ métricas possam ser testados sem GPU e sem torch instalado.
 
 import argparse
 import json
+import logging
 import math
 import os
 import sys
@@ -1342,6 +1343,124 @@ def configure_fast_runtime(torch, device):
     torch.backends.cudnn.benchmark = True
 
 
+def torch_device_is_accelerated(device):
+    return str(device).split(":", 1)[0] != "cpu"
+
+
+def resolve_compile(cli_value, tr, device):
+    """Decide torch.compile: CLI > ``training.compile`` > padrão do dispositivo.
+
+    Padrão ligado em CUDA e desligado em CPU; ``--no-compile`` ou
+    ``"compile": false`` na config continuam sendo a saída para eager.
+    """
+    if cli_value is not None:
+        return bool(cli_value)
+    return bool(tr.get("compile", torch_device_is_accelerated(device)))
+
+
+class _CompileFallbackLog(logging.Handler):
+    """Guarda os avisos do dynamo de frame que caiu para eager."""
+
+    def __init__(self):
+        super().__init__(logging.WARNING)
+        self.messages = []
+
+    def emit(self, record):
+        lines = record.getMessage().splitlines() or [""]
+        errors = [
+            line
+            for line in lines[1:]
+            if line
+            and not line[0].isspace()
+            and not line.startswith(("due to", "Traceback", "Set TORCHDYNAMO"))
+        ]
+        self.messages.append(" | ".join([lines[0].strip(), *errors])[:500])
+
+
+_COMPILE_FALLBACK_LOG = _CompileFallbackLog()
+
+
+def compile_runtime_status(status):
+    """``(status, motivo)`` depois de passos reais.
+
+    ``"compiled"`` vira ``"eager_fallback_runtime"`` quando o dynamo
+    recusou algum frame (``suppress_errors``) desde o ``apply_compile``.
+    """
+    if status == "compiled" and _COMPILE_FALLBACK_LOG.messages:
+        return "eager_fallback_runtime", _COMPILE_FALLBACK_LOG.messages[0]
+    return status, None
+
+
+def apply_compile(torch, model, device, backend=None):
+    """``torch.compile(model)`` com fallback seguro para eager.
+
+    Devolve ``(modelo, status)``: ``"compiled"`` ou ``"eager_fallback"``.
+    ``backend`` só existe para o smoke provar os dois caminhos de fallback.
+    Falha na chamada cai para eager na hora; falha tardia (traçado ou
+    compilação do backend no 1º passo) cai para eager por frame via
+    ``torch._dynamo.config.suppress_errors``, com o motivo no log do dynamo.
+    """
+    if not torch_device_is_accelerated(device):
+        print(
+            "AVISO: torch.compile em CPU (prova local); o ganho é medido "
+            "no smoke da sessão GPU.",
+            file=sys.stderr,
+        )
+    try:
+        import torch._dynamo
+
+        torch._dynamo.config.suppress_errors = True
+        compiled = torch.compile(model, **({"backend": backend} if backend else {}))
+    except Exception as exc:  # noqa: BLE001 - qualquer falha vira eager
+        print(
+            f"AVISO: torch.compile falhou ({type(exc).__name__}: {exc}); "
+            "seguindo em eager.",
+            file=sys.stderr,
+        )
+        return model, "eager_fallback"
+    _COMPILE_FALLBACK_LOG.messages.clear()
+    dynamo_log = logging.getLogger("torch._dynamo.convert_frame")
+    if _COMPILE_FALLBACK_LOG not in dynamo_log.handlers:
+        dynamo_log.addHandler(_COMPILE_FALLBACK_LOG)
+    print(
+        "torch.compile: LIGADO (modo default; erro de compilação no 1º passo "
+        "cai para eager)"
+    )
+    return compiled, "compiled"
+
+
+def enable_channels_last(torch, model):
+    """Pesos 4D e ``pixel_values`` em ``channels_last`` (experimento opt-in).
+
+    Os pesos vão com ``model.to(memory_format=...)``; o hook converte o
+    lote de entrada em toda chamada do modelo — treino, passos, validação,
+    sonda e régua de flicker usam o mesmo caminho. Devolve o handle do
+    hook (``disable_channels_last`` o remove antes do export ONNX).
+    """
+
+    def _to_channels_last(_module, args, kwargs):
+        pixel_values = kwargs.get("pixel_values")
+        if pixel_values is not None and pixel_values.dim() == 4:
+            kwargs["pixel_values"] = pixel_values.contiguous(
+                memory_format=torch.channels_last
+            )
+        elif args and hasattr(args[0], "dim") and args[0].dim() == 4:
+            args = (args[0].contiguous(memory_format=torch.channels_last),) + tuple(
+                args[1:]
+            )
+        return args, kwargs
+
+    model.to(memory_format=torch.channels_last)
+    return model.register_forward_pre_hook(_to_channels_last, with_kwargs=True)
+
+
+def disable_channels_last(torch, model, handle):
+    """Desfaz ``enable_channels_last``: remove o hook e volta ao layout contíguo."""
+    if handle is not None:
+        handle.remove()
+    model.to(memory_format=torch.contiguous_format)
+
+
 def _model_logits(model, images):
     """Accepta SegformerOutput ou Tensor (saída do DataParallel multi-GPU)."""
     output = model(pixel_values=images)
@@ -2262,6 +2381,61 @@ def validate_onnx(model, onnx_path, loader, device, cfg):
 
 
 # ---------------------------------------------------------------- smoke
+def _smoke_compile_and_channels_last(torch):
+    """Prova barata (sem inductor) do fallback do compile e do channels_last."""
+    torch.manual_seed(0)
+    net = torch.nn.Sequential(
+        torch.nn.Conv2d(3, 4, 3, padding=1), torch.nn.ReLU(), torch.nn.Conv2d(4, 4, 1)
+    )
+    x = torch.randn(2, 3, 16, 16)
+    with torch.no_grad():
+        eager_out = net(x)
+
+    # Falha na chamada (backend inexistente) -> eager imediato.
+    same, status = apply_compile(torch, net, "cpu", backend="draw_smoke_inexistente")
+    assert status == "eager_fallback" and same is net, status
+
+    # Falha tardia (backend quebra no 1º passo) -> eager por frame.
+    def _broken_backend(_gm, _example_inputs):
+        raise RuntimeError("falha simulada do backend (smoke)")
+
+    import torch._dynamo
+
+    previous_suppress = torch._dynamo.config.suppress_errors
+    try:
+        compiled, status = apply_compile(torch, net, "cpu", backend=_broken_backend)
+        assert status == "compiled", status
+        out = compiled(x)
+        status, reason = compile_runtime_status(status)
+        assert status == "eager_fallback_runtime" and reason, (status, reason)
+        out.sum().backward()
+        assert torch.isfinite(out).all(), "fallback tardio do compile não finito"
+        assert torch.allclose(out.detach(), eager_out, atol=1e-6), (
+            "fallback tardio do compile mudou a saída"
+        )
+    finally:
+        torch._dynamo.config.suppress_errors = previous_suppress
+        torch._dynamo.reset()
+
+    handle = enable_channels_last(torch, net)
+    assert net[0].weight.is_contiguous(memory_format=torch.channels_last)
+    seen = []
+    probe = net[0].register_forward_pre_hook(
+        lambda _m, a: seen.append(a[0].is_contiguous(memory_format=torch.channels_last))
+    )
+    with torch.no_grad():
+        cl_out = net(x)
+    probe.remove()
+    assert seen == [True], "lote não chegou em channels_last"
+    assert torch.allclose(cl_out, eager_out, atol=1e-5), "channels_last mudou a saída"
+    disable_channels_last(torch, net, handle)
+    assert net[0].weight.is_contiguous()
+    print(
+        "SMOKE OK: torch.compile cai para eager na chamada e no 1º passo; "
+        "channels_last preserva a saída e é reversível"
+    )
+
+
 def smoke(smoke_dir):
     """Smoke test sem GPU e sem treino completo.
 
@@ -2410,6 +2584,7 @@ def smoke(smoke_dir):
             raise AssertionError(
                 "avaliação totalmente ignorada deveria falhar claramente"
             )
+        _smoke_compile_and_channels_last(torch)
     # Contrato ONNX: nomes e shapes esperados, sem rodar modelo.
     contract = {
         "input_name": "image",
@@ -2509,13 +2684,66 @@ def main(argv=None):
         action="store_false",
         help="Desliga torch.compile (sobrescreve a config).",
     )
+    parser.add_argument(
+        "--channels-last",
+        dest="channels_last",
+        action="store_true",
+        default=None,
+        help="Experimento: pesos e lotes em channels_last (training.channels_last). "
+        "Meça s/passo e métricas contra o eager contíguo antes de adotar.",
+    )
+    parser.add_argument(
+        "--no-channels-last",
+        dest="channels_last",
+        action="store_false",
+        help="Desliga channels_last (sobrescreve a config).",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("epochs", "steps"),
+        default=None,
+        help="training.mode: épocas sobre o catálogo ou passos sobre buffers em RAM.",
+    )
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help="training.max_steps do modo steps (padrão da config: 1500).",
+    )
+    parser.add_argument(
+        "--eval-interval-steps",
+        type=int,
+        default=None,
+        help="training.eval_interval_steps: passos por bloco de avaliação (300).",
+    )
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=None,
+        help="early_stopping.patience_epochs: épocas (ou blocos, no modo steps) "
+        "sem melhora de val_mean_iou antes de parar.",
+    )
     args = parser.parse_args(argv)
+    for name in ("max_steps", "eval_interval_steps", "patience"):
+        value = getattr(args, name)
+        if value is not None and value < 1:
+            parser.error(f"--{name.replace('_', '-')} precisa ser positivo")
 
     cfg = load_config(args.config)
     if args.smoke:
         return smoke(args.smoke_dir)
     if args.precision is not None:
         cfg["training"]["mixed_precision"] = args.precision
+    if args.channels_last is not None:
+        cfg["training"]["channels_last"] = args.channels_last
+    if args.mode is not None:
+        cfg["training"]["mode"] = args.mode
+    if args.max_steps is not None:
+        cfg["training"]["max_steps"] = args.max_steps
+    if args.eval_interval_steps is not None:
+        cfg["training"]["eval_interval_steps"] = args.eval_interval_steps
+    if args.patience is not None:
+        cfg["training"]["early_stopping"]["patience_epochs"] = args.patience
 
     real_manifest = None
     real_labels_unverified = False
@@ -2616,6 +2844,14 @@ def main(argv=None):
         )
 
     model, base_model = _data_parallel(torch, build_model(cfg).to(device))
+    channels_last = bool(tr.get("channels_last", False))
+    channels_last_hook = None
+    if channels_last:
+        channels_last_hook = enable_channels_last(torch, base_model)
+        print(
+            "channels_last: LIGADO (experimento; meça s/passo e métricas "
+            "contra o eager contíguo antes de adotar)"
+        )
     if torch.cuda.is_available() and torch.cuda.device_count() > 1:
         print(f"data parallel: usando {torch.cuda.device_count()} GPUs CUDA")
     presence_init_path = args.init_presence or tr.get("init_presence_checkpoint")
@@ -2774,21 +3010,14 @@ def main(argv=None):
             f"{tset['consistency_weight']} | modo {tset['mode']} | "
             f"trim {tset['trim']} | peso área {tset['area_weight']}"
         )
-    # --- Pacote de eficiência: torch.compile + EMA (gated, padrão off).
-    compile_enabled = (
-        bool(args.compile)
-        if args.compile is not None
-        else bool(tr.get("compile", False))
-    )
+    # --- Pacote de eficiência: torch.compile (padrão ligado em CUDA, com
+    # fallback para eager) + EMA (gated, padrão off).
+    compile_enabled = resolve_compile(args.compile, tr, device)
+    compile_status = "off"
     if compile_enabled:
-        if device == "cpu":
-            print(
-                "AVISO: torch.compile em CPU (prova local); o ganho é medido "
-                "no smoke da sessão GPU.",
-                file=sys.stderr,
-            )
-        model = torch.compile(model)
-        print("torch.compile: LIGADO (modo default)")
+        model, compile_status = apply_compile(torch, model, device)
+    else:
+        print("torch.compile: DESLIGADO (eager)")
     ema_cfg = tr.get("ema") or {}
     ema = None
     if ema_cfg.get("enabled"):
@@ -2948,9 +3177,18 @@ def main(argv=None):
                     "pair_batches_epoch0": epoch_stats.get("pair_batches", 0),
                     "pairs_total": len(pair_loader.dataset),
                 }
+            compile_status, compile_fallback = compile_runtime_status(compile_status)
+            if compile_fallback:
+                print(
+                    f"AVISO: torch.compile caiu para eager no treino ({compile_fallback})",
+                    file=sys.stderr,
+                )
             receipt["efficiency"] = {
                 "cache_mode": cache_mode,
                 "compile": compile_enabled,
+                "compile_status": compile_status,
+                "compile_fallback_reason": compile_fallback,
+                "channels_last": channels_last,
                 "ema_decay": ema.decay if ema is not None else None,
             }
             receipt["projected_total_min"] = round(epoch_s * epochs / 60, 1)
@@ -3070,9 +3308,20 @@ def main(argv=None):
                         "pair_batches_block0": block_stats.get("pair_batches", 0),
                         "pairs_total": len(pair_buffer),
                     }
+                compile_status, compile_fallback = compile_runtime_status(
+                    compile_status
+                )
+                if compile_fallback:
+                    print(
+                        f"AVISO: torch.compile caiu para eager no treino ({compile_fallback})",
+                        file=sys.stderr,
+                    )
                 receipt["efficiency"] = {
                     "cache_mode": "ram_buffer",
                     "compile": compile_enabled,
+                    "compile_status": compile_status,
+                    "compile_fallback_reason": compile_fallback,
+                    "channels_last": channels_last,
                     "ema_decay": ema.decay if ema is not None else None,
                 }
                 receipt["steps_mode"] = {
@@ -3143,6 +3392,8 @@ def main(argv=None):
     # Não-fatal: se a exportação falhar, as métricas e os demais artefatos
     # ainda são escritos, e a falha fica registrada em onnx_validation —
     # antes, uma falha aqui perdia o metrics.json inteiro após o treino.
+    if channels_last:
+        disable_channels_last(torch, base_model, channels_last_hook)
     base_model.load_state_dict(
         torch.load(out_dir / "checkpoints" / "best.pt", map_location=device)
     )
@@ -3161,6 +3412,7 @@ def main(argv=None):
     final_metrics["onnx_validation"] = onnx_check
     final_metrics["delivery_status"] = onnx_delivery_status(onnx_check)
     final_metrics["history"] = history
+    final_metrics["compile_status"] = compile_runtime_status(compile_status)[0]
     if steps_steady_s_per_step is not None:
         final_metrics["steps_steady_s_per_step"] = steps_steady_s_per_step
     final_metrics["train_pixel_counts"] = counts.tolist()
