@@ -194,6 +194,165 @@ _INK_FRONTIER_KERNEL = np.ones(
 )
 
 
+# Regra de voto E3 (frente 89, desenho + prototipos offline em
+# draw-lab/live-audit-2026-11-10/89-regra-do-voto.md; implementacao
+# da frente 90): a candidata vencedora da F89, porto fiel da bancada
+# dela (frente89/f89_bench4.py, classe CommitE3). A regra atual
+# confirma sobre janelas deslizantes sobrepostas e o canvas cresce
+# 2,90x na regua de 17 passadas (relatorios 86/89): a franja que
+# pisca 2x na mesma posicao dentro de alguma janela confirma. A E3
+# separa a geracao em duas fases:
+# - Fase 1 (as _INK_VOTE_E3_PHASE1_PASSES primeiras passadas): o
+#   canvas nasce UMA vez, do nucleo de consenso espacial das 3
+#   passadas — tinta a <= _INK_FRONTIER_RADIUS px do pixel nas 3
+#   passadas, vista acima do limiar ao menos 1x no proprio pixel e
+#   soma das 3 probabilidades >= _INK_VOTE_E3_CORE_MIN_SUM (6.539 px
+#   e contencao 0,904 na regua). A uniao de tudo que foi visto acima
+#   do limiar nessas passadas vira "conteudo velho" da geracao.
+# - Fase 2: so entra tinta de componente conexo NOVO — componente
+#   (acima do limiar, area >= _INK_VOTE_E3_MIN_COMPONENT_PX) com
+#   menos de metade da area sobre o conteudo velho dilatado e fora
+#   das trilhas ja abertas. Componente sobre o velho e absorvido
+#   pelo velho (copia deslocada e franja nunca abrem trilha). A
+#   regiao do componente novo (dilatada) abre uma trilha lateral
+#   onde so a evidencia da regiao vota, com persistencia
+#   consecutiva estrita dividida por tamanho: componente grande
+#   (>= _INK_VOTE_E3_BIG_COMPONENT_PX) confirma com
+#   _INK_VOTE_E3_BIG_WINDOW passadas consecutivas acima do limiar e
+#   soma >= _INK_VOTE_E3_BIG_SCORE; componente pequeno confirma com
+#   _INK_VOTE_E3_SMALL_WINDOW e soma >= _INK_VOTE_E3_SMALL_SCORE.
+# Custos medidos da F89, assumidos: o canvas final cobre menos da
+# tinta de cada passada que o da regra atual (completude 0,308 x
+# 0,634 no prototipo offline — a regua formal e da frente 90);
+# marca pequena confirma devagar (trilha lenta); conteudo das 3
+# primeiras passadas fora do nucleo e "velho" pra sempre na
+# geracao. Atras de DRAW_INK_VOTE_E3 (padrao 0): com a flag
+# desligada o acumulador roda a regra atual sem tocar em nenhum
+# estado da E3. A flag e LIDA UMA VEZ por geracao (na primeira
+# passada apos o reset): trocar a variavel no meio da geracao nao
+# mistura as duas regras no mesmo canvas.
+_INK_VOTE_E3_ENV = "DRAW_INK_VOTE_E3"
+_INK_VOTE_E3_PHASE1_PASSES = 3
+_INK_VOTE_E3_CORE_MIN_SUM = 1.0
+_INK_VOTE_E3_MIN_COMPONENT_PX = 20
+_INK_VOTE_E3_BIG_COMPONENT_PX = 100
+_INK_VOTE_E3_BIG_WINDOW = 3
+_INK_VOTE_E3_BIG_SCORE = 2.1
+_INK_VOTE_E3_SMALL_WINDOW = 5
+_INK_VOTE_E3_SMALL_SCORE = 3.5
+_INK_VOTE_E3_DILATE_KERNEL = cv2.getStructuringElement(
+    cv2.MORPH_ELLIPSE,
+    (2 * _INK_FRONTIER_RADIUS + 1, 2 * _INK_FRONTIER_RADIUS + 1),
+)
+_INK_VOTE_E3_REGION_KERNEL = cv2.getStructuringElement(
+    cv2.MORPH_ELLIPSE, (13, 13)
+)
+
+
+def _ink_vote_e3_enabled():
+    value = os.environ.get(_INK_VOTE_E3_ENV, "0").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _e3_phase1_core(maps, threshold):
+    """Nucleo de consenso espacial das primeiras passadas (F89).
+
+    Confirma o pixel que tem tinta (prob > limiar) a
+    <= _INK_FRONTIER_RADIUS px em TODAS as passadas da fase 1, foi
+    visto acima do limiar ao menos uma vez no proprio pixel e cuja
+    soma de probabilidades na fase chega a _INK_VOTE_E3_CORE_MIN_SUM.
+    """
+    total = maps[0].copy()
+    for item in maps[1:]:
+        np.add(total, item, out=total)
+    hits = np.zeros(maps[0].shape, dtype=np.int32)
+    neighbours = np.zeros(maps[0].shape, dtype=np.int32)
+    for item in maps:
+        ink = item > threshold
+        np.add(hits, ink, out=hits)
+        np.add(
+            neighbours,
+            cv2.dilate(ink.astype(np.uint8), _INK_VOTE_E3_DILATE_KERNEL) > 0,
+            out=neighbours,
+        )
+    return (
+        (neighbours >= len(maps))
+        & (hits >= 1)
+        & (total >= _INK_VOTE_E3_CORE_MIN_SUM)
+    )
+
+
+class _E3SideVote:
+    """Voto estrito de uma trilha lateral da E3 (bancada da F89).
+
+    Janela deslizante das ultimas `window` passadas ALIMENTADAS (a
+    trilha so e alimentada nas passadas em que a regiao dela
+    existe); o pixel confirma quando foi visto acima do limiar em
+    TODAS as passadas da janela cheia e a soma chega a min_score —
+    persistencia consecutiva, sem a janela sobreposta da regra
+    principal. A porta de fronteira e a mesma da regra principal
+    (kernel quadrado de _INK_FRONTIER_RADIUS sobre visto u
+    confirmado da trilha): dentro do ombro, so confirma quem a
+    janela viu acima do limiar.
+    """
+
+    def __init__(self, window, min_score, threshold):
+        self._window_len = int(window)
+        self._min_score = float(min_score)
+        self._threshold = float(threshold)
+        self.reset()
+
+    def reset(self):
+        self._maps = deque(maxlen=self._window_len)
+        self._confirmed = None
+
+    def migrate(self, matrix, size):
+        if self._confirmed is None:
+            return
+        self._confirmed = (
+            cv2.warpPerspective(
+                self._confirmed.astype(np.uint8),
+                matrix,
+                size,
+                flags=cv2.INTER_NEAREST,
+                borderValue=0,
+            )
+            > 0
+        )
+        self._maps = deque(
+            (
+                cv2.warpPerspective(
+                    item, matrix, size, flags=cv2.INTER_LINEAR, borderValue=0.0
+                )
+                for item in self._maps
+            ),
+            maxlen=self._window_len,
+        )
+
+    def add(self, prob):
+        if self._confirmed is None or self._confirmed.shape != prob.shape:
+            self._confirmed = np.zeros(prob.shape, dtype=bool)
+            self._maps.clear()
+        self._maps.append(prob.copy())
+        maps = list(self._maps)
+        score = maps[0].copy()
+        for item in maps[1:]:
+            np.add(score, item, out=score)
+        hits = (maps[0] > self._threshold).astype(np.int32)
+        for item in maps[1:]:
+            np.add(hits, item > self._threshold, out=hits)
+        seen = hits > 0
+        rule = (hits >= self._window_len) & (score >= self._min_score)
+        if np.any(rule):
+            anchor = seen | self._confirmed
+            near_anchor = (
+                cv2.dilate(anchor.astype(np.uint8), _INK_FRONTIER_KERNEL) > 0
+            )
+            rule &= seen | ~near_anchor
+        self._confirmed |= rule
+        return self._confirmed
+
+
 # Registro da evidencia na geometria ancora da geracao (medido
 # na regua desta frente, 2026-11-05, draw-lab/parallel-2026-11-05/
 # repassada): o acumulador vive numa grade fixa da pagina, mas a
@@ -747,6 +906,110 @@ class _LayeredInkAccumulator:
         self._score_buf = None
         self._hits_buf = None
         self._seen_buf = None
+        # Regra E3 (DRAW_INK_VOTE_E3): o modo da geracao e decidido
+        # na primeira passada apos o reset (None = nao decidido) e
+        # todo o estado da regra zera junto com o da geracao — uma
+        # geracao nova nao herda nucleo, uniao velha nem trilhas.
+        self._e3_active = None
+        self._reset_e3_state()
+
+    def _reset_e3_state(self):
+        self._e3_passes = 0
+        self._e3_phase1_maps = []
+        self._e3_old_union = None
+        self._e3_region_big = None
+        self._e3_region_small = None
+        self._e3_side_big = _E3SideVote(
+            _INK_VOTE_E3_BIG_WINDOW, _INK_VOTE_E3_BIG_SCORE, self.threshold
+        )
+        self._e3_side_small = _E3SideVote(
+            _INK_VOTE_E3_SMALL_WINDOW, _INK_VOTE_E3_SMALL_SCORE, self.threshold
+        )
+        self._e3_tracks_big = 0
+        self._e3_tracks_small = 0
+
+    def _e3_step(self, evidence):
+        """Uma passada da regra E3; devolve a mascara confirmada.
+
+        Porto fiel da bancada vencedora da F89 (CommitE3): fase 1
+        confirma o nucleo de consenso espacial ao fechar a 3a
+        passada; fase 2 classifica cada componente conexo novo
+        contra a uniao velha dilatada e as regioes ja abertas
+        (fracoes medidas contra os instantaneos do inicio da
+        passada, como na bancada) e alimenta as trilhas por
+        tamanho com a evidencia mascarada pela regiao.
+        """
+        shape = evidence.shape
+        if self._e3_old_union is None or self._e3_old_union.shape != shape:
+            self._e3_old_union = np.zeros(shape, dtype=bool)
+            self._e3_region_big = np.zeros(shape, dtype=bool)
+            self._e3_region_small = np.zeros(shape, dtype=bool)
+            self._e3_phase1_maps = []
+            self._e3_passes = 0
+            self._e3_side_big.reset()
+            self._e3_side_small.reset()
+            self._e3_tracks_big = 0
+            self._e3_tracks_small = 0
+        ink = evidence > self.threshold
+        confirmed = self._confirmed > 0
+        if self._e3_passes < _INK_VOTE_E3_PHASE1_PASSES:
+            self._e3_phase1_maps.append(evidence.copy())
+            self._e3_old_union |= ink
+            if self._e3_passes == _INK_VOTE_E3_PHASE1_PASSES - 1:
+                confirmed = confirmed | _e3_phase1_core(
+                    self._e3_phase1_maps, self.threshold
+                )
+            self._e3_passes += 1
+            return confirmed
+        old_dilated = (
+            cv2.dilate(
+                self._e3_old_union.astype(np.uint8), _INK_VOTE_E3_DILATE_KERNEL
+            )
+            > 0
+        )
+        regions = self._e3_region_big | self._e3_region_small
+        regions_dilated = (
+            cv2.dilate(regions.astype(np.uint8), _INK_VOTE_E3_DILATE_KERNEL) > 0
+        )
+        count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+            ink.astype(np.uint8), 8
+        )
+        for index in range(1, count):
+            area = int(stats[index, cv2.CC_STAT_AREA])
+            if area < _INK_VOTE_E3_MIN_COMPONENT_PX:
+                continue
+            component = labels == index
+            frac_old = float(np.count_nonzero(component & old_dilated) / area)
+            frac_region = float(
+                np.count_nonzero(component & regions_dilated) / area
+            )
+            if frac_old >= 0.5:
+                self._e3_old_union |= component
+            elif frac_region < 0.5:
+                dilated = (
+                    cv2.dilate(
+                        component.astype(np.uint8), _INK_VOTE_E3_REGION_KERNEL
+                    )
+                    > 0
+                )
+                if area >= _INK_VOTE_E3_BIG_COMPONENT_PX:
+                    self._e3_region_big |= dilated
+                    self._e3_tracks_big += 1
+                else:
+                    self._e3_region_small |= dilated
+                    self._e3_tracks_small += 1
+        if np.any(self._e3_region_big):
+            masked = np.where(self._e3_region_big, evidence, 0.0).astype(
+                np.float32
+            )
+            confirmed = confirmed | self._e3_side_big.add(masked)
+        if np.any(self._e3_region_small):
+            masked = np.where(self._e3_region_small, evidence, 0.0).astype(
+                np.float32
+            )
+            confirmed = confirmed | self._e3_side_small.add(masked)
+        self._e3_passes += 1
+        return confirmed
 
     def migrate(self, matrix):
         """Re-projeta todo o estado da geracao para outra grade.
@@ -787,6 +1050,29 @@ class _LayeredInkAccumulator:
         self._hits_buf = None
         self._seen_buf = None
         self._low_overlap_streak = 0
+        if self._e3_active:
+            # Estado da E3 acompanha a grade: mascaras por vizinho
+            # mais proximo, mapas de evidencia/trilha bilineares —
+            # o mesmo tratamento do resto do estado da geracao.
+            if self._e3_old_union is not None:
+                self._e3_old_union = nearest(
+                    self._e3_old_union.astype(np.uint8)
+                ) > 0
+                self._e3_region_big = nearest(
+                    self._e3_region_big.astype(np.uint8)
+                ) > 0
+                self._e3_region_small = nearest(
+                    self._e3_region_small.astype(np.uint8)
+                ) > 0
+                self._e3_phase1_maps = [
+                    cv2.warpPerspective(
+                        item, matrix, size,
+                        flags=cv2.INTER_LINEAR, borderValue=0.0,
+                    )
+                    for item in self._e3_phase1_maps
+                ]
+                self._e3_side_big.migrate(matrix, size)
+                self._e3_side_small.migrate(matrix, size)
 
     def _window_stats(self):
         """(soma, hits, visto-como-tinta) da janela, sem empilhar.
@@ -835,6 +1121,12 @@ class _LayeredInkAccumulator:
             self._window.clear()
             self._low_overlap_streak = 0
             self._turn_fired = False
+            self._e3_active = None
+            self._reset_e3_state()
+        if self._e3_active is None:
+            # A regra da geracao decide na primeira passada e nao
+            # muda no meio dela (ver _INK_VOTE_E3_ENV).
+            self._e3_active = _ink_vote_e3_enabled()
         confirmed_before = self._confirmed > 0
         canvas_before = int(np.count_nonzero(self._confirmed))
         # Oclusao: pixel que a passada nao pode ver (a mao sobre a
@@ -877,27 +1169,35 @@ class _LayeredInkAccumulator:
                 else:
                     self._low_overlap_streak = 0
         self._window.append(evidence.copy())
-        score, hits, seen_as_ink = self._window_stats()
-        confirmed_rule = (score >= _INK_VOTE_SCORE_STRONG) | (
-            (hits >= _INK_VOTE_MIN_HITS) & (score >= _INK_VOTE_SCORE)
-        )
-        if np.any(confirmed_rule):
-            # Porta de fronteira (ver _INK_FRONTIER_RADIUS):
-            # dentro da faixa do ombro da tinta (confirmada ou
-            # vista acima do limiar nesta janela), so confirma
-            # quem alguma passada viu como tinta; a soma
-            # sub-limiar das copias deslocadas nao engrossa o
-            # traco nem poe camada nova sobre ele.
-            anchor = seen_as_ink | confirmed_before
-            near_anchor = (
-                cv2.dilate(
-                    anchor.astype(np.uint8),
-                    _INK_FRONTIER_KERNEL,
-                )
-                > 0
+        if self._e3_active:
+            # Regra E3 (DRAW_INK_VOTE_E3): a confirmacao sai de
+            # _e3_step; o "visto" da camada provisoria segue sendo a
+            # janela corrente, como na regra principal — a E3 muda
+            # quem confirma, nao o que a tela mostra como tinta nova.
+            _score, _hits, seen_as_ink = self._window_stats()
+            new_confirmed = self._e3_step(evidence) & ~confirmed_before
+        else:
+            score, hits, seen_as_ink = self._window_stats()
+            confirmed_rule = (score >= _INK_VOTE_SCORE_STRONG) | (
+                (hits >= _INK_VOTE_MIN_HITS) & (score >= _INK_VOTE_SCORE)
             )
-            confirmed_rule &= seen_as_ink | ~near_anchor
-        new_confirmed = confirmed_rule & ~confirmed_before
+            if np.any(confirmed_rule):
+                # Porta de fronteira (ver _INK_FRONTIER_RADIUS):
+                # dentro da faixa do ombro da tinta (confirmada ou
+                # vista acima do limiar nesta janela), so confirma
+                # quem alguma passada viu como tinta; a soma
+                # sub-limiar das copias deslocadas nao engrossa o
+                # traco nem poe camada nova sobre ele.
+                anchor = seen_as_ink | confirmed_before
+                near_anchor = (
+                    cv2.dilate(
+                        anchor.astype(np.uint8),
+                        _INK_FRONTIER_KERNEL,
+                    )
+                    > 0
+                )
+                confirmed_rule &= seen_as_ink | ~near_anchor
+            new_confirmed = confirmed_rule & ~confirmed_before
         new_confirmed_px = int(np.count_nonzero(new_confirmed))
         if new_confirmed_px:
             self._confirmed[new_confirmed] = 255
@@ -917,7 +1217,7 @@ class _LayeredInkAccumulator:
         self._provisional_ever |= provisional_now
         provisional_changed = bool(np.any(provisional_now != previous_provisional))
         self._provisional = np.where(provisional_now, 255, 0).astype(np.uint8)
-        return {
+        result = {
             "confirmed": self._confirmed.copy(),
             "provisional": self._provisional.copy(),
             "confirmed_changed": new_confirmed_px > 0,
@@ -929,6 +1229,14 @@ class _LayeredInkAccumulator:
             "retracted_px_total": int(np.count_nonzero(self._retracted_ever)),
             "turn": turn,
         }
+        if self._e3_active:
+            # Telemetria da E3: so existe com a flag ligada, como os
+            # demais mecanismos atras de flag deste arquivo.
+            result["ink_vote_e3"] = True
+            result["ink_vote_e3_passes"] = self._e3_passes
+            result["ink_vote_e3_tracks_big"] = self._e3_tracks_big
+            result["ink_vote_e3_tracks_small"] = self._e3_tracks_small
+        return result
 
 
 # Tamanho dos historicos de telemetria da trabalhadora: registros
@@ -2526,6 +2834,16 @@ class _PageCleanWorker:
                 # veredito de identidade.
                 visible = np.zeros(prob.shape, dtype=bool)
             result = self._accumulator.add(prob, visible)
+            if result.get("ink_vote_e3"):
+                # Telemetria da regra E3 (so com DRAW_INK_VOTE_E3
+                # ligada): fase da geracao e trilhas abertas.
+                reg_info["ink_vote_e3_passes"] = result["ink_vote_e3_passes"]
+                reg_info["ink_vote_e3_tracks_big"] = result[
+                    "ink_vote_e3_tracks_big"
+                ]
+                reg_info["ink_vote_e3_tracks_small"] = result[
+                    "ink_vote_e3_tracks_small"
+                ]
             if (
                 result["confirmed_changed"]
                 or result["provisional_changed"]
