@@ -26,6 +26,12 @@ from . import ink as ink_module
 from . import neural as neural_module
 from . import paper as paper_module
 from .ink_layers import _render_layered_canvas
+from .lk_propagate import (
+    LK_MAX_PROP_STEPS,
+    LkUpdateGate,
+    ReseededQuadPropagator,
+    lk_propagate_enabled,
+)
 from .sheet_track import _SheetTracker, _lk_track_corners
 
 
@@ -254,6 +260,22 @@ class SheetInkLoop:
         self.detect_settled_skipped = 0
         self.detect_settled_triggers = 0
         self.ink_reuse_passes = 0
+        # Propagacao LK do quad (frente 105, so com a flag
+        # DRAW_SHEET_LK_PROPAGATE ligada): propagador resemeado,
+        # portao anti-flip dos updates, ultima saida propagada,
+        # cinza do quadro anterior e o pedido de redeteccao
+        # imediata quando um passo morre. Com a flag desligada
+        # nada disto e tocado e os contadores ficam zerados.
+        self._lk_prop = ReseededQuadPropagator()
+        self._lk_gate = LkUpdateGate()
+        self._lk_prev_gray = None
+        self._lk_last_output = None
+        self._lk_needs_redetect = False
+        self.lk_propagated_passes = 0
+        self.lk_deaths = 0
+        self.lk_redetect_requests = 0
+        self.lk_forced_updates = 0
+        self.lk_last_gate_event = None
 
     def _settled_skip_applies(self, frame, settled_every):
         """True quando esta oportunidade de deteccao pode saltar.
@@ -349,9 +371,39 @@ class SheetInkLoop:
         # no bloco da tinta, pelo efeito da deteccao no quad
         # mediano — ver _SETTLED_INK_MOVE_PX. Aqui so o agendamento.
         settled_every = detect_settled_every()
+        # Propagacao LK (frente 105): com a flag ligada, a morte de
+        # um passo ou o teto periodico de passos propagados forçam
+        # a deteccao nesta oportunidade, por cima do intervalo do
+        # rastreador e do salto da cadencia assentada — e o desenho
+        # da frente 100 (redeteccao imediata + teto N=3-5) que tira
+        # o intervalo cego pos-morte. Desligada, nada muda.
+        lk_enabled = lk_propagate_enabled()
+        lk_gray_now = self._to_gray(frame) if lk_enabled else None
+        lk_force_detect = bool(
+            lk_enabled
+            and self.tracker.corners is not None
+            and (
+                self._lk_needs_redetect
+                or (
+                    self._lk_prop.alive
+                    and self._lk_prop.steps_since_anchor >= LK_MAX_PROP_STEPS
+                )
+                or (
+                    self._lk_prop.alive
+                    and self._lk_prop.last_loss is not None
+                    and self._lk_prop.last_loss > 0.6
+                )
+            )
+        )
         skipped_opportunity = False
-        if self.tracker.should_detect(self.frame_number):
-            if settled_every and self._settled_skip_applies(frame, settled_every):
+        if self.tracker.should_detect(self.frame_number) or lk_force_detect:
+            if lk_force_detect:
+                self.lk_forced_updates += 1
+            if (
+                settled_every
+                and not lk_force_detect
+                and self._settled_skip_applies(frame, settled_every)
+            ):
                 self._det_skip_left -= 1
                 self.detect_settled_skipped += 1
                 skipped_opportunity = True
@@ -456,6 +508,12 @@ class SheetInkLoop:
             self._det_stable_streak = 0
             self._det_skip_left = 0
             self._det_ref_small = None
+            # A propagacao morre com a folha: ancora e pendente do
+            # portao nao vazam para a proxima folha (frente 105).
+            self._lk_prop.reset()
+            self._lk_gate.reset()
+            self._lk_last_output = None
+            self._lk_needs_redetect = False
             self.ink_session_open = False
             self.session_corners = None
             self.freeze_pending = False
@@ -693,6 +751,68 @@ class SheetInkLoop:
                         self.legacy_generation, self.accumulated_canvas
                     )
 
+        # Propagacao LK do quad (frente 105, so com
+        # DRAW_SHEET_LK_PROPAGATE=1): nos quadros COM deteccao, o
+        # quad confirmado do rastreador e o UPDATE do propagador —
+        # passa pelo portao anti-flip da frente 97 contra a ultima
+        # saida (segurado 1 ciclo se saltar > 50 px com a
+        # propagacao viva; confirmado se a deteccao seguinte pousar
+        # a <= 25 px do pendente). Aceito, re-ancora o propagador
+        # resemeado. Nos quadros SEM deteccao, o propagador avanca
+        # um passo e o quad propagado alimenta a passada de tinta
+        # deste quadro (quadro novo, geometria propagada), ate o
+        # teto LK_MAX_PROP_STEPS; passo que morre nao passa tinta e
+        # arma a redeteccao imediata da proxima oportunidade. A
+        # propagacao nunca cria folha: sem sessao aberta ou sem
+        # quad confirmado, nada acontece. Com as duas flags, a
+        # passada propagada tem precedencia sobre o reuso congelado
+        # da frente 93 (geometria viva x mediana congelada); o reuso
+        # cobre os quadros em que a propagacao nao anda (morta ou
+        # no teto).
+        lk_pass_done = False
+        if lk_enabled:
+            if (
+                ran_detection
+                and self.ink_worker is not None
+                and self.ink_session_open
+                and self.tracker.corners is not None
+            ):
+                gate_event, accepted = self._lk_gate.feed(
+                    self.tracker.corners,
+                    self._lk_last_output,
+                    self._lk_prop.alive,
+                )
+                self.lk_last_gate_event = gate_event
+                if accepted:
+                    self._lk_prop.anchor(self.tracker.corners)
+                    self._lk_last_output = np.asarray(
+                        self.tracker.corners, dtype=np.float64
+                    ).copy()
+                    self._lk_needs_redetect = False
+            elif (
+                not ran_detection
+                and self.ink_worker is not None
+                and self.ink_session_open
+                and self.tracker.corners is not None
+                and self._lk_prop.alive
+                and self._lk_prev_gray is not None
+                and self._lk_prop.steps_since_anchor < LK_MAX_PROP_STEPS
+            ):
+                propagated = self._lk_prop.step(self._lk_prev_gray, lk_gray_now)
+                self.lk_deaths = self._lk_prop.deaths
+                if propagated is None:
+                    if not self._lk_needs_redetect:
+                        self.lk_redetect_requests += 1
+                    self._lk_needs_redetect = True
+                else:
+                    self._lk_last_output = propagated.copy()
+                    self._warp_and_submit_ink(
+                        frame, propagated.astype(np.float32)
+                    )
+                    self.lk_propagated_passes += 1
+                    lk_pass_done = True
+            self._lk_prev_gray = lk_gray_now
+
         # Passada de REUSO da cadencia assentada (frente 93, so com
         # DRAW_SHEET_DETECT_SETTLED_EVERY >= 2): oportunidade de
         # deteccao que o salto pulou e nenhum resultado chegou neste
@@ -706,6 +826,7 @@ class SheetInkLoop:
         if (
             skipped_opportunity
             and not ran_detection
+            and not lk_pass_done
             and self.ink_worker is not None
             and self.ink_session_open
             and self.tracker.corners is not None
