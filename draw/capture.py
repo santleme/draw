@@ -8,12 +8,26 @@ o desfecho da ultima abertura fica em _LAST_OPEN_PROBE, para o
 cabecalho do relatorio de sessao. O escritor de PNG drena a fila
 em thread propria para o salvamento nunca travar o laco.
 
+O slot unico resolve a fila do lado do app, mas nao a fila do
+DRIVER: o read() desempilha FIFO o que o V4L2/usbipd empilhou
+(profundidade 4 medida na mesa do Lucas, 2026-10-31 — ate
+200-300 ms de quadro velho), e o CAP_PROP_BUFFERSIZE=1 da abertura
+e so um pedido, que o backend pode ignorar em silencio. Atras de
+DRAW_CAPTURE_DRAIN_LATEST=1 (frente 95, padrao desligado) a thread
+drena essa fila com grab() — que transfere o quadro comprimido sem
+decodificar — e so paga o retrieve() (o decode MJPG) quando ha
+consumidor esperando e o grab e fresco (bloqueou de verdade);
+quadro de fila acumulada e aposentado sem decode: a fila do driver
+anda na velocidade do grab, nao na do decode, e quadro velho morre
+contado em `capture_drained` em vez de ser servido como presente.
+
 Extraido de draw/app.py na modularizacao de 2026-11-05; o app
 re-exporta todos os nomes deste modulo.
 """
 
 import glob
 import os
+from collections import deque
 import queue
 import sys
 import threading
@@ -36,8 +50,53 @@ _CAPTURE_MAX_FAILURES = 15
 _READ_RETRY_SECONDS = 0.005
 
 
+# Drenagem da fila do driver (frente 95): com
+# DRAW_CAPTURE_DRAIN_LATEST=1 a thread de captura usa grab()/
+# retrieve() em vez de read() — ver o cabecalho do modulo e o
+# docstring de _LatestFrameCapture. Padrao desligado: sem a
+# variavel, o caminho e o read() de sempre, byte a byte.
+_CAPTURE_DRAIN_ENV = "DRAW_CAPTURE_DRAIN_LATEST"
+
+
+def capture_drain_latest_enabled():
+    """True so com DRAW_CAPTURE_DRAIN_LATEST=1 (default: desligado)."""
+    return os.environ.get(_CAPTURE_DRAIN_ENV, "").strip() == "1"
+
+
+# Espera minima de um grab pra o quadro contar como FRESCO na
+# drenagem. grab() sobre fila acumulada volta de imediato (o quadro
+# ja estava la, velho); grab() sobre fila vazia bloqueia ate o
+# proximo quadro da camera — e esse quadro acabou de nascer. O
+# corte fica muito abaixo do menor periodo pedido (30 fps =
+# 33 ms) e acima do custo de transferencia de um grab (~1 ms):
+# fonte muito acima de ~200 fps poderia aposentar quadro fresco,
+# mas a abertura pede 30 fps e a mesa mediu 13-30.
+_DRAIN_FRESH_WAIT_SECONDS = 0.005
+
+
+# Espera longa demais pra um grab "fresco" ser inocente: ou a
+# camera engasgou (e o quadro que chegou no fim da espera e
+# fresco mesmo) ou o servico atrasou com a fila enchendo atras
+# (e o quadro desempilhado e a cabeca velha da fila). Os dois
+# casos se distinguem com UM grab de sondagem: se ele volta de
+# imediato, havia fila — o suspeito era velho. O corte e
+# adaptativo: 1,8x a mediana das ultimas esperas frescas (a
+# espera fresca normal e o resto do periodo da fonte), com piso
+# de 100 ms — acima do maior periodo medido na mesa (77 ms a
+# 13 fps) e abaixo do atraso de servico que enche a fila
+# (~150 ms na bancada). Fonte lenta (5 fps, espera normal de
+# ~200 ms) eleva o corte sozinha e nunca vira suspeita.
+_DRAIN_SUSPECT_FLOOR_SECONDS = 0.100
+_DRAIN_SUSPECT_PERIOD_FACTOR = 1.8
+_DRAIN_FRESH_WAITS_KEPT = 8
+
+
 # Teto da espera pela drenagem da fila de PNG na saida do app.
 _PNG_DRAIN_SECONDS = 5.0
+
+
+class _DrainStop(Exception):
+    """Encerra a bomba de drenagem sem erro (stop ou fonte morta)."""
 
 
 class _LatestFrameCapture:
@@ -53,6 +112,42 @@ class _LatestFrameCapture:
     consumidor pega sempre o mais novo, e e isso que tira o teto da
     latencia de captura.
 
+    Isso vale pro slot do app. A fila do DRIVER continua FIFO: se a
+    thread atrasa (decode MJPG dentro do read(), contencao de GIL
+    com o laco), o read() serve os quadros empilhados do mais velho
+    pro mais novo, um decode por vez, e o consumidor acordado no
+    primeiro da rajada pega quadro ja velho — a classe de
+    200-300 ms medida na mesa (fila de profundidade 4). O modo de
+    drenagem (DRAW_CAPTURE_DRAIN_LATEST=1, frente 95) ataca essa
+    camada com tres regras, todas na thread da bomba (grab e
+    retrieve nunca concorrem):
+
+    1. grab() sem parar: grab transfere o quadro comprimido da
+       fila do driver pro buffer interno, sem decode — a fila do
+       driver anda na velocidade da transferencia, nao na do
+       decode MJPG, e nao enche enquanto o consumidor processa.
+    2. retrieve() (o decode) so roda quando ha consumidor
+       esperando quadro novo (o wait_next anuncia em _want_frame)
+       e so sobre um grab FRESCO: se o grab voltou de imediato
+       (esperou menos que _DRAIN_FRESH_WAIT_SECONDS), o quadro
+       saiu da fila acumulada — e velho por construcao — e e
+       aposentado sem decode, contado em `drained`; o proximo
+       grab que bloquear de verdade traz o quadro do presente.
+       Grab fresco com espera longa demais pra cadencia medida
+       (suspeito: engasgo de camera ou servico atrasado com fila
+       atras) so publica apos um grab de sondagem — imediato,
+       os dois eram fila; bloqueado, a sonda e o quadro fresco
+       publicado e o suspeito se aposenta. Sem consumidor
+       esperando, nenhum decode e pago: cada grab novo aposenta
+       o anterior, tambem contado em `drained`.
+    3. O carimbo de captura nasce no grab vencedor: e o instante
+       em que o quadro chegou ao app, antes do decode.
+
+    Fonte sem grab/retrieve (fakes, backends exoticos) cai pro
+    caminho read() mesmo com a flag ligada, e `drain_active` diz
+    qual caminho rodou. Com a flag desligada, nada disto existe:
+    o laco da bomba e o read() de sempre.
+
     Falha de leitura tem um equivalente declarado do comportamento
     antigo. O laco antigo contava as falhas seguidas de read() e, com
     _CAPTURE_MAX_FAILURES, imprimia o aviso e saia; abaixo do limite,
@@ -62,10 +157,19 @@ class _LatestFrameCapture:
     imprime o mesmo aviso e sai. Abaixo do limite, nenhum quadro novo
     chega e o consumidor fica bloqueado na espera: janela congelada e
     teclas sem resposta, como antes. Uma leitura boa zera a contagem.
+    No modo drenagem, grab() falso e retrieve() falso contam na
+    mesma contagem, com o mesmo limite e o mesmo desfecho.
     """
 
-    def __init__(self, capture):
+    def __init__(self, capture, drain_latest=None):
         self._capture = capture
+        if drain_latest is None:
+            drain_latest = capture_drain_latest_enabled()
+        self._drain_active = bool(
+            drain_latest
+            and callable(getattr(capture, "grab", None))
+            and callable(getattr(capture, "retrieve", None))
+        )
         self._condition = threading.Condition()
         self._thread = threading.Thread(
             target=self._pump, name="draw-capture", daemon=True
@@ -79,6 +183,20 @@ class _LatestFrameCapture:
         self._dead = False
         self._stopped = False
         self._error = None
+        # Estado do modo drenagem: o grab mais recente ainda nao
+        # decodificado, quantos grabs chegaram e quantos foram
+        # ultrapassados sem decode (a fila do driver drenada).
+        # _want_frame e o anuncio do wait_next: ha consumidor
+        # esperando quadro novo, entao o proximo grab fresco vale
+        # um decode; fora da espera, grab nao vira retrieve.
+        self._grabbed_total = 0
+        self._grabbed_ms = 0
+        self._grabbed_pending = False
+        self._drained = 0
+        self._want_frame = False
+        # Ultimas esperas de grabs frescos (segundos): a mediana
+        # delas alimenta o corte adaptativo de grab suspeito.
+        self._fresh_waits = deque(maxlen=_DRAIN_FRESH_WAITS_KEPT)
 
     def start(self):
         self._thread.start()
@@ -91,7 +209,10 @@ class _LatestFrameCapture:
         # visivel tem de ser o mesmo das falhas de read(): fonte
         # morta, aviso na janela e saida limpa.
         try:
-            self._pump_loop()
+            if self._drain_active:
+                self._pump_loop_drain()
+            else:
+                self._pump_loop()
         except Exception as error:  # noqa: BLE001 - vai para o aviso
             with self._condition:
                 self._error = error
@@ -130,6 +251,169 @@ class _LatestFrameCapture:
                         return
                 time.sleep(_READ_RETRY_SECONDS)
 
+    def _note_failure_locked(self):
+        """Conta uma falha seguida (condicao ja adquirida).
+
+        Devolve True quando o limite declara a fonte morta — quem
+        chama acorda os esperantes e encerra a bomba. Compartilhado
+        pelos dois lacos: read() falso, grab() falso e retrieve()
+        falso tem o mesmo limite e o mesmo desfecho.
+        """
+        self._failures += 1
+        if self._failures >= _CAPTURE_MAX_FAILURES:
+            self._dead = True
+            self._condition.notify_all()
+            return True
+        return False
+
+    def _drain_grab_once(self):
+        """Um grab cronometrado, com a contagem de falhas da casa.
+
+        Devolve (espera_s, carimbo_ms) num grab bom; None numa
+        falha ja contada (o laco tenta de novo). Levanta
+        _DrainStop quando a bomba tem de encerrar (stop() ou
+        fonte morta declarada).
+        """
+        with self._condition:
+            if self._stopped:
+                raise _DrainStop
+        grab_started = time.monotonic()
+        if not self._capture.grab():
+            with self._condition:
+                if self._stopped or self._note_failure_locked():
+                    raise _DrainStop
+            time.sleep(_READ_RETRY_SECONDS)
+            return None
+        return (
+            time.monotonic() - grab_started,
+            int(time.monotonic() * 1000),
+        )
+
+    def _drain_suspect_threshold(self):
+        # Condicao ja adquirida. Sem nenhuma espera fresca medida
+        # ainda, nada e suspeito: o primeiro grab da sessao nao
+        # tem base de comparacao e publica como no read().
+        if not self._fresh_waits:
+            return None
+        ordered = sorted(self._fresh_waits)
+        median = ordered[len(ordered) // 2]
+        return max(
+            _DRAIN_SUSPECT_FLOOR_SECONDS,
+            _DRAIN_SUSPECT_PERIOD_FACTOR * median,
+        )
+
+    def _drain_note_fresh_locked(self, wait_s):
+        # Condicao ja adquirida: registra a espera de um grab
+        # fresco na janela do corte adaptativo. Um unico valor
+        # fora da curva (o proprio suspeito) nao move a mediana.
+        self._fresh_waits.append(wait_s)
+
+    def _drain_publish_locked(self, frame, stamp_ms):
+        # Condicao ja adquirida. O retrieve decodificou o grab mais
+        # recente desta thread (grab e retrieve moram so aqui).
+        if self._seq > self._taken_seq:
+            self._dropped += 1
+        self._grabbed_pending = False
+        self._seq += 1
+        self._frame = frame
+        self._capture_ms = stamp_ms
+        self._failures = 0
+        self._condition.notify_all()
+
+    def _pump_loop_drain(self):
+        # Laco da drenagem (frente 95): grab() continuo esvazia a
+        # fila do driver na velocidade da transferencia, sem decode.
+        # O retrieve() — o decode MJPG, a parte cara — so roda com
+        # consumidor esperando (_want_frame, ou o primeiro quadro
+        # da sessao) e sobre grab fresco (o que bloqueou de
+        # verdade: quadro que acabou de chegar). Grab imediato =
+        # quadro da fila acumulada: aposenta sem decode. Grab
+        # fresco mas com espera longa demais (suspeito) ganha uma
+        # sondagem antes do decode — ver _DRAIN_SUSPECT_*. Sem
+        # consumidor esperando, todo grab aposenta o anterior.
+        # Aposentados contam em _drained.
+        try:
+            while True:
+                got = self._drain_grab_once()
+                if got is None:
+                    continue
+                grab_wait, grabbed_ms = got
+                with self._condition:
+                    if self._stopped:
+                        return
+                    if self._grabbed_pending:
+                        self._drained += 1
+                    self._grabbed_total += 1
+                    self._grabbed_ms = grabbed_ms
+                    self._grabbed_pending = True
+                    # Sem nada publicado ainda, o primeiro grab
+                    # fresco publica mesmo sem consumidor
+                    # esperando: e o que faz a chegada lenta nao
+                    # perder o quadro inaugural (no read() ele
+                    # sairia na hora) e ja deixa um quadro fresco
+                    # no slot pra primeira espera.
+                    want = self._want_frame or self._seq == 0
+                    fresh = grab_wait >= _DRAIN_FRESH_WAIT_SECONDS
+                    threshold = self._drain_suspect_threshold()
+                    suspect = fresh and threshold is not None and grab_wait >= threshold
+                    if fresh:
+                        # Inclusive o suspeito: a espera dele tambem
+                        # entra na janela, e e ela que ensina o
+                        # corte a nao confundir fonte lenta (5 fps:
+                        # espera normal de ~200 ms) com engasgo.
+                        self._drain_note_fresh_locked(grab_wait)
+                    if want and not fresh:
+                        # O consumidor espera, mas este quadro e
+                        # da fila acumulada: aposenta e vai buscar
+                        # o presente no proximo grab.
+                        self._grabbed_pending = False
+                        self._drained += 1
+                if not want or not fresh:
+                    continue
+                publish_ms = grabbed_ms
+                if suspect:
+                    # Sondagem: um grab a mais desempata engasgo de
+                    # camera (o suspeito era fresco; a sonda
+                    # bloqueia e traz um ainda mais novo, que e o
+                    # publicado) de fila acumulada (a sonda volta
+                    # de imediato: os dois eram velhos).
+                    probe = self._drain_grab_once()
+                    if probe is None:
+                        continue
+                    probe_wait, probe_ms = probe
+                    with self._condition:
+                        if self._stopped:
+                            return
+                        self._grabbed_total += 1
+                        # A sonda substitui o suspeito, que se
+                        # aposenta sem decode nos dois desfechos.
+                        self._drained += 1
+                        self._grabbed_ms = probe_ms
+                        self._grabbed_pending = True
+                        if probe_wait < _DRAIN_FRESH_WAIT_SECONDS:
+                            self._grabbed_pending = False
+                            self._drained += 1
+                            publish_ms = None
+                        else:
+                            self._drain_note_fresh_locked(probe_wait)
+                            publish_ms = probe_ms
+                    if publish_ms is None:
+                        continue
+                ok, frame = self._capture.retrieve()
+                if not ok or frame is None:
+                    with self._condition:
+                        if self._stopped:
+                            return
+                        if self._note_failure_locked():
+                            return
+                    continue
+                with self._condition:
+                    if self._stopped:
+                        return
+                    self._drain_publish_locked(frame, publish_ms)
+        except _DrainStop:
+            return
+
     def wait_next(self, after_seq, timeout=None):
         """Espera um quadro com sequencia maior que after_seq.
 
@@ -138,14 +422,26 @@ class _LatestFrameCapture:
         vence sem quadro novo; quem chama distingue por dead.
         """
         with self._condition:
-            self._condition.wait_for(
-                lambda: self._seq > after_seq or self._dead or self._stopped,
-                timeout=timeout,
-            )
-            if self._seq > after_seq:
-                self._taken_seq = self._seq
-                return self._frame, self._capture_ms, self._seq
-            return None
+            # Anuncia a espera pra bomba de drenagem: com alguem
+            # esperando quadro novo, o proximo grab fresco vale um
+            # decode; sem anuncio, grab nenhum vira retrieve e a
+            # fila do driver drena de graca. No caminho read() o
+            # anuncio nao tem efeito. O anuncio cai em toda saida.
+            waiting = self._seq <= after_seq and not self._dead and not self._stopped
+            if waiting:
+                self._want_frame = True
+            try:
+                self._condition.wait_for(
+                    lambda: self._seq > after_seq or self._dead or self._stopped,
+                    timeout=timeout,
+                )
+                if self._seq > after_seq:
+                    self._taken_seq = self._seq
+                    return self._frame, self._capture_ms, self._seq
+                return None
+            finally:
+                if waiting:
+                    self._want_frame = False
 
     @property
     def dead(self):
@@ -156,6 +452,43 @@ class _LatestFrameCapture:
     def dropped(self):
         with self._condition:
             return self._dropped
+
+    @property
+    def drained(self):
+        """Quadros agarrados e ultrapassados sem decode (drenagem).
+
+        Zero fora do modo drenagem: la nenhum quadro e agarrado.
+        """
+        with self._condition:
+            return self._drained
+
+    @property
+    def grabbed(self):
+        """Total de grabs bem-sucedidos (zero fora da drenagem)."""
+        with self._condition:
+            return self._grabbed_total
+
+    @property
+    def drain_active(self):
+        """True quando a bomba esta no caminho grab/retrieve."""
+        return self._drain_active
+
+    def stats(self):
+        """Contadores para a telemetria de sessao (1 registro/s).
+
+        capture_dropped: publicados substituidos antes do consumo
+        (a fila do slot, os dois modos). capture_drained: quadros
+        que a drenagem aposentou na fila do driver sem decode —
+        fora do modo drenagem fica 0, e capture_grabbed tambem.
+        """
+        with self._condition:
+            return {
+                "capture_seq": self._seq,
+                "capture_dropped": self._dropped,
+                "capture_grabbed": self._grabbed_total,
+                "capture_drained": self._drained,
+                "capture_drain_active": 1 if self._drain_active else 0,
+            }
 
     @property
     def failures(self):

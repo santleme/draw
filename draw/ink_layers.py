@@ -254,6 +254,65 @@ def _ink_vote_e3_enabled():
     return value in {"1", "true", "yes", "on"}
 
 
+# Cadencia ativa por atividade (frente 92): com a flag ligada, a
+# sonda ociosa de _IDLE_PROBE_SECONDS nao governa enquanto a
+# saida do acumulador esta mudando — ver _PageCleanWorker.
+_INK_ACTIVE_CADENCE_ENV = "DRAW_INK_ACTIVE_CADENCE"
+
+
+def _ink_active_cadence_enabled():
+    value = os.environ.get(_INK_ACTIVE_CADENCE_ENV, "0").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+# Corte de latencia voto->canvas (frente 94, 2026-11-12;
+# draw-lab/live-audit-2026-11-10/94-latencia-voto-canvas.md).
+# A medicao da F94 separou o que as F89/F90 mediam fundido: a
+# tinta FORTE ja fica VISIVEL na 1a passada nos dois bracos (a
+# provisoria pinta o que a janela viu acima do limiar), mas so
+# CONFIRMA na 2a (regra atual) ou na 3a/5a (E3: nucleo/trilha
+# grande/trilha pequena); a tinta FRACA canonica (0,55, o lapis
+# do comentario do voto) NAO fica visivel antes de confirmar —
+# a provisoria so mostra o que passou do limiar de tinta (0,7),
+# e a evidencia de hit (>= _INK_VOTE_HIT) nao pintava nada: na
+# regra atual ela surge de supetao na 3a passada, ja confirmada;
+# na E3 nunca surge (componente <= limiar nao abre trilha nem
+# entra no nucleo).
+# O corte que a F94 ENTREGA, atras de DRAW_INK_VOTE_FAST
+# (padrao 0, lida uma vez por geracao junto com a da E3), e so
+# na camada provisoria (exibicao): pixel com
+# >= _INK_VOTE_FAST_PROV_MIN_HITS hits na janela e soma
+# >= _INK_VOTE_FAST_PROV_MIN_SCORE entra na provisoria antes de
+# confirmar — a tinta fraca fica visivel na 2a passada nos dois
+# bracos, em vez de surgir confirmada na 3a (regra atual) ou
+# nunca (E3). A confirmada NAO muda: quem consome canvas
+# (poll) nao ve pixel nenhum a mais, e as reguas de crescimento/
+# contencao/completude ficam byte-identicas nos dois bracos; a
+# provisoria que nao confirma segue retratando ao sair da
+# janela, e a contagem de retratados mede o custo.
+# O corte de CONFIRMACAO (regra forte de 2 passadas — soma
+# >= 1,9, a paridade com _INK_VOTE_SCORE_STRONG — nas trilhas
+# e no nucleo da fase 1 da E3) foi implementado e MEDIDO nesta
+# frente e REPROVADO na regua: crescimento 1,216-1,554x contra
+# o portao de 1,15x em todas as variantes (so trilhas, so
+# nucleo, so trilha grande, soma 1,96, com consenso espacial —
+# a condicao de vizinhanca e vazia na franja, que sempre tem
+# tinta a <= 3 px). O tremor entre passadas vizinhas e
+# correlacionado: 2 passadas fortes consecutivas no mesmo
+# pixel acontecem na franja do flicker, nao so no traco novo.
+# A latencia de confirmacao da E3 esta no piso da evidencia
+# que os portoes permitem; nao ha corte de confirmacao nesta
+# camada sem devolver o crescimento que a E3 eliminou.
+_INK_VOTE_FAST_ENV = "DRAW_INK_VOTE_FAST"
+_INK_VOTE_FAST_PROV_MIN_HITS = 2
+_INK_VOTE_FAST_PROV_MIN_SCORE = 1.0
+
+
+def _ink_vote_fast_enabled():
+    value = os.environ.get(_INK_VOTE_FAST_ENV, "0").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
 def _e3_phase1_core(maps, threshold):
     """Nucleo de consenso espacial das primeiras passadas (F89).
 
@@ -911,6 +970,9 @@ class _LayeredInkAccumulator:
         # todo o estado da regra zera junto com o da geracao — uma
         # geracao nova nao herda nucleo, uniao velha nem trilhas.
         self._e3_active = None
+        # Corte de latencia (DRAW_INK_VOTE_FAST): decidido junto
+        # com o modo E3, na mesma primeira passada da geracao.
+        self._fast_active = None
         self._reset_e3_state()
 
     def _reset_e3_state(self):
@@ -1122,11 +1184,14 @@ class _LayeredInkAccumulator:
             self._low_overlap_streak = 0
             self._turn_fired = False
             self._e3_active = None
+            self._fast_active = None
             self._reset_e3_state()
         if self._e3_active is None:
             # A regra da geracao decide na primeira passada e nao
-            # muda no meio dela (ver _INK_VOTE_E3_ENV).
+            # muda no meio dela (ver _INK_VOTE_E3_ENV). O corte de
+            # latencia da F94 decide junto, na mesma passada.
             self._e3_active = _ink_vote_e3_enabled()
+            self._fast_active = _ink_vote_fast_enabled()
         confirmed_before = self._confirmed > 0
         canvas_before = int(np.count_nonzero(self._confirmed))
         # Oclusao: pixel que a passada nao pode ver (a mao sobre a
@@ -1174,7 +1239,7 @@ class _LayeredInkAccumulator:
             # _e3_step; o "visto" da camada provisoria segue sendo a
             # janela corrente, como na regra principal — a E3 muda
             # quem confirma, nao o que a tela mostra como tinta nova.
-            _score, _hits, seen_as_ink = self._window_stats()
+            score, hits, seen_as_ink = self._window_stats()
             new_confirmed = self._e3_step(evidence) & ~confirmed_before
         else:
             score, hits, seen_as_ink = self._window_stats()
@@ -1203,6 +1268,17 @@ class _LayeredInkAccumulator:
             self._confirmed[new_confirmed] = 255
         confirmed_now = self._confirmed > 0
         provisional_now = seen_as_ink & ~confirmed_now
+        if self._fast_active:
+            # Provisoria rapida (F94, SO exibicao): a evidencia de
+            # hit acumulada (>= 2 hits na janela, soma >= 1,0) pinta
+            # a tinta fraca antes da confirmacao. A confirmada nao
+            # muda — poll() nao ve este pixel; se o voto nao
+            # fechar, a provisoria retrata ao sair da janela, como
+            # qualquer provisoria.
+            provisional_now |= (
+                (hits >= _INK_VOTE_FAST_PROV_MIN_HITS)
+                & (score >= _INK_VOTE_FAST_PROV_MIN_SCORE)
+            ) & ~confirmed_now
         previous_provisional = self._provisional > 0
         if visible is not None:
             # Sem visao nao ha retracao nem estreia: o provisorio
@@ -1236,6 +1312,10 @@ class _LayeredInkAccumulator:
             result["ink_vote_e3_passes"] = self._e3_passes
             result["ink_vote_e3_tracks_big"] = self._e3_tracks_big
             result["ink_vote_e3_tracks_small"] = self._e3_tracks_small
+        if self._fast_active:
+            # Telemetria do corte de latencia (F94): idem, so com
+            # DRAW_INK_VOTE_FAST ligada.
+            result["ink_vote_fast"] = True
         return result
 
 
@@ -1384,6 +1464,18 @@ class _PageCleanWorker:
         # confirmar nada novo.
         self._generation_passes = 0
         self._quiet_passes = 0
+        # Passadas seguidas sem a saida (confirmada ou provisoria)
+        # mudar, contadas SO pelas passadas — nunca zeradas por
+        # set_hand_presence, que o laco chama a cada amostra de
+        # presenca e zeraria o sinal entre passadas. E o sinal que
+        # a cadencia por atividade (frente 92) le; _still_passes
+        # nao serve porque a presenca o zera.
+        self._activity_quiet_passes = 0
+        # Passadas retiradas da fila e descartadas ANTES do modelo
+        # por a geracao ter trocado (ou a trabalhadora ter parado)
+        # entre a retirada e a execucao: custo de modelo poupado,
+        # contado para a telemetria nao confundir com passada.
+        self._telemetry_skipped_stale = 0
         # Relogio de quietude da mao (carimbo monotonico do
         # ultimo movimento/aparicao reportado): o descanso com a
         # mao presente exige a mao parada alem de
@@ -1456,6 +1548,7 @@ class _PageCleanWorker:
             self._still_passes = 0
             self._generation_passes = 0
             self._quiet_passes = 0
+            self._activity_quiet_passes = 0
             self._pending = None
             self._published = None
             self._published_display = None
@@ -1552,6 +1645,20 @@ class _PageCleanWorker:
         propria mao, reportado pela assinatura da mascara.
         Ver _REST_MIN_GENERATION_PASSES/_REST_QUIET_PASSES.
         """
+        if (
+            _ink_active_cadence_enabled()
+            and self._activity_quiet_passes < _NO_HAND_REST_AFTER_STILL_PASSES
+        ):
+            # Com a cadencia por atividade (frente 92), a
+            # quietude so da confirmada nao basta para descansar:
+            # o criterio conta PASSADAS, nao tempo — a 4
+            # passadas/s, 2 passadas quietas sao 0,5 s de cena e
+            # a trabalhadora descansava no meio do desenho lento,
+            # sem evento que a acordasse (submit nao acorda o
+            # descanso). Enquanto a camada provisoria — a tinta
+            # que o usuario ve chegando — mudou dentro da janela
+            # de atividade, a pagina nao assentou.
+            return False
         if self._identity_recovery_requested and self._identity_reference is not None:
             return False
         if (
@@ -1568,6 +1675,28 @@ class _PageCleanWorker:
     def _pass_interval(self):
         if self._at_rest():
             return None
+        if (
+            _ink_active_cadence_enabled()
+            and self._hand_state is False
+            and not self._confirm_once
+            and self._activity_quiet_passes < _NO_HAND_REST_AFTER_STILL_PASSES
+        ):
+            # Cadencia por atividade (frente 92, atras de
+            # DRAW_INK_ACTIVE_CADENCE, default OFF): a sonda
+            # ociosa pressupoe "sem mao, sem tinta nova" — mas
+            # quem desmente o pressuposto e a propria saida: na
+            # sessao viva 1794443693 a confirmada cresceu em
+            # quase toda pasada por geracoes inteiras com o
+            # intervalo travado em 1,0 s (93 de 102 intervalos),
+            # porque o sinal de presenca dizia "sem mao" enquanto
+            # o conteudo mudava. Enquanto a saida mudou nas
+            # ultimas _NO_HAND_REST_AFTER_STILL_PASSES passadas,
+            # a cadencia e a ativa; assentou, a sonda volta. O
+            # sinal e o do acumulador (a mesma familia que o
+            # descanso total usa), nunca diff de quadro. O regime
+            # sem sinal (None) ja tem a regra gemea via
+            # _still_passes, mais abaixo, e nao muda.
+            return _PAGE_CLEAN_INTERVAL_SECONDS
         if self._hand_state is False and not self._confirm_once:
             return _IDLE_PROBE_SECONDS
         if (
@@ -1948,7 +2077,13 @@ class _PageCleanWorker:
         queue_wait_s (submit->inicio da passada; inclui a espera
         da cadencia de _PAGE_CLEAN_INTERVAL_SECONDS), pass_s
         (inicio->fim do modelo) e submit_to_publish_s (submit->
-        fim da passada que decide a publicacao). Na reconciliacao
+        fim da passada que decide a publicacao). Cada registro
+        traz tambem interval_s (o intervalo que governou a espera
+        daquela passada; None na primeira ou na acordada do
+        descanso), hand_state (o sinal de presenca na retirada) e
+        activity_quiet_passes (quietude da saida ao fim da
+        passada) — sem esses tres, o orcamento de cadencia nao
+        distingue sonda ociosa de cadencia ativa (frente 92). Na reconciliacao
         com a orquestracao em camadas, passes conta cada passada
         do modelo e publishes conta so as passadas que publicam
         canvas confirmado novo no poll(). Eventos de identidade de
@@ -1961,6 +2096,7 @@ class _PageCleanWorker:
                 "submits_replaced": self._telemetry_replaced,
                 "passes": self._telemetry_passes,
                 "publishes": self._telemetry_publishes,
+                "passes_skipped_stale": self._telemetry_skipped_stale,
                 "records": [dict(r) for r in self._telemetry_records],
                 "page_identity_events": [
                     dict(event) for event in self._identity_events
@@ -2229,11 +2365,29 @@ class _PageCleanWorker:
         """Retira o pendente e abre a passada (com a Condition na mao)."""
         warped, generation, submitted_at, corners, visible = self._pending
         self._pending = None
+        # Intervalo que governou a espera desta passada (o regime
+        # de cadencia em vigor na retirada, antes de _last_pass_start
+        # andar): vai ao registro de telemetria para o orcamento de
+        # latencia separar espera de cadencia de custo de passada.
+        # None na primeira passada da trabalhadora.
+        scheduled_interval = (
+            self._pass_interval() if self._last_pass_start is not None else None
+        )
+        scheduled_hand_state = self._hand_state
         self._last_pass_start = self._clock()
         pass_started_at = self._last_pass_start
         if self._confirm_once:
             self._confirm_once = False
-        return warped, generation, submitted_at, corners, visible, pass_started_at
+        return (
+            warped,
+            generation,
+            submitted_at,
+            corners,
+            visible,
+            pass_started_at,
+            scheduled_interval,
+            scheduled_hand_state,
+        )
 
     def pump(self):
         """Execucao sincrona (sem thread): roda a passada se ja venceu.
@@ -2259,7 +2413,28 @@ class _PageCleanWorker:
 
     def _run_pass(self, job):
         """Uma passada do modelo + voto. False quando a trabalhadora para."""
-        warped, generation, submitted_at, corners, visible, pass_started_at = job
+        (
+            warped,
+            generation,
+            submitted_at,
+            corners,
+            visible,
+            pass_started_at,
+            scheduled_interval,
+            scheduled_hand_state,
+        ) = job
+        # Geracao trocou (ou a trabalhadora parou) entre a retirada
+        # e a execucao: a passada esta morta antes de nascer — o
+        # pos-modelo a descartaria do mesmo jeito, mas pagando o
+        # custo inteiro do modelo por um resultado que nunca entra
+        # no canvas. Descarta aqui e conta a economia; o desfecho
+        # (True segue, False para) e o mesmo do descarte tardio.
+        with self._condition:
+            if self._stopped:
+                return False
+            if generation != self._generation:
+                self._telemetry_skipped_stale += 1
+                return True
         # Uma excecao do modelo (shape errado, sessao morta, ONNX
         # sem memoria) matava esta thread em silencio: o canvas
         # congelava no ultimo quadro e nada era impresso. O erro
@@ -2844,14 +3019,20 @@ class _PageCleanWorker:
                 reg_info["ink_vote_e3_tracks_small"] = result[
                     "ink_vote_e3_tracks_small"
                 ]
+            if result.get("ink_vote_fast"):
+                # Telemetria do corte de latencia (so com
+                # DRAW_INK_VOTE_FAST ligada).
+                reg_info["ink_vote_fast"] = True
             if (
                 result["confirmed_changed"]
                 or result["provisional_changed"]
                 or result["turn"]
             ):
                 self._still_passes = 0
+                self._activity_quiet_passes = 0
             else:
                 self._still_passes += 1
+                self._activity_quiet_passes += 1
             # Contadores do descanso total: so a saida
             # CONFIRMADA interessa (provisoria tremula com o
             # warp e nao pode segurar a trabalhadora acordada).
@@ -2937,6 +3118,9 @@ class _PageCleanWorker:
                     "queue_wait_s": pass_started_at - submitted_at,
                     "pass_s": pass_ended_at - pass_started_at,
                     "submit_to_publish_s": published_at - submitted_at,
+                    "interval_s": scheduled_interval,
+                    "hand_state": scheduled_hand_state,
+                    "activity_quiet_passes": self._activity_quiet_passes,
                     "mask_px": int(
                         np.count_nonzero(prob > self._accumulator.threshold)
                     ),

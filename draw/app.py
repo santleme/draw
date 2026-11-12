@@ -96,6 +96,8 @@ from .capture import (
     _READ_RETRY_SECONDS as _READ_RETRY_SECONDS,
     _PNG_DRAIN_SECONDS as _PNG_DRAIN_SECONDS,
     _LatestFrameCapture as _LatestFrameCapture,
+    _CAPTURE_DRAIN_ENV as _CAPTURE_DRAIN_ENV,
+    capture_drain_latest_enabled as capture_drain_latest_enabled,
     _PngWriter as _PngWriter,
     parse_source as parse_source,
     is_wsl as is_wsl,
@@ -849,6 +851,7 @@ def run(
                 "sheet_present": tel_sheet_present,
                 "state": "sheet" if tel_sheet_present else "no_sheet",
             }
+            tel_fields.update(frame_source.stats())
             if ink_worker is not None:
                 tel_fields.update(ink_worker.stats())
             if detection_worker is not None:

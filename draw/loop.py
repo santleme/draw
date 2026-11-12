@@ -43,6 +43,59 @@ _INK_CORNER_HISTORY = 5
 INK_WORKER_FAILED = "ink_worker_failed"
 
 
+# Cadencia de deteccao com a folha assentada (frente 93, atras de
+# DRAW_SHEET_DETECT_SETTLED_EVERY, default desligado): a remedida
+# da frente 93 nesta VM mostrou a passada dominada pelos dois
+# session.run (folha ~93% de pre+run+fit; tinta ~99% dos runs) —
+# pre/pos-processo e warp somam <2%. O sinal de "assentada" NAO e
+# o quad cru do detector (na sequencia gravada do caderno ele anda
+# mediana de 14,1 px por deteccao, e so 36% das deteccoes ficam a
+# <= 2 px da anterior): e o efeito da deteccao na geometria da
+# tinta — em 94% das deteccoes da mesma sequencia, o quad mediano
+# do historico de cantos anda <= 1 px (mediana 0,0), porque banda
+# morta + mediana absorvem o jitter. Com 2 deteccoes seguidas
+# assim, a deteccao neural nao precisa rodar em toda oportunidade
+# agendada: com a variavel em K (>= 2), so 1 em cada K
+# oportunidades roda deteccao e as demais reusam o quad — a tinta
+# segue passando nesses quadros com a geometria mediana ja
+# confirmada (quadro novo, quad assentado), sem tocar no
+# historico de cantos, no rastreador nem na sessao. Um gatilho
+# barato de mudanca grossa (diferenca media de cinza reduzido
+# contra o quadro da ultima deteccao submetida; limiar alto de
+# proposito — a diferenca quadro a quadro mediana na sequencia do
+# caderno ja e 7,3, entao o gatilho so pega troca/remocao/movimento
+# grande, nao o jitter) cancela o salto na hora. Folha ausente,
+# sessao fechada, rastreador em missed (salto pendente) e o
+# caminho legado (sem trabalhadora) nunca saltam: a flag e inerte
+# fora da pilha pagina->limpa com folha assentada e estavel.
+_ENV_DETECT_SETTLED_EVERY_VAR = "DRAW_SHEET_DETECT_SETTLED_EVERY"
+_SETTLED_STABLE_STREAK = 2
+_SETTLED_INK_MOVE_PX = 2.0
+_SETTLED_TRIGGER_SIZE = (160, 90)
+_SETTLED_TRIGGER_MEAN_ABSDIFF = 20.0
+
+
+def detect_settled_every():
+    """K da cadencia assentada: >= 2 liga; ausente/invalido desliga."""
+    raw = os.environ.get(_ENV_DETECT_SETTLED_EVERY_VAR, "").strip()
+    if not raw:
+        return 0
+    try:
+        value = int(raw)
+    except ValueError:
+        return 0
+    return value if value >= 2 else 0
+
+
+def _small_gray(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return cv2.resize(
+        gray,
+        (_SETTLED_TRIGGER_SIZE[0], _SETTLED_TRIGGER_SIZE[1]),
+        interpolation=cv2.INTER_AREA,
+    )
+
+
 def _acquisition_record(trace, frame_index, consumed, before, after, tracker_event):
     """Evento por aquisicao: rastro do combinado + rastreador.
 
@@ -191,6 +244,81 @@ class SheetInkLoop:
         # rastreador e contagem das aberturas de geracao por causa.
         self.last_tracker_event = None
         self.generation_events = {"drop": 0, "reopen": 0, "turn": 0, "split": 0}
+        # Cadencia assentada (frente 93, so com a flag ligada):
+        # sequencia de deteccoes estaveis (pelo efeito na geometria
+        # da tinta), saltos ainda devidos, referencia do gatilho de
+        # mudanca e os contadores de observabilidade do mecanismo.
+        self._det_stable_streak = 0
+        self._det_skip_left = 0
+        self._det_ref_small = None
+        self.detect_settled_skipped = 0
+        self.detect_settled_triggers = 0
+        self.ink_reuse_passes = 0
+
+    def _settled_skip_applies(self, frame, settled_every):
+        """True quando esta oportunidade de deteccao pode saltar.
+
+        Condicoes (todas): pilha pagina->limpa (trabalhadora de
+        tinta presente), folha confirmada no rastreador e sessao de
+        tinta aberta, rastreador sem missed (salto pendente nunca
+        espera), estabilidade crua sustentada e orcamento de saltos
+        disponivel. O gatilho de mudanca e a ultima palavra: cena
+        que mudou de verdade desde o quadro da ultima deteccao
+        submetida cancela o salto, zera orcamento e estabilidade e
+        conta o disparo — a deteccao roda nesta oportunidade.
+        """
+        if (
+            self.ink_worker is None
+            or self.tracker.corners is None
+            or not self.ink_session_open
+            or self.tracker.missed
+            or self._det_stable_streak < _SETTLED_STABLE_STREAK
+            or self._det_skip_left <= 0
+        ):
+            return False
+        if self._det_ref_small is not None:
+            diff = float(
+                np.mean(
+                    cv2.absdiff(_small_gray(frame), self._det_ref_small)
+                )
+            )
+            if diff >= _SETTLED_TRIGGER_MEAN_ABSDIFF:
+                self._det_skip_left = 0
+                self._det_stable_streak = 0
+                self.detect_settled_triggers += 1
+                return False
+        return True
+
+    def _warp_and_submit_ink(self, frame, warp_corners):
+        """Warp + visibilidade + submissao a trabalhadora de tinta.
+
+        E o trecho final da passada de tinta do caminho novo,
+        compartilhado pela passada de deteccao e pela passada de
+        reuso da cadencia assentada (frente 93): os cantos sao o
+        quad que retifica ESTE warp, e a trabalhadora registra a
+        evidencia de cada passada na geometria ancora da geracao —
+        sem isso, o quad que anda entre passadas re-projeta a tinta
+        assentada e cada alinhamento confirma a sua copia (a
+        reimpressao da regua de 2026-11-05 em draw/ink_layers.py).
+        """
+        ink_warped = self._warp_sheet(frame, warp_corners)
+        # Visibilidade na grade da pagina: onde a mao esta, a
+        # passada nao ve a folha — a passada nao pode votar com
+        # evidencia fabricada sob oclusao.
+        visible = None
+        if self.hand_masker is not None:
+            camera_mask = self.hand_masker.mask(frame)
+            if camera_mask is not None:
+                hand_warped = self._warp_sheet(camera_mask, warp_corners)
+                visible = hand_warped == 0
+        self.ink_worker.submit(
+            ink_warped,
+            self.clean_generation,
+            warp_corners,
+            visible,
+        )
+        if self.session_recorder is not None:
+            self.session_recorder.note_warp(self.clean_generation, ink_warped)
 
     def step(self, frame, frame_capture_ms, ink_passes_total=None):
         """Um quadro do laco sem marcadores.
@@ -217,10 +345,31 @@ class SheetInkLoop:
             detected_corners, detected_verdict = None, None
             det_captured_at = None
             ran_detection = False
+        # A estabilidade da cadencia assentada (frente 93) e medida
+        # no bloco da tinta, pelo efeito da deteccao no quad
+        # mediano — ver _SETTLED_INK_MOVE_PX. Aqui so o agendamento.
+        settled_every = detect_settled_every()
+        skipped_opportunity = False
         if self.tracker.should_detect(self.frame_number):
-            self.detection_worker.submit(
-                frame, frame_capture_ms / 1000.0, self.frame_number
-            )
+            if settled_every and self._settled_skip_applies(frame, settled_every):
+                self._det_skip_left -= 1
+                self.detect_settled_skipped += 1
+                skipped_opportunity = True
+            else:
+                self.detection_worker.submit(
+                    frame, frame_capture_ms / 1000.0, self.frame_number
+                )
+                if settled_every:
+                    # Deteccao submetida com a folha estavel recarrega
+                    # o orcamento de saltos; qualquer outro desfecho
+                    # (sem estabilidade, sem folha) zera o orcamento.
+                    self._det_skip_left = (
+                        settled_every - 1
+                        if self._det_stable_streak >= _SETTLED_STABLE_STREAK
+                        and self.tracker.corners is not None
+                        else 0
+                    )
+                    self._det_ref_small = _small_gray(frame)
         if self.detection_worker.error is not None:
             raise self.detection_worker.error
         # Portão de primeira confirmação anti-fantasma (frentes
@@ -302,6 +451,11 @@ class SheetInkLoop:
         self.last_tracker_event = tracker_event
         if tracker_event == "drop":
             self.generation_events["drop"] += 1
+            # A cadencia assentada recomeca com a folha: estabilidade
+            # e orcamento da folha que caiu nao vazam para a proxima.
+            self._det_stable_streak = 0
+            self._det_skip_left = 0
+            self._det_ref_small = None
             self.ink_session_open = False
             self.session_corners = None
             self.freeze_pending = False
@@ -467,11 +621,29 @@ class SheetInkLoop:
             # ultima mediana: a pagina esta assentada e a
             # mediana viva seguiria andando com o balanco
             # do detector, deslocando a tinta ja publicada.
+            _med_before = (
+                np.median(np.stack(self.corner_history), axis=0).astype(np.float32)
+                if self.corner_history
+                else None
+            )
             if self.clean_hand_present is not False or (not self.corner_history):
                 self.corner_history.append(self.tracker.corners.copy())
             ink_corners = np.median(np.stack(self.corner_history), axis=0).astype(
                 np.float32
             )
+            if settled_every:
+                # Estabilidade da cadencia assentada (frente 93):
+                # quanto ESTA deteccao moveu a geometria da tinta.
+                if _med_before is None:
+                    self._det_stable_streak = 0
+                else:
+                    _ink_move = float(
+                        np.max(np.linalg.norm(ink_corners - _med_before, axis=1))
+                    )
+                    if _ink_move <= _SETTLED_INK_MOVE_PX:
+                        self._det_stable_streak += 1
+                    else:
+                        self._det_stable_streak = 0
             if self.freeze_pending:
                 self.session_corners = ink_corners.copy()
                 self.freeze_pending = False
@@ -480,18 +652,6 @@ class SheetInkLoop:
                 if self.session_ink is not None and self.session_corners is not None
                 else ink_corners
             )
-            ink_warped = self._warp_sheet(frame, warp_corners)
-            # Visibilidade na grade da pagina: onde a mao
-            # esta, a passada nao ve a folha — nenhum dos
-            # dois caminhos pode votar com evidencia
-            # fabricada sob oclusao. O mesmo mapa serve a
-            # trabalhadora neural e ao caminho classico.
-            visible = None
-            if self.hand_masker is not None:
-                camera_mask = self.hand_masker.mask(frame)
-                if camera_mask is not None:
-                    hand_warped = self._warp_sheet(camera_mask, warp_corners)
-                    visible = hand_warped == 0
             if self.ink_worker is not None:
                 # Caminho novo: o warp vai para a trabalhadora
                 # de tinta e o laco segue sem esperar o modelo.
@@ -499,23 +659,19 @@ class SheetInkLoop:
                 # moram na trabalhadora e entram no painel
                 # pelo poll_display() logo abaixo, a provisoria
                 # na primeira passada e a confirmada quando o
-                # voto fecha. Os cantos vao junto: sao o quad
-                # que retificou ESTE warp, e a trabalhadora
-                # registra a evidencia de cada passada na
-                # geometria ancora da geracao — sem isso, o
-                # quad que anda entre passadas re-projeta a
-                # tinta assentada e cada alinhamento confirma
-                # a sua copia (a reimpressao da regua de
-                # 2026-11-05 em draw/ink_layers.py).
-                self.ink_worker.submit(
-                    ink_warped,
-                    self.clean_generation,
-                    warp_corners,
-                    visible,
-                )
-                if self.session_recorder is not None:
-                    self.session_recorder.note_warp(self.clean_generation, ink_warped)
+                # voto fecha.
+                self._warp_and_submit_ink(frame, warp_corners)
             else:
+                ink_warped = self._warp_sheet(frame, warp_corners)
+                # Visibilidade na grade da pagina: onde a mao
+                # esta, a passada nao ve a folha — a passada nao
+                # pode votar com evidencia fabricada sob oclusao.
+                visible = None
+                if self.hand_masker is not None:
+                    camera_mask = self.hand_masker.mask(frame)
+                    if camera_mask is not None:
+                        hand_warped = self._warp_sheet(camera_mask, warp_corners)
+                        visible = hand_warped == 0
                 if self.session_ink is not None:
                     if not self.session_ink.ready:
                         if self.baseline_armed:
@@ -536,6 +692,30 @@ class SheetInkLoop:
                     self.session_recorder.note_canvas(
                         self.legacy_generation, self.accumulated_canvas
                     )
+
+        # Passada de REUSO da cadencia assentada (frente 93, so com
+        # DRAW_SHEET_DETECT_SETTLED_EVERY >= 2): oportunidade de
+        # deteccao que o salto pulou e nenhum resultado chegou neste
+        # quadro — a tinta passa na MESMA cadencia de hoje (1 por
+        # oportunidade) com a geometria mediana das deteccoes ja
+        # feitas (historico intocado: a mediana e a mesma da ultima
+        # passada de deteccao) sobre os pixels NOVOS deste quadro.
+        # Sem sessao nova, sem congelamento, sem submit de presenca
+        # de mao: so a passada de tinta que a deteccao saltada nao
+        # pode mais gatinhar.
+        if (
+            skipped_opportunity
+            and not ran_detection
+            and self.ink_worker is not None
+            and self.ink_session_open
+            and self.tracker.corners is not None
+            and self.corner_history
+        ):
+            reuse_corners = np.median(
+                np.stack(self.corner_history), axis=0
+            ).astype(np.float32)
+            self._warp_and_submit_ink(frame, reuse_corners)
+            self.ink_reuse_passes += 1
 
         return self.collect_ink()
 
