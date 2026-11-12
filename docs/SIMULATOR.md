@@ -198,7 +198,33 @@ python tools/sim_source.py --text "draw hand" --fps 15 \
   100% do retângulo — `retained` exige `visible`, e pixel sem visão
   não retrai. Semântica correta (não julga o que não vê), consequência
   real: a tinta apagada segue "viva" na tela enquanto a palma estiver
-  parada sobre ela.
+  parada sobre ela. Com `DRAW_INK_REMOVAL=1` a bancada mediu
+  `confirmed_in_erased_px: 0` — a retração acontece em toda região
+  visível após a borracha sair.
+
+### Mitigações validadas na mesma cena (2026-11-12)
+
+- `DRAW_CANVAS_PERSIST=1` — o drop do tracker não prova troca de
+  página: a geração da trabalhadora já era preservada
+  (`clean_recovery_pending`), mas o `clean_mask` ia embora na hora.
+  Com a flag, o canvas congela até o re-registro. Na bancada o
+  resultado mudou de `no_canvas` para `status: ok` com 18.351 px
+  confirmados no fim — e a queda real de página segue limpando tudo
+  (reopen/turn/split inalterados).
+- `DRAW_INK_SKIP_STALE=1` — na janela de graça do tracker (cantos
+  retidos, `_frames_since_seen > _SHEET_LOST_MIN_FRAMES`), as
+  passadas de reuso/LK param de subir: por construção só há mesa ou
+  oclusão lá. Acoplado a `draw.sheet_track._SHEET_LOST_MIN_FRAMES`.
+  Observação da bancada: a janela real é estreita (a queda dispara
+  na mesma faixa de contagem) — o grosso do provisório fantasma se
+  acumula na cadência normal durante move+oclusão, antes da graça
+  estourar. Bounded: nunca confirmou.
+- Dieta do corpus — `tools/gen_synthetic.py` ganhou `--clip-fraction`
+  (folha 5-40% fora por qualquer borda) e `--rotation-fraction` +
+  `--rotation-max` (rotação além do teto ±18° histórico), opt-in,
+  registrados em `manifest.diet`. Cobrem os dois gaps medidos do
+  detector: clipe ~7-9% nas laterais/topo e cego acima de ~15°.
+  A fração zero preserva o comportamento histórico byte a byte.
 
 A auditoria por fase trata `return` como o `move`: checkpoints após o
 retorno pontuam contra `page_to_scene_final`. Checkpoints de `absent`

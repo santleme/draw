@@ -32,7 +32,12 @@ from .lk_propagate import (
     ReseededQuadPropagator,
     lk_propagate_enabled,
 )
-from .sheet_track import _SheetTracker, _corner_distance, _lk_track_corners
+from .sheet_track import (
+    _SHEET_LOST_MIN_FRAMES,
+    _SheetTracker,
+    _corner_distance,
+    _lk_track_corners,
+)
 
 
 # A tinta e lida numa geometria estabilizada: a mediana dos ultimos
@@ -109,6 +114,23 @@ def detect_settled_every():
 # 25 px fica bem acima do jitter residual do rastreador (~2 px de
 # banda morta) e abaixo do salto grande de _SHEET_BIG_JUMP_PX, que
 # um deslize continuo nunca dispara.
+_ENV_CANVAS_PERSIST_VAR = "DRAW_CANVAS_PERSIST"
+
+
+def _canvas_persist_enabled():
+    raw = os.environ.get(_ENV_CANVAS_PERSIST_VAR, "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+_ENV_INK_SKIP_STALE_VAR = "DRAW_INK_SKIP_STALE"
+_STALE_PASS_MIN_FRAMES = _SHEET_LOST_MIN_FRAMES
+
+
+def _ink_skip_stale_enabled():
+    raw = os.environ.get(_ENV_INK_SKIP_STALE_VAR, "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 _ENV_INK_FOLLOW_MOVE_VAR = "DRAW_INK_FOLLOW_MOVE"
 _FROZEN_SHEET_MOVE_PX = 25.0
 
@@ -374,6 +396,18 @@ class SheetInkLoop:
         assentada e cada alinhamento confirma a sua copia (a
         reimpressao da regua de 2026-11-05 em draw/ink_layers.py).
         """
+        if _ink_skip_stale_enabled() and (
+            self.tracker._frames_since_seen > _STALE_PASS_MIN_FRAMES
+        ):
+            # DRAW_INK_SKIP_STALE: os cantos retidos sao de graça —
+            # frames_since_seen passou do piso da queda sem
+            # confirmacao nova. O warp olharia a mesa (o quad ficou
+            # pra tras) ou pixels ja ocluidos (o canal visible ja
+            # zera) — a passada e trabalho morto por construcao.
+            # Medido: 3,7k->346k px de provisorio em ~1 s na janela
+            # de perda do cenario lift & return. Passada fresca nao
+            # e afetada: _frames_since_seen = 0 nela.
+            return
         ink_warped = self._warp_sheet(frame, warp_corners)
         # Visibilidade na grade da pagina: onde a mao esta, a
         # passada nao ve a folha — a passada nao pode votar com
@@ -589,7 +623,14 @@ class SheetInkLoop:
             self.ink_session_open = False
             self.session_corners = None
             self.freeze_pending = False
-            self.clean_mask = None
+            # DRAW_CANVAS_PERSIST: a queda do tracker nao prova que a
+            # pagina mudou — o canvas do usuario fica congelado na
+            # tela ate a folha voltar (re-registro via
+            # clean_recovery_pending) ou a sessao reabrir com pagina
+            # nova (a reabertura limpa, como sempre). Sem a flag:
+            # comportamento historico, o canvas some da tela.
+            if not _canvas_persist_enabled():
+                self.clean_mask = None
             if self.ink_worker is not None:
                 # A queda do tracker nao prova que a pagina
                 # mudou. Guarda a geracao ate a folha voltar;

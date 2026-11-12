@@ -668,19 +668,20 @@ def _smooth_background(
     return np.clip(img, 0, 255).astype(np.uint8)
 
 
-def _sample_normal_quad(rng: np.random.Generator, w: int, h: int) -> np.ndarray:
-    """Quad da folha no placement normal: grande, rotacionada/deslocada.
-
-    Consumo de RNG idêntico ao ramo "normal" histórico de
-    ``_warp_to_scene`` (cx, cy, scale, ang — nesta ordem).
-    """
+def _sample_quad(
+    rng: np.random.Generator, w: int, h: int, rotation_max: float
+) -> np.ndarray:
+    """Quad da folha: centro ±40 px, escala 0,85–1,05, rotação
+    uniforme em ±rotation_max graus. Consumo de RNG idêntico ao
+    ramo "normal" histórico de ``_warp_to_scene`` (cx, cy, scale,
+    ang — nesta ordem)."""
     cx, cy = (
         SIZE // 2 + int(rng.integers(-40, 41)),
         SIZE // 2 + int(rng.integers(-40, 41)),
     )
     scale = float(rng.uniform(0.85, 1.05))
     pw, ph = int(w * scale * SIZE / 560), int(h * scale * SIZE / 560)
-    ang = math.radians(float(rng.uniform(-18, 18)))
+    ang = math.radians(float(rng.uniform(-rotation_max, rotation_max)))
     ca, sa = math.cos(ang), math.sin(ang)
     corners = np.array(
         [
@@ -693,6 +694,47 @@ def _sample_normal_quad(rng: np.random.Generator, w: int, h: int) -> np.ndarray:
     )
     rot = np.array([[ca, -sa], [sa, ca]], dtype=np.float32)
     return (corners @ rot.T + np.array([cx, cy], dtype=np.float32)).astype(np.float32)
+
+
+def _sample_normal_quad(rng: np.random.Generator, w: int, h: int) -> np.ndarray:
+    """Quad da folha no placement normal: grande, rotacionada ±18°."""
+    return _sample_quad(rng, w, h, 18.0)
+
+
+def _sample_wide_rotation_quad(
+    rng: np.random.Generator, w: int, h: int, rotation_max: float
+) -> np.ndarray:
+    """Quad com rotação além do teto histórico: o detector medido
+    cruza a cegueira em ~15° — borda exata do uniform(-18, 18) do
+    placement normal (bancada lift & return, 2026-11-12)."""
+    return _sample_quad(rng, w, h, rotation_max)
+
+
+def _sample_clipped_quad(
+    rng: np.random.Generator, w: int, h: int
+) -> tuple[np.ndarray, int, float]:
+    """Quad da folha deslocado até ``frac`` da sua caixa sair por uma
+    borda sorteada — o regime entre "inteira" e ``sheet_out`` (lasca):
+    5–40% fora, borda uniforme. Cobre o gap medido na bancada de mão
+    em massa (2026-11-12): o detector cega com só ~7-9% da folha fora
+    nas laterais/topo, e ~17% embaixo — folha clipada nunca existiu
+    no placement normal (centro ±40 px mantém a folha inteira no
+    frame). Devolve (quad, borda, fração) — borda 0=esq 1=dir 2=topo
+    3=baixo — para registro no ``info``."""
+    quad = _sample_normal_quad(rng, w, h)
+    edge = int(rng.integers(4))
+    frac = float(rng.uniform(0.05, 0.40))
+    lo, hi = quad.min(axis=0), quad.max(axis=0)
+    bw, bh = hi - lo
+    if edge == 0:
+        off = np.float32([-frac * bw - lo[0], 0])
+    elif edge == 1:
+        off = np.float32([SIZE + frac * bw - hi[0], 0])
+    elif edge == 2:
+        off = np.float32([0, -frac * bh - lo[1]])
+    else:
+        off = np.float32([0, SIZE + frac * bh - hi[1]])
+    return quad + off, edge, frac
 
 
 def _sample_loguniform_quad(rng: np.random.Generator, w: int, h: int) -> np.ndarray:
@@ -761,12 +803,39 @@ def _warp_paper(
     return rgb_w, paper_mask, ink_w, paper_cov, ink_cov
 
 
+def _sheet_clip_info(quad: np.ndarray) -> dict | None:
+    """Clip da caixa da folha nas bordas do frame, para ``info``.
+    Mede o que o quad pede (não o rótulo final): bordas com qualquer
+    excesso e a fração de caixa fora do frame."""
+    lo, hi = quad.min(axis=0), quad.max(axis=0)
+    edges = []
+    if lo[0] < 0:
+        edges.append("left")
+    if hi[0] > SIZE:
+        edges.append("right")
+    if lo[1] < 0:
+        edges.append("top")
+    if hi[1] > SIZE:
+        edges.append("bottom")
+    if not edges:
+        return None
+    span = np.maximum(hi - lo, 1)
+    inside = np.minimum(hi, SIZE) - np.maximum(lo, 0)
+    visible = float(np.clip(inside / span, 0, 1).prod())
+    return {"edges": edges, "clip_fraction": round(1 - visible, 3)}
+
+
 def _warp_to_scene(
-    rng: np.random.Generator, paper: np.ndarray, ink: np.ndarray, placement: str
+    rng: np.random.Generator,
+    paper: np.ndarray,
+    ink: np.ndarray,
+    placement: str,
+    rotation_max: float = 40.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Warp do papel para a cena, com o quad sorteado pelo placement.
 
     Devolve (rgb_warp, paper_mask, ink_warp, quad, paper_cov, ink_cov).
+    ``rotation_max`` só alcança o placement ``wide_rotation``.
     """
     h, w = paper.shape[:2]
     if placement == "tiny_sheet":
@@ -786,6 +855,10 @@ def _warp_to_scene(
         dst = np.array(
             [[-320, -260], [-40, -280], [-20, 120], [-340, 100]], dtype=np.float32
         )
+    elif placement == "clipped":
+        dst, _, _ = _sample_clipped_quad(rng, w, h)
+    elif placement == "wide_rotation":
+        dst = _sample_wide_rotation_quad(rng, w, h, rotation_max)
     elif placement == "loguniform":
         dst = _sample_loguniform_quad(rng, w, h)
     else:
@@ -1115,11 +1188,13 @@ def compose_scene(
     background_sigma: float | None = None,
     sheet_scale: str = "legacy",
     augment_noise_sigma: float | None = None,
+    rotation_max: float = 40.0,
 ) -> dict:
     """Compõe UMA cena. Devolve rgb, mask, ink_full e info.
 
     scene_type: normal | empty_table | hand_no_sheet | white_object |
-    tiny_sheet | sheet_out | notebook_spread (caderno aberto: dois
+    tiny_sheet | sheet_out | clipped_sheet | rotated_sheet |
+    notebook_spread (caderno aberto: dois
     quads com lombada, vale e espiral — ver ``_warp_spread``).
     hand_placement: None (sorteado) ou um dos
     off_sheet | entering | edge | corner | center | over_stroke |
@@ -1198,7 +1273,15 @@ def compose_scene(
             else (
                 "sheet_out"
                 if scene_type == "sheet_out"
-                else ("loguniform" if sheet_scale == "loguniform" else "normal")
+                else (
+                    "clipped"
+                    if scene_type == "clipped_sheet"
+                    else (
+                        "wide_rotation"
+                        if scene_type == "rotated_sheet"
+                        else ("loguniform" if sheet_scale == "loguniform" else "normal")
+                    )
+                )
             )
         )
         if scene_type == "notebook_spread":
@@ -1210,7 +1293,7 @@ def compose_scene(
         else:
             paper, ink, _, _ = _paper_canvas(rng, paper_style)
             rgb_w, paper_mask, ink_w, paper_quad, paper_cov, ink_cov = _warp_to_scene(
-                rng, paper, ink, placement
+                rng, paper, ink, placement, rotation_max
             )
         on_paper = paper_mask > 0
         rgb[on_paper] = rgb_w[on_paper]
@@ -1221,6 +1304,9 @@ def compose_scene(
         frac = float(on_paper.mean())
         info["paper_fraction"] = frac
         info["has_valid_sheet"] = frac >= VALID_PAPER_FRACTION
+        clip = _sheet_clip_info(paper_quad)
+        if clip is not None:
+            info["sheet_clip"] = clip
 
     # Mão (ou duas).
     if hand is not None and scene_type not in ("empty_table", "white_object"):
@@ -1435,6 +1521,9 @@ def generate_dataset(
     sheet_scale: str = "legacy",
     no_paper_fraction: float = 0.0,
     notebook_fraction: float = 0.0,
+    clip_fraction: float = 0.0,
+    rotation_fraction: float = 0.0,
+    rotation_max: float = 40.0,
 ) -> dict:
     """Gera o dataset completo com split por fonte + manifest.json.
 
@@ -1447,13 +1536,23 @@ def generate_dataset(
     substituindo o ciclo histórico de negativos;
     ``notebook_fraction`` — fração das cenas COM papel que viram
     caderno aberto (dois quads + lombada), a classe geométrica que
-    faltava (smoke do Colab, 2026-11-08).
+    faltava (smoke do Colab, 2026-11-08);
+    ``clip_fraction`` — fração das cenas COM papel com a folha 5–40%
+    fora por uma borda sorteada (gap medido: detector cego a ~7-9%
+    de clipe nas laterais/topo, ~17% embaixo — bancada de mão em
+    massa, 2026-11-12);
+    ``rotation_fraction`` — fração com rotação além do teto histórico
+    (uniforme em ±``rotation_max``°, default 40 — gap medido: detector
+    cego acima de ~15°, teto do uniform(-18, 18) — bancada lift &
+    return, 2026-11-12).
     """
     for name, frac in (
         ("bg_real_fraction", bg_real_fraction),
         ("bg_smooth_fraction", bg_smooth_fraction),
         ("no_paper_fraction", no_paper_fraction),
         ("notebook_fraction", notebook_fraction),
+        ("clip_fraction", clip_fraction),
+        ("rotation_fraction", rotation_fraction),
     ):
         if not 0.0 <= frac <= 1.0:
             raise ValueError(f"{name} precisa estar em [0, 1]: {frac}")
@@ -1461,6 +1560,8 @@ def generate_dataset(
         raise ValueError("bg_real_fraction + bg_smooth_fraction > 1")
     if sheet_scale not in ("legacy", "loguniform"):
         raise ValueError(f"sheet_scale desconhecido: {sheet_scale!r}")
+    if not math.isfinite(rotation_max) or not 0 < rotation_max <= 90:
+        raise ValueError(f"rotation_max deve estar em (0, 90]: {rotation_max}")
     counts = counts or {"train": 20, "val": 3, "test": 3}
     out = Path(out_dir)
     hands = load_hands(hands_dir)
@@ -1512,6 +1613,8 @@ def generate_dataset(
         or sheet_scale != "legacy"
         or no_paper_fraction > 0
         or notebook_fraction > 0
+        or clip_fraction > 0
+        or rotation_fraction > 0
     ):
         manifest["diet"] = {
             "bg_real_fraction": bg_real_fraction,
@@ -1521,6 +1624,9 @@ def generate_dataset(
             "sheet_area_range": ([0.05, 0.70] if sheet_scale == "loguniform" else None),
             "no_paper_fraction": no_paper_fraction,
             "notebook_fraction": notebook_fraction,
+            "clip_fraction": clip_fraction,
+            "rotation_fraction": rotation_fraction,
+            "rotation_max_deg": rotation_max if rotation_fraction > 0 else None,
             "smooth_background_bases": sorted(SMOOTH_BACKGROUND_BASES),
             "notes": (
                 "Diet opt-ins (frente dieta 2026-11-05): smooth = "
@@ -1528,7 +1634,10 @@ def generate_dataset(
                 "sigma (bg_smooth_sigma per scene) and reduced "
                 "augment sensor noise; loguniform = sheet area "
                 "uniform in log between 5% and 70% of the frame; "
-                "no_paper > 0 replaces the legacy negative cycle."
+                "no_paper > 0 replaces the legacy negative cycle; "
+                "clipped_sheet/rotated_sheet (2026-11-12) cobrem os "
+                "gaps medidos do detector: clipe ~7-9% nas "
+                "laterais/topo e rotação >~15°."
             ),
         }
     if temporal_counts:
@@ -1615,6 +1724,18 @@ def generate_dataset(
                 and float(rng.random()) < notebook_fraction
             ):
                 scene_type = "notebook_spread"
+            if (
+                scene_type == "normal"
+                and clip_fraction > 0
+                and float(rng.random()) < clip_fraction
+            ):
+                scene_type = "clipped_sheet"
+            elif (
+                scene_type == "normal"
+                and rotation_fraction > 0
+                and float(rng.random()) < rotation_fraction
+            ):
+                scene_type = "rotated_sheet"
             second = None
             if two_hands and hand_id and len(hand_pool) > 1:
                 second_id = [h for h in hand_pool if h != hand_id][
@@ -1635,6 +1756,7 @@ def generate_dataset(
                 background_sigma=background_sigma,
                 sheet_scale=sheet_scale,
                 augment_noise_sigma=augment_noise,
+                rotation_max=rotation_max,
             )
             scene_id = f"scene_{split}_{i:04d}"
             cv2.imwrite(str(split_dir / f"{scene_id}.png"), scene["rgb"])
@@ -1766,6 +1888,28 @@ def main() -> int:
         help="Fração das cenas COM papel que viram caderno "
         "aberto (dois quads + lombada; 0 a 1; default 0)",
     )
+    parser.add_argument(
+        "--clip-fraction",
+        type=float,
+        default=0.0,
+        help="Fração das cenas COM papel com a folha 5-40%% "
+        "fora por borda sorteada (0 a 1; default 0) — cobre "
+        "o gap medido do detector a clipes de ~7-9%%",
+    )
+    parser.add_argument(
+        "--rotation-fraction",
+        type=float,
+        default=0.0,
+        help="Fração das cenas COM papel com rotação além do "
+        "teto ±18° (uniforme em ±--rotation-max; 0 a 1; "
+        "default 0) — cobre o gap medido >~15°",
+    )
+    parser.add_argument(
+        "--rotation-max",
+        type=float,
+        default=40.0,
+        help="Teto da rotação em graus para --rotation-fraction (0, 90]; default 40)",
+    )
     args = parser.parse_args()
     temporal_counts = None
     if args.temporal_train > 0 or args.temporal_val > 0:
@@ -1784,6 +1928,9 @@ def main() -> int:
         sheet_scale=args.sheet_scale,
         no_paper_fraction=args.no_paper_fraction,
         notebook_fraction=args.notebook_fraction,
+        clip_fraction=args.clip_fraction,
+        rotation_fraction=args.rotation_fraction,
+        rotation_max=args.rotation_max,
     )
     n = len(manifest["scenes"])
     print(f"{n} cenas em {args.out} (seed {args.seed})")
