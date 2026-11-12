@@ -410,7 +410,27 @@ pixel a F-07/F-09. A régua por passada agora é persistida durante a corrida
 em `ink_passes.jsonl`, além do resumo final; ver diagnóstico em FALHAS.
 
 As correções `DRAW_REG_CONTENT_GUARD` e `DRAW_INK_REMOVAL` são opt-in,
-default 0; não promovem modelo nem substituem validação ao vivo. A primeira
+com padrões preservados. Após revisão, o isolamento mantém `session_id`
+original e sela antes do teacher, mas nunca usa chave de lote como caminho.
+A remoção E3 mantém suporte geométrico para redesenho e limpa só a memória
+dos pixels apagados, sem reabrir a fase global. Os 125 testes focados
+passaram na VM e no WSL; antes de integrar o merge 66, a suíte completa teve
+1.080 aprovações. No follow-up sobre main após os merges 66/67, houve 1.104
+aprovações, uma falha herdada de fundos privados ausentes e quatro skips.
+
+A tentativa nativa automatizada em `01efd20` não validou mover/apagar:
+com os modelos oficiais verificados, o vídeo sintético teve folha detectada,
+mas nenhuma tinta confirmada em 101 passadas. Não se avançou sem esse
+estado inicial. Isso não prova regressão nem resultado ao vivo no papel;
+ainda é necessária uma fonte temporal reconhecida pelo modelo. Ao sair
+com Q, tanto `01efd20` quanto a base `3c00e29` terminaram em falha de
+segmentação (139), sem manifesto final, com o mesmo ambiente/fonte/modelos.
+Os traces apontam encerramento da captura; a causa permanece indeterminada.
+Esse crash foi reproduzido na base. A UI não foi repetida nas correções
+posteriores de isolamento/E3; não alegar aprovação delas no papel real.
+
+As flags novas continuam desligadas por padrão;
+não promovem modelo nem substituem validação ao vivo. A primeira
 evita votar a cópia reprojetada quando o conteúdo favorece identidade e
 reancora só após assentamento. A segunda retira tinta confirmada com
 ausência forte, visível e persistente e testemunho positivo da mesma página;

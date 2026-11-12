@@ -58,9 +58,7 @@ def _feed(worker, generation, seconds):
 
 
 def _worker(monkeypatch, fake):
-    monkeypatch.setattr(
-        ink_layers_module, "_PAGE_CLEAN_INTERVAL_SECONDS", 0.02
-    )
+    monkeypatch.setattr(ink_layers_module, "_PAGE_CLEAN_INTERVAL_SECONDS", 0.02)
     monkeypatch.setattr(ink_layers_module, "_IDLE_PROBE_SECONDS", 0.30)
     worker = ink_layers_module._PageCleanWorker(fake).start()
     generation = worker.new_generation()

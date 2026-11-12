@@ -52,6 +52,64 @@ da folha é fixa, com textura, fundo e ruído de sensor do gerador original.
 Movimento de papel e comportamento real de mão/modelos exigem outros
 cenários; os resultados aqui são exclusivamente sintéticos.
 
+## Cenário escrever → apagar → redesenhar → mover
+
+A fonte também encadeia fases além da escrita: uma borracha visível
+varre uma região da folha e devolve o papel original, um segundo texto
+cai sobre a área limpa e a folha desliza/gira no fim. As fases são
+declaradas no GT (`events`, `stroke_phase` 0 para o texto inicial e 1
+para o redesenho, `stroke_erased`, `erase_rect`, `page_ink_final` com o
+estado real da folha no fim e as poses inicial/final). Sem os flags, a
+linha do tempo é exatamente warmup → escrita → settle, como sempre foi.
+
+```sh
+python tools/sim_source.py --text "Draw ok" --seed 7 --fps 15 \
+  --stroke-seconds 0.3 --warmup-seconds 2 --settle-seconds 8 \
+  --height 26 --hand --erase-stroke -1 --redraw-text "ui" \
+  --erase-seconds 1.2 --hold-seconds 6 \
+  --move 35,22,2.5 --move-seconds 0.8 --out captures/sim-e3.mp4
+```
+
+`--erase-stroke N` apaga a caixa do traço N (índice negativo conta do
+fim); `--erase-rect x,y,w,h` apaga um retângulo explícito em pixels de
+página. As duas opções são alternativas. `--redraw-text` exige uma
+região apagada e centraliza o novo texto nela. `--hold-seconds` é a
+parada de cena entre fases — dê passadas suficientes para a confirmação
+amadurecer antes do próximo evento. `--move dx,dy,graus` desloca e gira
+a folha em `move-seconds`; sem ele, não há fase de movimento.
+
+A auditoria por fase roda o mesmo laço real do `eval_capture` e
+fotografa a máscara confirmada e a provisória no último frame de cada
+fase, pontuando cada uma contra o GT esperado daquele instante (traços
+já aplicados, menos o retângulo já apagado, na âncora que a worker
+publicava ali). O que se quer ver: recall confirmado crescendo na
+escrita, resíduo confirmado na região apagada caindo depois da
+borracha, recall confirmado dos traços de redesenho subindo depois da
+segunda escrita — o contrato do E3 é que pixel apagado não fica
+provisório para sempre — e o canvas sobrevivendo ao movimento.
+
+```sh
+python tools/eval_scenario.py --video captures/sim-e3.mp4 \
+  --gt captures/sim-e3.gt.npz --out captures/eval-e3.json \
+  --save-masks captures/e3-masks
+```
+
+O relatório lista os checkpoints com IoU/precisão/recall por fase,
+`confirmed_in_erased_px` (resíduo na região apagada),
+`redraw_confirmed_recall` e `redraw_provisional_px`. Bundles sem
+`events` são recusados: cenário simples é trabalho do `eval_capture`.
+
+Para o app nativo, o arquivo consumido direto esgota em segundos — a
+bomba latest-wins descarta quase todos os frames. `tools/mjpeg_server.py`
+serve o MP4 como câmera em tempo real (`--fps` nominal), e o laço
+inteiro — captura assíncrona, cadência da trabalhadora, coleta de
+sessão — opera como na mesa:
+
+```sh
+python tools/mjpeg_server.py --video captures/sim-e3.mp4 --port 8554 &
+python main.py --source http://127.0.0.1:8554/video
+```
+
 ## Capturar e avaliar sem interface
 
 Com os ONNX oficiais instalados (veja `tools/fetch_models.py`):

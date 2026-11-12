@@ -86,6 +86,21 @@ _REST_QUIET_PASSES = 2
 _HAND_REST_STILL_SECONDS = 1.0
 
 
+# Evento geometrico que acorda o descanso (frente do cenario E3,
+# atras de DRAW_INK_FOLLOW_MOVE, default desligado): a premissa do
+# descanso sem mao e "a pagina nao muda" — mas a folha que desliza
+# sem mao na cena mostra exatamente o contrario (medido em
+# 2026-11-12: o warp congelado seguiu vendo mesa e a trabalhadora
+# dormiu no meio do movimento, porque submit nao acorda). Um quad
+# submetido a mais de _GEO_WAKE_MOVE_PX da ancora e evidencia de
+# cena nova — enquanto o deslocamento persistir, a quietude nao
+# acumula e a sonda segue; quando a geometria retorna a moldura,
+# _REST_QUIET_PASSES recoloca a trabalhadora para dormir.
+# 25 px casa com o destrave do historico do laco: abaixo disso o
+# rastreador ainda trata como jitter de deteccao.
+_GEO_WAKE_MOVE_PX = 25.0
+
+
 # Cadencia maxima da tinta: uma passada completa a cada ~250 ms.
 # A passada custa 168 ms no Ryzen com 8 threads (perfil em
 # draw-lab/page-clean-v0/PERF_BASELINE_RYZEN.md), entao quem manda
@@ -322,9 +337,7 @@ _INK_VOTE_E4_THIN_SCORE = 2.1
 _INK_VOTE_E4_THIN_MIN_LENGTH = 50
 _INK_VOTE_E4_THIN_MAX_AREA_RATIO = 3.5
 _INK_VOTE_E4_FAR_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17))
-_INK_VOTE_E4_TOLERANCE_KERNEL = cv2.getStructuringElement(
-    cv2.MORPH_ELLIPSE, (3, 3)
-)
+_INK_VOTE_E4_TOLERANCE_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
 
 def _ink_vote_e4_enabled():
@@ -559,8 +572,8 @@ class _E4ThinSideVote:
             ).astype(np.int32)
             neighbours = near_hit if neighbours is None else neighbours + near_hit
             seen = (hit > 0) if seen is None else (seen | (hit > 0))
-        rule = (neighbours >= self._window_len) & (hits >= 1) & (
-            score >= self._min_score
+        rule = (
+            (neighbours >= self._window_len) & (hits >= 1) & (score >= self._min_score)
         )
         if np.any(rule):
             anchor = seen | self._confirmed
@@ -1276,9 +1289,7 @@ class _LayeredInkAccumulator:
         sub-trilha no conteudo coberto que a gerou).
         """
         frac_far = float(np.count_nonzero(component & far_mask) / area)
-        dil3 = (
-            cv2.dilate(component.astype(np.uint8), _INK_VOTE_E3_DILATE_KERNEL) > 0
-        )
+        dil3 = cv2.dilate(component.astype(np.uint8), _INK_VOTE_E3_DILATE_KERNEL) > 0
         if frac_far < 0.5:
             self._e4_region_slow |= dil3
             self._e4_tracks_slow += 1
@@ -1292,9 +1303,7 @@ class _LayeredInkAccumulator:
             self._e4_region_big |= (
                 dil3
                 if sub
-                else cv2.dilate(
-                    component.astype(np.uint8), _INK_VOTE_E3_REGION_KERNEL
-                )
+                else cv2.dilate(component.astype(np.uint8), _INK_VOTE_E3_REGION_KERNEL)
                 > 0
             )
             self._e4_tracks_big += 1
@@ -1302,9 +1311,7 @@ class _LayeredInkAccumulator:
             self._e4_region_small |= (
                 dil3
                 if sub
-                else cv2.dilate(
-                    component.astype(np.uint8), _INK_VOTE_E3_REGION_KERNEL
-                )
+                else cv2.dilate(component.astype(np.uint8), _INK_VOTE_E3_REGION_KERNEL)
                 > 0
             )
             self._e4_tracks_small += 1
@@ -1388,8 +1395,7 @@ class _LayeredInkAccumulator:
             component = labels == index
             if (
                 float(np.count_nonzero(component & opening_d3) / area) >= 0.5
-                or float(np.count_nonzero(component & opening_evidence) / area)
-                >= 0.5
+                or float(np.count_nonzero(component & opening_evidence) / area) >= 0.5
             ):
                 # Pre-existente na abertura: ignorado NESTA
                 # passada, sem virar estado — nada absorve pra
@@ -1411,8 +1417,8 @@ class _LayeredInkAccumulator:
             residual = component & ~covered
             if np.count_nonzero(residual) < _INK_VOTE_E4_MIN_COMPONENT_PX:
                 continue
-            sub_count, sub_labels, sub_stats, _sub = (
-                cv2.connectedComponentsWithStats(residual.astype(np.uint8), 8)
+            sub_count, sub_labels, sub_stats, _sub = cv2.connectedComponentsWithStats(
+                residual.astype(np.uint8), 8
             )
             for sub_index in range(1, sub_count):
                 sub_area = int(sub_stats[sub_index, cv2.CC_STAT_AREA])
@@ -1715,13 +1721,9 @@ class _LayeredInkAccumulator:
                 if self._e3_active:
                     for item in self._e3_phase1_maps:
                         item[removed] = 0
-                    for mask in (
-                        self._e3_old_union,
-                        self._e3_region_big,
-                        self._e3_region_small,
-                    ):
-                        if mask is not None:
-                            mask[removed] = False
+                    if self._e3_old_union is not None:
+                        self._e3_old_union[removed] = False
+                    # Regiões são suporte geométrico para redesenhar, não votos.
                     for side in (self._e3_side_big, self._e3_side_small):
                         if side._confirmed is not None:
                             side._confirmed[removed] = False
@@ -1987,6 +1989,11 @@ class _PageCleanWorker:
         # _HAND_REST_STILL_SECONDS. None = nenhum movimento
         # reportado ainda — nao conta como parada.
         self._hand_motion_at = None
+        # Estado do evento geometrico (frente do cenario E3, atras
+        # de DRAW_INK_FOLLOW_MOVE): True enquanto o quad submetido
+        # segue fora da moldura da ancora — o periodo em que o
+        # descanso nao pode fechar.
+        self._geo_away = False
         # Telemetria por etapa (U0 do loop v2): contadores e os
         # carimbos das ultimas passadas, para medir onde o tempo
         # submit->publicacao mora sem mudar comportamento nenhum.
@@ -2063,7 +2070,7 @@ class _PageCleanWorker:
             self._condition.notify_all()
             return self._generation
 
-    def submit(self, warped, generation, corners=None, visible=None):
+    def submit(self, warped, generation, corners=None, visible=None, coverage=None):
         """Entrega o warp mais recente (latest-wins).
 
         corners e o quad que retificou ESTE warp (os mesmos
@@ -2080,6 +2087,17 @@ class _PageCleanWorker:
         nao vota, a virada nao julga e a decisao de identidade so
         olha a tinta anterior visivel. Formato divergente do warp
         e tratado como ausente, pela mesma razao dos cantos.
+
+        coverage e a cobertura de folha DESTE warp (True onde a
+        retificacao cobre papel de verdade; False onde o quad
+        admitiu o que esta fora da folha — mesa que entra por
+        quad largo ou atrasado depois de movimento). Onde ela e
+        False, a passada so vota sobre a tinta que a ancora ja
+        conhece: re-confirmar e retrair o que existe, sim; tinta
+        nova nascendo fora da folha, nunca. Assim o defeito
+        semantico da mascara (traco denso virando "fundo" numa
+        pose nova) nao congela a tinta real — ela ja e tinta —
+        e a banda de mesa, que nunca foi tinta, segue vedada.
         """
         if corners is not None:
             try:
@@ -2095,16 +2113,57 @@ class _PageCleanWorker:
                 visible = None
             if visible is not None and visible.shape != warped.shape[:2]:
                 visible = None
+        if coverage is not None:
+            try:
+                coverage = np.asarray(coverage, dtype=bool)
+            except (TypeError, ValueError):
+                coverage = None
+            if coverage is not None and coverage.shape != warped.shape[:2]:
+                coverage = None
         with self._condition:
             if self._stopped or generation != self._generation:
                 return
+            if (
+                _experimental_enabled("DRAW_INK_FOLLOW_MOVE")
+                and corners is not None
+                and self._anchor_corners is not None
+            ):
+                # Evento geometrico: o quad deste warp saiu da
+                # moldura da ancora (folha que se moveu de
+                # verdade, nao jitter — quem envia aqui ja e a
+                # geometria estabilizada do laco). Enquanto o
+                # deslocamento persistir, a premissa do descanso
+                # ("pagina parada, nada para ver") esta refutada:
+                # a vista pode ter evidencia que o canvas nunca
+                # contou. A quietude nao acumula — a sonda fica no
+                # regime de 1 Hz do modo sem sinal de mao — e o
+                # descanso so volta quando a geometria retorna a
+                # moldura ou a saida prova que nao ha nada novo.
+                away = (
+                    float(
+                        np.max(np.linalg.norm(corners - self._anchor_corners, axis=1))
+                    )
+                    > _GEO_WAKE_MOVE_PX
+                )
+                if away:
+                    self._quiet_passes = 0
+                    self._activity_quiet_passes = 0
+                    self._still_passes = 0
+                self._geo_away = away
             if self._pending is not None:
                 # Latest-wins: um warp pendente substituido nunca
                 # vira passada; a telemetria conta a substituicao
                 # porque ela e atraso real de atualizacao.
                 self._telemetry_replaced += 1
             self._telemetry_submits += 1
-            self._pending = (warped, generation, self._clock(), corners, visible)
+            self._pending = (
+                warped,
+                generation,
+                self._clock(),
+                corners,
+                visible,
+                coverage,
+            )
             self._condition.notify_all()
 
     def set_hand_presence(self, present, moved=False):
@@ -2948,7 +3007,14 @@ class _PageCleanWorker:
 
     def _take_pending_locked(self):
         """Retira o pendente e abre a passada (com a Condition na mao)."""
-        warped, generation, submitted_at, corners, visible = self._pending
+        (
+            warped,
+            generation,
+            submitted_at,
+            corners,
+            visible,
+            coverage,
+        ) = self._pending
         self._pending = None
         # Intervalo que governou a espera desta passada (o regime
         # de cadencia em vigor na retirada, antes de _last_pass_start
@@ -2969,6 +3035,7 @@ class _PageCleanWorker:
             submitted_at,
             corners,
             visible,
+            coverage,
             pass_started_at,
             scheduled_interval,
             scheduled_hand_state,
@@ -3004,6 +3071,7 @@ class _PageCleanWorker:
             submitted_at,
             corners,
             visible,
+            coverage,
             pass_started_at,
             scheduled_interval,
             scheduled_hand_state,
@@ -3061,6 +3129,10 @@ class _PageCleanWorker:
                 prob = ink_prob(warped)
             else:
                 prob = (self._page_clean.ink_mask(warped) > 0).astype(np.float32)
+            # Cobertura de folha (DRAW_SHEET_COVERAGE) viaja em
+            # canal proprio ate depois do registro: o veto nao e
+            # cego nem se confunde com oclusao de mao — ver o
+            # gate de re-confirmacao abaixo, no espaco da ancora.
             pass_ended_at = self._clock()
             with self._condition:
                 if self._stopped:
@@ -3151,6 +3223,11 @@ class _PageCleanWorker:
                                 }
                             )
                 confirmed = self._accumulator._confirmed
+                anchor_ink = (
+                    confirmed > 0
+                    if confirmed is not None and confirmed.shape == prob.shape
+                    else None
+                )
                 ecc_reference = (
                     confirmed.astype(np.float32) / 255.0
                     if (
@@ -3164,6 +3241,44 @@ class _PageCleanWorker:
             registered_prob, registered_visible, ecc_info = _register_ink_probability(
                 prob, anchor, registration_corners, ecc_reference, visible
             )
+            if coverage is not None and coverage.shape == prob.shape:
+                # Gate de re-confirmacao (DRAW_SHEET_COVERAGE): onde
+                # o warp nao e folha, so a tinta que a ancora JA
+                # conhece vota — re-confirmar e retrair o que
+                # existe, sim; tinta nova nascendo na mesa, nunca.
+                # e o que separa o buraco semantico (a faixa de
+                # texto que o segmentador marca como fundo na pose
+                # nova, E3 2026-11-12) da banda de mesa: os dois
+                # sao "fora da mascara perto dela", mas so um ja
+                # era tinta. Sem tinta de ancora o gate e o veto
+                # seco de sempre.
+                if anchor is not None and registration_corners is not None:
+                    reg_matrix = _registration_matrix(
+                        anchor, registration_corners, prob.shape
+                    )
+                    if not _registration_is_identity(reg_matrix):
+                        reg_coverage = (
+                            cv2.warpPerspective(
+                                coverage.astype(np.uint8),
+                                reg_matrix,
+                                (prob.shape[1], prob.shape[0]),
+                                flags=cv2.INTER_NEAREST,
+                                borderValue=0,
+                            )
+                            > 0
+                        )
+                    else:
+                        reg_coverage = coverage
+                else:
+                    reg_coverage = coverage
+                if anchor_ink is None:
+                    registered_prob = registered_prob * reg_coverage
+                else:
+                    registered_prob = np.where(
+                        reg_coverage | anchor_ink,
+                        registered_prob,
+                        0.0,
+                    ).astype(np.float32)
             if anchor is not None and registration_corners is not None:
                 matrix = _registration_matrix(anchor, registration_corners, prob.shape)
                 reg_info["registration_displacement_px"] = _matrix_grid_displacement(
@@ -3655,21 +3770,13 @@ class _PageCleanWorker:
                 # Telemetria da regra E5-S (so com
                 # DRAW_INK_VOTE_E4 ligada): fase e trilhas.
                 reg_info["ink_vote_e4_passes"] = result["ink_vote_e4_passes"]
-                reg_info["ink_vote_e4_tracks_big"] = result[
-                    "ink_vote_e4_tracks_big"
-                ]
+                reg_info["ink_vote_e4_tracks_big"] = result["ink_vote_e4_tracks_big"]
                 reg_info["ink_vote_e4_tracks_small"] = result[
                     "ink_vote_e4_tracks_small"
                 ]
-                reg_info["ink_vote_e4_tracks_slow"] = result[
-                    "ink_vote_e4_tracks_slow"
-                ]
-                reg_info["ink_vote_e4_tracks_thin"] = result[
-                    "ink_vote_e4_tracks_thin"
-                ]
-                reg_info["ink_vote_e4_tracks_sub"] = result[
-                    "ink_vote_e4_tracks_sub"
-                ]
+                reg_info["ink_vote_e4_tracks_slow"] = result["ink_vote_e4_tracks_slow"]
+                reg_info["ink_vote_e4_tracks_thin"] = result["ink_vote_e4_tracks_thin"]
+                reg_info["ink_vote_e4_tracks_sub"] = result["ink_vote_e4_tracks_sub"]
             if result.get("ink_vote_fast"):
                 # Telemetria do corte de latencia (so com
                 # DRAW_INK_VOTE_FAST ligada).

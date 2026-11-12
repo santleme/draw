@@ -1,6 +1,7 @@
 """Testes do simulador procedural (frente 103): funções puras e
 o contrato do corpus — GT exato, bandas, impressão separada da
 tinta, homografia salva. Sem ONNX, sem modelos."""
+
 import json
 import sys
 from pathlib import Path
@@ -8,9 +9,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-sys.path.insert(
-    0, str(Path(__file__).resolve().parent.parent / "tools")
-)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 
 from sim_writer import (  # noqa: E402
     SHEET_H,
@@ -46,8 +45,7 @@ def test_gt_final_equals_full_drawing():
     rng = np.random.default_rng(0)
     strokes, _, _, _ = build_strokes("cad", rng)
     total = sum(
-        np.linalg.norm(np.diff(s.points, axis=0), axis=1).sum()
-        for s in strokes
+        np.linalg.norm(np.diff(s.points, axis=0), axis=1).sum() for s in strokes
     )
     page = np.full((SHEET_H, SHEET_W, 3), 243, np.uint8)
     gt = np.zeros((SHEET_H, SHEET_W), np.uint8)
@@ -102,11 +100,13 @@ def test_homography_maps_sheet_corners():
 
 def test_events_corners_push_and_rotation():
     events = {
-        "push_frame": 10, "push_px": 25.0,
+        "push_frame": 10,
+        "push_px": 25.0,
         "occlusion_frames": [14, 15, 16],
         "occlusion_center_sheet": [620.0, 390.0],
         "occlusion_radius_sheet": 95.0,
-        "rotation_frame": 20, "rotation_deg": 2.0,
+        "rotation_frame": 20,
+        "rotation_deg": 2.0,
     }
     base = corners_at(0, events)
     pushed = corners_at(10, events)
@@ -119,8 +119,7 @@ def test_generate_scenario_corpus_contract(tmp_path):
     side = generate_scenario(tmp_path, "blank_keyboard")
     scen = tmp_path / "blank_keyboard"
     assert (scen / "frames").is_dir()
-    assert len(list((scen / "frames").glob("*.png"))) == len(
-        side["frames"])
+    assert len(list((scen / "frames").glob("*.png"))) == len(side["frames"])
     saved = json.loads((scen / "sidecar.json").read_text())
     assert saved["format"] == "sim_writer_v1"
     assert saved["sheet_space"] == [SHEET_W, SHEET_H]

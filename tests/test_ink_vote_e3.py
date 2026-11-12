@@ -145,8 +145,13 @@ def test_off_runs_the_current_rule_without_new_keys(off):
 
 
 def test_off_canvas_equals_default_rule_on_mixed_sequence(off):
-    sequence = [_page([BASE]), _page([BASE]), _page([BASE, BIG]),
-                _page([BASE, BIG]), _page([BASE])]
+    sequence = [
+        _page([BASE]),
+        _page([BASE]),
+        _page([BASE, BIG]),
+        _page([BASE, BIG]),
+        _page([BASE]),
+    ]
     acc_a, acc_b = _acc(), _acc()
     for prob in sequence:
         result_a = acc_a.add(prob)

@@ -21,6 +21,7 @@ Corpus: diretório com imagens, ou diretório de sessão gravada
 (com subpasta raw/). Modelos: os de models/ do repo quando
 presentes; senão ~/workspace/draw/models/.
 """
+
 import argparse
 import json
 import os
@@ -46,9 +47,7 @@ def list_corpus_frames(corpus):
         if (corpus / sub).is_dir():
             src = corpus / sub
             break
-    files = sorted(
-        p for p in src.iterdir() if p.suffix.lower() in IMG_EXTS
-    )
+    files = sorted(p for p in src.iterdir() if p.suffix.lower() in IMG_EXTS)
     if not files:
         raise FileNotFoundError(f"nenhum frame em {src}")
     return files
@@ -102,10 +101,7 @@ def compute_signals(records):
         if tracker_quad is not None:
             prev_tracker = tracker_quad
             q = np.asarray(tracker_quad, float)
-            sides = [
-                float(np.linalg.norm(q[(i + 1) % 4] - q[i]))
-                for i in range(4)
-            ]
+            sides = [float(np.linalg.norm(q[(i + 1) % 4] - q[i])) for i in range(4)]
             r["sig_quad_aspect"] = max(sides) / max(1.0, min(sides))
         else:
             r["sig_quad_aspect"] = None
@@ -163,8 +159,7 @@ def select_worst(records, top_k, min_gap=2):
     scored = []
     for i, r in enumerate(records):
         score = (
-            jumps[i] + areas[i] + growth[i] + tjumps[i] + aspects[i]
-            + 1.5 * flips[i]
+            jumps[i] + areas[i] + growth[i] + tjumps[i] + aspects[i] + 1.5 * flips[i]
         )
         scored.append((score, i))
     scored.sort(reverse=True)
@@ -204,9 +199,7 @@ def build_panel(frame, quad, warp, ink_mask):
         wh, ww = warp.shape[:2]
         mask_panel = warp.copy()
         if ink_mask is not None:
-            m = cv2.resize(
-                (ink_mask > 0).astype(np.uint8) * 255, (ww, wh)
-            )
+            m = cv2.resize((ink_mask > 0).astype(np.uint8) * 255, (ww, wh))
             green = np.zeros_like(warp)
             green[:, :, 1] = 255
             mask_panel = np.where(
@@ -219,8 +212,14 @@ def build_panel(frame, quad, warp, ink_mask):
     for panel, label in zip(panels, labels):
         cv2.rectangle(panel, (0, 0), (pw, 26), (0, 0, 0), -1)
         cv2.putText(
-            panel, label, (6, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-            (255, 255, 255), 1, cv2.LINE_AA,
+            panel,
+            label,
+            (6, 19),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
         )
     top = np.hstack(panels[:2])
     bottom = np.hstack(panels[2:])
@@ -252,9 +251,20 @@ def _default_model(name):
     return Path.home() / "workspace" / "draw" / "models" / name
 
 
-def run_replay(corpus, out_dir, *, top_k=8, stride=1, scene_fps=2.0,
-               flags=None, detector=None, page_clean=None,
-               sheet_model=None, ink_model=None, panel_frames=None):
+def run_replay(
+    corpus,
+    out_dir,
+    *,
+    top_k=8,
+    stride=1,
+    scene_fps=2.0,
+    flags=None,
+    detector=None,
+    page_clean=None,
+    sheet_model=None,
+    ink_model=None,
+    panel_frames=None,
+):
     """Roda o corpus pelo laço real. detector/page_clean injetáveis
     (testes); por omissão, os modelos reais. panel_frames: conjunto
     de índices (na enumeração com stride) cujos artefatos se gravam;
@@ -283,13 +293,22 @@ def run_replay(corpus, out_dir, *, top_k=8, stride=1, scene_fps=2.0,
         # então o lab rebaixa a verificação NESTE processo (o app
         # segue estrito) e o relatório declara o sha usado.
         ink_path = ink_model or _default_model("page_clean_unet.onnx")
-        if ink_model is None and not (
-            Path(__file__).resolve().parent.parent
-            / "models" / "page_clean_unet.onnx"
-        ).exists():
+        if (
+            ink_model is None
+            and not (
+                Path(__file__).resolve().parent.parent
+                / "models"
+                / "page_clean_unet.onnx"
+            ).exists()
+        ):
             candidate = (
-                Path.home() / "workspace" / "draw-lab" / "live-audit-2026-11-10"
-                / "frente48" / "results" / "page_clean_finetune_real_v6.onnx"
+                Path.home()
+                / "workspace"
+                / "draw-lab"
+                / "live-audit-2026-11-10"
+                / "frente48"
+                / "results"
+                / "page_clean_finetune_real_v6.onnx"
             )
             if candidate.exists():
                 ink_path = candidate
@@ -311,14 +330,18 @@ def run_replay(corpus, out_dir, *, top_k=8, stride=1, scene_fps=2.0,
             self.traces = []
 
         def submit(self, frame, captured_at, frame_index=None):
-            corners, verdict, trace = _detect_sheet_combined_traced(
-                frame, detector
-            )
+            outcome = _detect_sheet_combined_traced(frame, detector)
+            corners, verdict, trace = outcome[0], outcome[1], outcome[2]
+            extras = outcome[3] if len(outcome) > 3 else None
             self._seq += 1
             result = (self._seq, corners, verdict, captured_at, 1.0)
             gate = _gate_info_from_trace(trace)
             if gate is not None:
                 result = result + (gate,)
+            if extras is not None:
+                if gate is None:
+                    result = result + (None,)
+                result = result + (extras,)
             self._result = result
             self.traces.append(trace)
 
@@ -355,11 +378,7 @@ def run_replay(corpus, out_dir, *, top_k=8, stride=1, scene_fps=2.0,
         # entre rodadas idênticas — medido na frente 102.
         t_before = ink_worker._passes_total
         ink_worker.pump()
-        passes_now = (
-            [round(clock.t, 3)]
-            if ink_worker._passes_total > t_before
-            else []
-        )
+        passes_now = [round(clock.t, 3)] if ink_worker._passes_total > t_before else []
         loop.collect_ink()
         quad = (
             None
@@ -368,9 +387,7 @@ def run_replay(corpus, out_dir, *, top_k=8, stride=1, scene_fps=2.0,
         )
         trace = det_worker.traces[-1] if det_worker.traces else {}
         canvas_px = (
-            int((loop.clean_mask > 0).sum())
-            if loop.clean_mask is not None
-            else 0
+            int((loop.clean_mask > 0).sum()) if loop.clean_mask is not None else 0
         )
         rec = {
             "frame": idx,
@@ -392,13 +409,9 @@ def run_replay(corpus, out_dir, *, top_k=8, stride=1, scene_fps=2.0,
             ink_mask = None
             if quad is not None:
                 try:
-                    warp = warp_sheet(
-                        frame, np.asarray(quad, np.float32)
-                    )
+                    warp = warp_sheet(frame, np.asarray(quad, np.float32))
                     prob = page_clean.ink_prob(warp)
-                    ink_mask = (prob >= page_clean.threshold).astype(
-                        np.uint8
-                    )
+                    ink_mask = (prob >= page_clean.threshold).astype(np.uint8)
                 except Exception:  # prancha sem warp é diagnóstico tb
                     warp, ink_mask = None, None
             panel = build_panel(frame, quad, warp, ink_mask)
@@ -406,8 +419,12 @@ def run_replay(corpus, out_dir, *, top_k=8, stride=1, scene_fps=2.0,
     compute_signals(records)
     (out_dir / "telemetry.json").write_text(
         json.dumps(
-            {"corpus": str(corpus), "stride": stride,
-             "scene_fps": scene_fps, "frames": records},
+            {
+                "corpus": str(corpus),
+                "stride": stride,
+                "scene_fps": scene_fps,
+                "frames": records,
+            },
             indent=1,
         )
     )
@@ -426,15 +443,24 @@ def main(argv=None):
     flags = [f for f in args.flags.split(",") if f.strip()]
     out = Path(args.out)
     records = run_replay(
-        args.corpus, out, top_k=args.top_k, stride=args.stride,
-        scene_fps=args.fps_cena, flags=flags,
+        args.corpus,
+        out,
+        top_k=args.top_k,
+        stride=args.stride,
+        scene_fps=args.fps_cena,
+        flags=flags,
     )
     worst = select_worst(records, args.top_k)
     # 2ª passagem determinística: artefatos só dos selecionados.
     wanted = {w["index"] for w in worst}
     run_replay(
-        args.corpus, out, top_k=args.top_k, stride=args.stride,
-        scene_fps=args.fps_cena, flags=flags, panel_frames=wanted,
+        args.corpus,
+        out,
+        top_k=args.top_k,
+        stride=args.stride,
+        scene_fps=args.fps_cena,
+        flags=flags,
+        panel_frames=wanted,
     )
     by_idx = {r["frame"]: r for r in records}
     index = [
@@ -444,8 +470,10 @@ def main(argv=None):
             "signals": {
                 k: by_idx[w["index"]].get(k)
                 for k in (
-                    "sig_quad_jump_px", "sig_area_change",
-                    "sig_canvas_growth_px", "sig_presence_flip",
+                    "sig_quad_jump_px",
+                    "sig_area_change",
+                    "sig_canvas_growth_px",
+                    "sig_presence_flip",
                 )
             },
             "panel": f"panel_{w['index']:04d}.png",

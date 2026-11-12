@@ -233,7 +233,7 @@ def test_traced_source_matches_the_combined_outcome(
 
     frame = _frame(0)
     plain = app_module._detect_sheet_combined(frame, detector())
-    corners, verdict, trace = app_module._detect_sheet_combined_traced(
+    corners, verdict, trace, _extras = app_module._detect_sheet_combined_traced(
         frame, detector()
     )
     # A decisao e a mesma do caminho sem rastro.

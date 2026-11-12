@@ -59,23 +59,54 @@ foi enviado à VM nem publicado. Não é aprovação semântica das propostas.
 | Execução completa | Passou | Falhou | Skip |
 |---|---:|---:|---:|
 | Base 3c00e29, worktree separado | 1.031 | 2 | 4 |
-| Esta implementação | 1.065 | 1 | 4 |
+| Implementação após revisão, antes de integrar a PR 66 | 1.080 | 1 | 4 |
+| Follow-up sobre main após merges 66/67 | 1.104 | 1 | 4 |
 
-Foram adicionados 33 casos; o subconjunto de self-learning, registro,
-arbitragem, remoção, replay e documentação passou 110/110. A falha comum
+Foram adicionados 48 casos; o subconjunto de self-learning, registro,
+arbitragem, remoção, replay e documentação passou 125/125. A falha comum
 é `test_sim_writer.py::test_generate_scenario_corpus_contract`, que exige
 fundos privados de laboratório ausentes na VM; ela também reprova o CI da
 base. A outra falha da execução-base é a asserção de identidade do teste
 threaded `test_new_sheet_does_not_inherit_the_previous_canvas`; passou na
 execução desta branch, sem alteração desse teste. Não se alega tê-la corrigido.
-Os mesmos 110 casos também passaram no WSL em worktree isolada; o pytest
+Os mesmos 125 casos também passaram no WSL em worktree isolada; o pytest
 foi instalado em diretório próprio de teste, sem alterar o venv do aplicativo.
+Após o merge da PR 67 em `01efd20`, as duas correções posteriores foram
+separadas em follow-up sobre `d69cee6`: 113 casos focados passam nessa base
+e 125 no follow-up. A falta de fundos privados também foi reproduzida nessa
+base atual; os outros casos adicionados pelo merge 66 não são desta frente.
 
 `ruff check .`, compilação e formato dos fontes tocados passam. O formato
 global já falha em 15 arquivos na base e ainda falha em 13 intocados aqui;
 o CI `rapido` da base confirma isso. Não desabilitar os checks nem publicar
 os fundos privados para deixá-los verdes. Essas pendências são anteriores
 e separadas da régua de comportamento; não houve promoção de modelo.
+
+Na revisão, preservou-se o `session_id` original (validado como nome simples)
+para não ocultar holdout anterior; `split.json` prévio impede teacher no
+holdout. IDs de lote permanecem hash, mesmo quando o selo contém caminhos:
+uma chave do catálogo nunca vira caminho de saída. Na borracha E3, votos e
+memórias dos pixels removidos são limpos sem reiniciar a fase global; as
+regiões geométricas permanecem disponíveis para redesenho. Há regressões
+para ruído rejeitado não confirmar após apagar e para redesenho em ambas
+as trilhas laterais, com FAST ligado/desligado.
+
+**Tentativa de teste nativo automatizado (não é prova ao vivo):** em
+`01efd20`, modelos oficiais verificados e vídeo MJPEG sintético, com E3,
+content guard e remoção ligados e arbitragem desligada. A folha foi
+detectada, mas os 101 passes registrados produziram zero pixels de máscara
+e de tinta confirmada; salvar o canvas gerou imagem branca. O pré-requisito
+falhou: mover, apagar, redesenhar e casos negativos não foram executados.
+Não atribuir isso à PR nem ao papel real sem evidência independente.
+MediaPipe estava ausente, portanto não houve validação de oclusão por mão.
+Sair com Q terminou em falha de segmentação (139), sem manifesto final.
+A comparação nativa com a base `3c00e29`, mesma fonte/modelos/ambiente/flags,
+reproduziu 139 e ausência de manifesto também na base. Ambos os traces
+apontam o pump da captura durante o encerramento; a causa exata não foi
+determinada. É uma falha herdada neste ambiente, não uma regressão provada
+da PR. A comparação usou `01efd20`; não se repetiu a UI nas correções
+posteriores de isolamento/E3. O subconjunto de código cobre essas correções,
+mas não substitui uma fonte temporal reconhecida para validar mover/apagar.
 
 | ID | Falha | Classe | Severidade | Régua |
 |---|---|---|---|---|

@@ -203,9 +203,13 @@ class ReseededQuadPropagator:
         if h_step is None or inl is None or int(inl.sum()) < _LK_MIN_INLIERS:
             return self._die()
         self.last_inliers = int(inl.sum())
-        q_new = cv2.perspectiveTransform(
-            self.quad.astype(np.float32).reshape(-1, 1, 2), h_step
-        ).reshape(-1, 2).astype(np.float64)
+        q_new = (
+            cv2.perspectiveTransform(
+                self.quad.astype(np.float32).reshape(-1, 1, 2), h_step
+            )
+            .reshape(-1, 2)
+            .astype(np.float64)
+        )
         area_new = abs(cv2.contourArea(q_new.astype(np.float32)))
         area_cur = abs(cv2.contourArea(self.quad.astype(np.float32)))
         if not _quad_is_plausible(q_new, self.anchor_area) or not (
@@ -213,10 +217,14 @@ class ReseededQuadPropagator:
         ):
             return self._die()
         self._h_total = h_step @ self._h_total
-        self.quad = cv2.perspectiveTransform(
-            self.anchor_quad.astype(np.float32).reshape(-1, 1, 2),
-            self._h_total,
-        ).reshape(-1, 2).astype(np.float64)
+        self.quad = (
+            cv2.perspectiveTransform(
+                self.anchor_quad.astype(np.float32).reshape(-1, 1, 2),
+                self._h_total,
+            )
+            .reshape(-1, 2)
+            .astype(np.float64)
+        )
         self.steps_since_anchor += 1
         return self.quad.copy()
 

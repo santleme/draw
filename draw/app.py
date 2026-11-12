@@ -90,6 +90,7 @@ from .sheet_track import (
     _lk_track_corners as _lk_track_corners,
     _DETECTION_STOP_TIMEOUT_SECONDS as _DETECTION_STOP_TIMEOUT_SECONDS,
     _SheetDetectionWorker as _SheetDetectionWorker,
+    sheet_coverage_enabled as sheet_coverage_enabled,
 )
 from .capture import (
     _CAPTURE_MAX_FAILURES as _CAPTURE_MAX_FAILURES,
@@ -365,7 +366,7 @@ def _detect_sheet_combined(frame, neural_detector):
     sem esse canal, cada ajuste recusado vira contagem de perda e a
     folha cai durante os episódios de oclusão).
     """
-    corners, verdict, _trace = _detect_sheet_combined_traced(frame, neural_detector)
+    corners, verdict = _detect_sheet_combined_traced(frame, neural_detector)[:2]
     return corners, verdict
 
 
@@ -394,11 +395,19 @@ def _detect_sheet_combined_traced(frame, neural_detector):
         "classic_corners": None,
     }
 
+    coverage_on = sheet_coverage_enabled()
+    extras = {}
+
     def _done(corners, verdict, source):
         trace["source"] = source
         trace["combined_corners"] = _corners_json(corners)
         trace["combined_verdict"] = verdict
-        return corners, verdict, trace
+        # Com a flag ligada, extras sai sempre (mesmo vazio): é o
+        # que deixa a detecção clássica ou sem máscara LIMPAR a
+        # cobertura anterior no laço, em vez de deixá-la defasada.
+        # Sem a flag, extras vazio volta a ser None — a tupla de
+        # sempre, byte a byte.
+        return corners, verdict, trace, extras if coverage_on else (extras or None)
 
     def _classic():
         corners, verdict = paper_module.detect_sheet_with_confidence(frame)
@@ -413,15 +422,37 @@ def _detect_sheet_combined_traced(frame, neural_detector):
 
     if neural_detector is not None:
         trace["veto_logit"] = float(neural_module.PRESENCE_VETO_LOGIT)
-        if neural_module.first_confirm_gate_enabled():
-            # Portão de primeira confirmação (frente 88): com a flag
-            # ligada, a detecção pede a máscara — é dela que sai o
-            # edge_in que o laço (draw.loop) julga antes de o
-            # rastreador confirmar a primeira folha. A decisão
-            # combinada é a mesma; só o rastro ganha o campo.
+        if neural_module.first_confirm_gate_enabled() or coverage_on:
+            # Portão de primeira confirmação (frente 88) e cobertura
+            # de folha (DRAW_SHEET_COVERAGE): com qualquer uma ligada,
+            # a detecção pede a máscara — o portão lê o edge_in que o
+            # laço julga antes da primeira folha; a cobertura vai no
+            # extras para o laço retificar com a homografia do warp
+            # de tinta. A decisão combinada é a mesma.
             corners, verdict, mask = neural_detector(frame, return_mask=True)
             if corners is not None and mask is not None:
-                trace["edge_in"] = float(neural_module.mask_edge_fraction(frame, mask))
+                if neural_module.first_confirm_gate_enabled():
+                    trace["edge_in"] = float(
+                        neural_module.mask_edge_fraction(frame, mask)
+                    )
+                # Máscara quase vazia não é evidência de folha: sem
+                # o piso, uma detecção ruim transformaria a cobertura
+                # num voto sempre-zero e secaria a tinta inteira. A
+                # cobertura é papel+tinta+mão — só o fundo fica fora.
+                coverage_mask = getattr(neural_detector, "last_coverage_mask", None)
+                if (
+                    coverage_on
+                    and coverage_mask is not None
+                    and np.count_nonzero(coverage_mask) > coverage_mask.size * 0.05
+                ):
+                    frame_h, frame_w = frame.shape[:2]
+                    if coverage_mask.shape != (frame_h, frame_w):
+                        coverage_mask = cv2.resize(
+                            coverage_mask,
+                            (frame_w, frame_h),
+                            interpolation=cv2.INTER_NEAREST,
+                        )
+                    extras["coverage_mask"] = coverage_mask
         else:
             corners, verdict = neural_detector.detect_sheet_with_confidence(frame)
         logit = neural_detector.last_presence_logit
