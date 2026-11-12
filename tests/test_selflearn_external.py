@@ -292,3 +292,33 @@ def test_existing_seal_blocks_teacher_before_labeling(tmp_path):
     )
     assert teacher.calls == 0
     assert review.holdout_pages(tmp_path / "ok")[0]["session_id"] == "recorded-holdout"
+
+
+@pytest.mark.parametrize("batch_id", ["../outside", r"..\outside", "ABSOLUTE"])
+@pytest.mark.parametrize("side", ["train", "holdout"])
+def test_sealed_batch_names_are_never_output_paths(tmp_path, batch_id, side):
+    root = catalog(tmp_path, groups=("batch", "batch", "batch"))
+    if batch_id == "ABSOLUTE":
+        batch_id = str(tmp_path / "outside")
+    manifest = root / "frames.csv"
+    with manifest.open() as stream:
+        rows = list(csv.DictReader(stream))
+    for row in rows:
+        del row["session_id"]
+        row["batch_id"] = batch_id
+    with manifest.open("w") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    (root / "split.json").write_text(json.dumps({"assignments": {batch_id: side}}))
+    teacher = Teacher()
+    pool = tmp_path / "pool"
+    report = external.translate(
+        root, pool, "batch-data", model=teacher, images_are_pages=True
+    )
+    assert report[side] == 3
+    assert teacher.calls == (3 if side == "train" else 0)
+    assert all(
+        r["session_id"].startswith("external-") for r in review.review_pages(pool, side)
+    )
+    assert not (tmp_path / "outside").exists()
