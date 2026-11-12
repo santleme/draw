@@ -145,6 +145,77 @@ _TIMING_LOG_EVERY = 100
 # neural subdispara num setup novo.
 PRESENCE_VETO_LOGIT = -3.0
 
+# Portão de PRIMEIRA confirmação anti-fantasma (frente 85, medido em
+# 2026-11-12 no laboratório; implementação na frente 88). Na sessão
+# viva de 2026-11-11, a máscara deste detector fechou um blob único e
+# liso sobre a mancha desgastada do mousepad (presença piscando em
+# +0,07…+0,51) e o rastreador confirmou a "folha" com UM quad só:
+# 2 gerações nasceram sobre a mesa vazia. Toda folha real daquela
+# sessão entrou com logit ≥ +3,81. O portão — ativo só com a variável
+# DRAW_FIRST_CONFIRM_GATE=1 e só enquanto o rastreador NÃO tem folha
+# (a lógica mora em draw.loop) — exige, para a detecção neural que
+# fecharia a primeira folha: logit de presença ≥ 2,0 E fração de
+# arestas internas da máscara ≥ 0,005. Na bancada da frente 85 ele
+# zera as entradas fantasma da sessão sem atrasar a folha real,
+# corta as cenas sustentadas da bancada de ausência de 67 para 40 e
+# mantém 43/43 controles positivos (folga: logit mín 8,3, arestas
+# mín 0,019). NÃO é o portão de presença do modelo C (a cabeça
+# `presence` de outro modelo, que segue desligada): isto é regra de
+# aquisição sobre o logit DESTE detector + textura da máscara dele.
+FIRST_CONFIRM_MIN_LOGIT = 2.0
+FIRST_CONFIRM_MIN_EDGE_IN = 0.005
+_FIRST_CONFIRM_GRID = 384
+_FIRST_CONFIRM_CANNY_LOW = 60
+_FIRST_CONFIRM_CANNY_HIGH = 180
+_ENV_FIRST_CONFIRM_GATE_VAR = "DRAW_FIRST_CONFIRM_GATE"
+
+
+def first_confirm_gate_enabled():
+    """True só com DRAW_FIRST_CONFIRM_GATE=1 (default: desligado)."""
+    return os.environ.get(_ENV_FIRST_CONFIRM_GATE_VAR, "").strip() == "1"
+
+
+def mask_edge_fraction(frame, mask):
+    """Fração de píxeis de aresta DENTRO da máscara, na grade 384².
+
+    A receita medida da frente 85, sem desvio: frame e máscara
+    reduzidos a 384x384 (máscara com vizinho-mais-próximo), Canny
+    60/180 sobre o cinza, e a fração dos píxeis da máscara que são
+    aresta. O blob fantasma do mousepad é liso (0,0003–0,004); papel
+    real tem pauta/textura (0,019+ nos controles dele). Máscara vazia
+    devolve 0,0.
+    """
+    small = cv2.resize(frame, (_FIRST_CONFIRM_GRID, _FIRST_CONFIRM_GRID))
+    small_mask = (
+        cv2.resize(
+            mask,
+            (_FIRST_CONFIRM_GRID, _FIRST_CONFIRM_GRID),
+            interpolation=cv2.INTER_NEAREST,
+        )
+        > 0
+    )
+    if not small_mask.any():
+        return 0.0
+    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    canny = cv2.Canny(gray, _FIRST_CONFIRM_CANNY_LOW, _FIRST_CONFIRM_CANNY_HIGH)
+    return float((canny[small_mask] > 0).mean())
+
+
+def first_confirm_passes(presence_logit, edge_in):
+    """O veredito do portão: logit E arestas, os dois com folga.
+
+    Sinal ausente (None) reprova: sem logit ou sem máscara não há
+    como distinguir a folha real do blob liso, e a detecção fraca é
+    rebaixada só naquela ronda — a folha entra no primeiro frame
+    forte, não fica bloqueada.
+    """
+    if presence_logit is None or edge_in is None:
+        return False
+    return (
+        float(presence_logit) >= FIRST_CONFIRM_MIN_LOGIT
+        and float(edge_in) >= FIRST_CONFIRM_MIN_EDGE_IN
+    )
+
 # Guarda de plausibilidade do ajuste (medida em 2026-10-30 no
 # laboratório, draw-lab/noite-2026-10-30/block6/): o ajuste neural cru
 # é biestável sob oclusão. Nas 1.132 detecções gravadas dos dois

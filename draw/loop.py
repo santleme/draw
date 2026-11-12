@@ -23,6 +23,7 @@ import cv2
 import numpy as np
 
 from . import ink as ink_module
+from . import neural as neural_module
 from . import paper as paper_module
 from .ink_layers import _render_layered_canvas
 from .sheet_track import _SheetTracker, _lk_track_corners
@@ -181,6 +182,11 @@ class SheetInkLoop:
         self.last_det_seq = 0
         self.display_corners = None
         self.display_gray = None
+        # Portão de primeira confirmação (frente 88, so leitura):
+        # quantas primeiras detecções o portão rebaixou e o retrato
+        # da última avaliada (logit/edge_in/veredito do portão).
+        self.first_confirm_gate_blocked = 0
+        self.last_first_confirm_gate = None
         # Observabilidade (sem efeito no laco): ultimo evento do
         # rastreador e contagem das aberturas de geracao por causa.
         self.last_tracker_event = None
@@ -195,6 +201,7 @@ class SheetInkLoop:
         tinta morreu (o aviso ja saiu no log).
         """
         det_result = self.detection_worker.poll(self.last_det_seq)
+        det_gate_info = None
         if det_result is not None:
             (
                 self.last_det_seq,
@@ -202,7 +209,9 @@ class SheetInkLoop:
                 detected_verdict,
                 det_captured_at,
                 self.detect_ms,
-            ) = det_result
+            ) = det_result[:5]
+            if len(det_result) > 5:
+                det_gate_info = det_result[5]
             ran_detection = True
         else:
             detected_corners, detected_verdict = None, None
@@ -214,6 +223,42 @@ class SheetInkLoop:
             )
         if self.detection_worker.error is not None:
             raise self.detection_worker.error
+        # Portão de primeira confirmação anti-fantasma (frentes
+        # 85/88), atrás de DRAW_FIRST_CONFIRM_GATE (default OFF —
+        # com a flag desligada nada aqui roda e o comportamento é o
+        # de sempre, byte a byte). Com a flag ligada, SÓ a primeira
+        # confirmação é julgada: sem folha no rastreador, uma
+        # detecção "paper" de fonte neural só chega ao rastreador
+        # se passar em logit ≥ 2,0 E edge_in ≥ 0,005 (draw.neural).
+        # A detecção fraca é rebaixada a (None, "none") NESTA ronda
+        # apenas — a detecção continua a cada ciclo e a folha entra
+        # no primeiro frame forte. Folha já confirmada, reserva
+        # clássica e presença-só passam intocados; sem o pacote do
+        # portão no resultado (bancada/replay sem rastro), não há
+        # julgamento e nada é bloqueado. A reentrada após uma queda
+        # volta a passar pelo portão, como manda o desenho da
+        # frente 85: fantasmas de reentrada incluídos.
+        if (
+            ran_detection
+            and neural_module.first_confirm_gate_enabled()
+            and self.tracker.corners is None
+            and detected_corners is not None
+            and detected_verdict == "paper"
+            and det_gate_info is not None
+            and det_gate_info.get("source") == "neural"
+        ):
+            gate_passed = neural_module.first_confirm_passes(
+                det_gate_info.get("presence_logit"),
+                det_gate_info.get("edge_in"),
+            )
+            self.last_first_confirm_gate = {
+                "presence_logit": det_gate_info.get("presence_logit"),
+                "edge_in": det_gate_info.get("edge_in"),
+                "passed": gate_passed,
+            }
+            if not gate_passed:
+                self.first_confirm_gate_blocked += 1
+                detected_corners, detected_verdict = None, "none"
         tracker_before = (
             self.tracker.diagnostic_state()
             if self.trace_acquisitions and ran_detection

@@ -411,7 +411,19 @@ def _detect_sheet_combined_traced(frame, neural_detector):
 
     if neural_detector is not None:
         trace["veto_logit"] = float(neural_module.PRESENCE_VETO_LOGIT)
-        corners, verdict = neural_detector.detect_sheet_with_confidence(frame)
+        if neural_module.first_confirm_gate_enabled():
+            # Portão de primeira confirmação (frente 88): com a flag
+            # ligada, a detecção pede a máscara — é dela que sai o
+            # edge_in que o laço (draw.loop) julga antes de o
+            # rastreador confirmar a primeira folha. A decisão
+            # combinada é a mesma; só o rastro ganha o campo.
+            corners, verdict, mask = neural_detector(frame, return_mask=True)
+            if corners is not None and mask is not None:
+                trace["edge_in"] = float(
+                    neural_module.mask_edge_fraction(frame, mask)
+                )
+        else:
+            corners, verdict = neural_detector.detect_sheet_with_confidence(frame)
         logit = neural_detector.last_presence_logit
         trace["presence_logit"] = None if logit is None else float(logit)
         trace["neural_corners"] = _corners_json(corners)
@@ -610,7 +622,11 @@ def run(
     trace_acquisitions = False
 
     def detect_sheet(frame):
-        if trace_acquisitions:
+        # Com o portão de primeira confirmação ligado, a forma com
+        # rastro é obrigatória mesmo fora de sessão gravada: é o
+        # rastro que carrega logit/edge_in até o laço (a trabalhadora
+        # extrai dele o gate_info do resultado).
+        if trace_acquisitions or neural_module.first_confirm_gate_enabled():
             return _detect_sheet_combined_traced(frame, neural_detector)
         return _detect_sheet_combined(frame, neural_detector)
 

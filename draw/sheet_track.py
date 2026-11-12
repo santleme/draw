@@ -472,6 +472,30 @@ def _lk_track_corners(prev_gray, next_gray, corners):
     return tracked.reshape(-1, 2)
 
 
+def _gate_info_from_trace(trace):
+    """O pacote do portão de primeira confirmação de um rastro.
+
+    Extrai do rastro da combinada (draw.app) o que o laço precisa
+    para julgar a primeira confirmação (frente 88): a fonte do
+    desfecho, o logit de presença e o edge_in da máscara. Rastro sem
+    esses campos (detecção de dois elementos, bancada, replay)
+    devolve None e o laço não julga — o portão nunca bloqueia por
+    falta de sinal.
+    """
+    if not trace:
+        return None
+    # O campo do portão só existe no rastro quando a flag está
+    # ligada (draw.app só o escreve nesse caso): sem ele, não há
+    # pacote — o logit sozinho é observabilidade antiga, não portão.
+    if "edge_in" not in trace:
+        return None
+    return {
+        "source": trace.get("source"),
+        "presence_logit": trace.get("presence_logit"),
+        "edge_in": trace.get("edge_in"),
+    }
+
+
 # Teto da espera pela thread de deteccao na saida do app. Uma
 # deteccao nesta VM pode passar de 1 s; no Ryzen ela mede 36,7 ms.
 _DETECTION_STOP_TIMEOUT_SECONDS = 5.0
@@ -483,7 +507,10 @@ class _SheetDetectionWorker:
     O laco entrega o quadro com submit() e segue: a fila tem
     tamanho 1 e um quadro nao processado e substituido pelo
     proximo, nunca acumulado. A thread roda a deteccao e publica
-    (sequencia, cantos, veredito, carimbo do quadro, duracao). O
+    (sequencia, cantos, veredito, carimbo do quadro, duracao) — e,
+    quando a deteccao devolve rastro com os campos do portão de
+    primeira confirmação, um sexto elemento com esse pacote
+    (_gate_info_from_trace). O
     laco colhe com poll() sem bloquear, em qualquer estado do
     rastreador, inclusive no missed: os 36,7 ms medidos da
     deteccao no Ryzen saiam do laco de exibicao, e no missed
@@ -585,13 +612,20 @@ class _SheetDetectionWorker:
                 self._completed += 1
                 self._last_detect_ms = detect_ms
                 self._result_seq += 1
-                self._result = (
+                result = (
                     self._result_seq,
                     corners,
                     verdict,
                     captured_at,
                     detect_ms,
                 )
+                # Sexto elemento SÓ quando há rastro com os campos
+                # do portão (frente 88): sem rastro, o resultado é a
+                # tupla de 5 de sempre, byte a byte.
+                gate_info = _gate_info_from_trace(trace)
+                if gate_info is not None:
+                    result = result + (gate_info,)
+                self._result = result
                 self._condition.notify_all()
 
     def take_traces(self, upto_result_seq=None):
