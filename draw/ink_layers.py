@@ -1297,13 +1297,9 @@ class _LayeredInkAccumulator:
                 if self._e3_active:
                     for item in self._e3_phase1_maps:
                         item[removed] = 0
-                    for mask in (
-                        self._e3_old_union,
-                        self._e3_region_big,
-                        self._e3_region_small,
-                    ):
-                        if mask is not None:
-                            mask[removed] = False
+                    if self._e3_old_union is not None:
+                        self._e3_old_union[removed] = False
+                    # Regiões são suporte geométrico para redesenhar, não votos.
                     for side in (self._e3_side_big, self._e3_side_small):
                         if side._confirmed is not None:
                             side._confirmed[removed] = False

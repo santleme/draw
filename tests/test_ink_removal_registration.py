@@ -239,3 +239,24 @@ def test_local_erasure_does_not_reopen_e3_initial_confirmation(monkeypatch):
         acc.add(erased, visible)
     assert not acc._confirmed[65:75, 65:85].any()
     assert not acc._confirmed[85:88, 85:88].any()
+
+
+@pytest.mark.parametrize("height,width", [(5, 10), (10, 20), (40, 80)])
+@pytest.mark.parametrize("fast", ["0", "1"])
+def test_e3_lateral_tracks_allow_erasure_then_redraw(monkeypatch, height, width, fast):
+    monkeypatch.setenv("DRAW_INK_REMOVAL", "1")
+    monkeypatch.setenv("DRAW_INK_VOTE_E3", "1")
+    monkeypatch.setenv("DRAW_INK_VOTE_FAST", fast)
+    acc = layers._LayeredInkAccumulator()
+    initial = np.zeros((260, 400), np.float32)
+    initial[10:180, 10:200] = 0.95
+    confirmed(acc, initial)
+    with_side = initial.copy()
+    region = np.s_[200 : 200 + height, 250 : 250 + width]
+    with_side[region] = 0.95
+    confirmed(acc, with_side)
+    assert np.all(acc._confirmed[region] == 255)
+    confirmed(acc, initial)
+    assert not acc._confirmed[region].any()
+    confirmed(acc, with_side)
+    assert np.all(acc._confirmed[region] == 255)
