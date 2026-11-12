@@ -171,12 +171,16 @@ def run_pipeline(
     page_clean_model=None,
     legacy_ink=False,
     hand_model=None,
+    on_frame=None,
 ):
     """Consome VideoCapture ou SyntheticCapture via SheetInkLoop real.
 
     Não inicia threads, não descarta frames, não lê propriedades de GT da
     fonte. Sem modelo de tinta, exige --legacy-ink explicitamente. Captura
     continua pertencendo ao chamador, que deve chamar release().
+    ``on_frame(loop, worker, frame_index)`` opcional roda depois do
+    pump/collect de cada quadro — a auditoria por fase usa isso para
+    fotografar clean_mask/provisional/âncora no fim de cada fase.
     """
     from draw import config, hand, ink
     from draw.hand_presence import _make_hand_presence
@@ -242,6 +246,8 @@ def run_pipeline(
             ).astype(np.float32)
         if outcome is not None:
             raise RuntimeError(f"laço do Draw encerrou: {outcome}")
+        if on_frame is not None:
+            on_frame(loop, worker, frame_index)
         frame_index += 1
     if frame_index == 0:
         raise ValueError("fonte de vídeo não contém frames decodificáveis")
