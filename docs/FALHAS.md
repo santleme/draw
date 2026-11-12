@@ -152,6 +152,12 @@ Isso exercita a régua e registra uma falha de recuperação nesta cena;
 não isola a causa entre inferência e confirmação temporal, não mede
 desempenho em câmera real e não promove nem recalibra modelos/limiares.
 Fluxo e limitações em `docs/SIMULATOR.md`; vídeos e JSONs não versionados.
+Nesta VM, MediaPipe não está instalado: os adaptadores de mão retornam
+sinal indisponível, como no app. Após conectar esses adaptadores ao runner,
+a verificação do mesmo arquivo conservou exatamente as métricas acima
+(0 de 20 amostras de presença disponíveis). O teste de oclusão usa
+adaptadores controlados; não comprova reconhecimento da mão placeholder
+pelo modelo MediaPipe.
 
 ## F-03 — Mão confundida com papel
 
