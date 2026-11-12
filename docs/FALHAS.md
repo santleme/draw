@@ -25,6 +25,47 @@ Convenções:
 
 ## Mapa rápido
 
+### Insumo do holdout e tradução externa (2026-11-12)
+
+@santleme relata revisão ruim das 25 páginas. A reconstrução somente leitura
+das oito sessões originais no WSL reproduz cinco sessões/25 rascunhos com
+fração 0,5; há exemplos visuais de teclado, mão e mesa. O delta de um teclado
+marca 65,32% da imagem como tinta; o de uma cena com mão, 85,93%.
+`final_minus_reference` mede escurecimento, não tinta semântica, e ignora
+desenho já presente na primeira referência. A CLI registra decisões, não
+oferece editor nem certifica distribuição. Não foram encontrados os ledgers
+de revisão: não inventar contagens de aprovação ou perda do modelo.
+
+`tools/selflearn/import_external.py` passa a traduzir o `frames.csv` do pool
+catalogado e imagens/CSV de outros autores para a fila existente, em pool
+externo próprio. Selo imutável por sessão/lote, metadados de treino anterior,
+integridade de entrada/modelo e revisão humana obrigatória antes de exportar.
+Pseudo-máscara do incumbente só no treino; holdout recebe suporte vazio para
+rótulo humano independente e recusa aceite automático. O catálogo citado
+descreve um pool privado de capturas, não vários datasets públicos; este
+adaptador permite os demais sem alegar que já foram inventariados/aprovados.
+
+**Validação de código (VM, 2026-11-12; não é teste ao vivo):**
+
+| Execução completa | Passou | Falhou | Skip |
+|---|---:|---:|---:|
+| Base 3c00e29, worktree separado | 1.031 | 2 | 4 |
+| Esta implementação | 1.065 | 1 | 4 |
+
+Foram adicionados 33 casos; o subconjunto de self-learning, registro,
+arbitragem, remoção, replay e documentação passou 110/110. A falha comum
+é `test_sim_writer.py::test_generate_scenario_corpus_contract`, que exige
+fundos privados de laboratório ausentes na VM; ela também reprova o CI da
+base. A outra falha da execução-base é a asserção de identidade do teste
+threaded `test_new_sheet_does_not_inherit_the_previous_canvas`; passou na
+execução desta branch, sem alteração desse teste. Não se alega tê-la corrigido.
+
+`ruff check .`, compilação e formato dos fontes tocados passam. O formato
+global já falha em 15 arquivos na base e ainda falha em 13 intocados aqui;
+o CI `rapido` da base confirma isso. Não desabilitar os checks nem publicar
+os fundos privados para deixá-los verdes. Essas pendências são anteriores
+e separadas da régua de comportamento; não houve promoção de modelo.
+
 | ID | Falha | Classe | Severidade | Régua |
 |---|---|---|---|---|
 | F-01 | Tinta repassada/reimpressa em camadas | acumulador/orquestração | bloqueante | parcial — ver F-01 |
@@ -36,7 +77,7 @@ Convenções:
 | F-07 | Canvas muda sem tinta nova (invariância violada) | orquestração | bloqueante | parcial — ver F-07 |
 | F-08 | Jitter/latência que impede desenhar | orquestração/folha | maior | parcial — ver F-08 |
 | F-09 | Folha perdida com o caderno movido (e a tinta vai junto) | folha/orquestração | maior | sim, sem limiar |
-| F-10 | Apagar no papel não apaga no digital | acumulador | maior | sem régua ainda |
+| F-10 | Apagar no papel não apaga no digital | acumulador | maior | parcial — canal opt-in e testes sintéticos |
 | F-11 | Página nova lida como a mesma (ou vice-versa) | orquestração | maior | parcial — ver F-11 |
 
 ## F-01 — Tinta repassada/reimpressa em camadas
@@ -266,6 +307,24 @@ das pessoas — o canvas nasce poluído antes do primeiro traço.
 
 ## F-07 — Canvas muda sem tinta nova (invariância violada)
 
+### Correção opt-in da duplicação dentro da geração (2026-11-12)
+
+`DRAW_REG_CONTENT_GUARD=1` (padrão 0) compara suporte do canvas na
+probabilidade original (colocação identidade) e na reprojetada. Com
+deslocamento acima do gatilho existente de 8 px, massa mínima existente
+e vantagem de identidade acima do delta existente, bloqueia o voto até
+três poses assentadas; então troca só a âncora e usa a evidência original.
+Não transporta nem soma o canvas. Geometria espúria com suporte superior
+na reprojeção não troca âncora; identidade/virada em julgamento tem
+precedência. O mecanismo está na trabalhadora real que o replay instancia;
+o adaptador de contagem encaminha também o canal de remoção.
+
+Régua parcial: `tests/test_ink_removal_registration.py` fixa página movida
+sem duplicação, tinta nova após pouso, geometria espúria e paridade OFF.
+Isto não reverte o veredito negativo ao vivo da arbitragem v3 nem prova
+correção dos +1.911 a +9.383 px históricos no corpus privado. Não houve
+retuning dos limiares existentes nem alteração de `DRAW_ECC_REFINE`.
+
 **Sintoma:** com a página assentada e ninguém desenhando, o canvas
 muda sozinho — tinta aparece, engrossa ou se move. É a forma
 mensurável de F-01 e a violação direta da especificação do Lucas:
@@ -493,6 +552,41 @@ decisão de desenho, não reajuste de limiar. Ligar a flag por padrão
 está vetado até uma prova nova passar.
 
 ### M3 — arbitragem por conteúdo + abstenção: a v3 (2026-11-10)
+
+**Teste ao vivo reprovado, relato de @santleme registrado em 2026-11-12:**
+"ficou uma merda". Aprovação nos portões de replay não é aprovação na
+mesa. Auditoria somente leitura dos manifestos do WSL:
+
+| Sessão local | Execução da arbitragem | Cadência observada | Identidade |
+|---|---|---|---|
+| 1794341688-dbea1982 | 53 passadas, 6 abstenções; `spurious`, Sp=0,0201, Sc=0,0894, deslocamento 9,49 px | gap mediano 1,0001 s; inferência mediana 126,9 ms | nenhum evento |
+| 1794443693-8096ad69 | 103 passadas, 5 abstenções; `landing_default`, canvas de só 23 px | gap mediano 1,0001 s; inferência mediana 120,0 ms, p95 136,8 ms | sete `new_page`, um `same_page` |
+
+Os campos/eventos provam que a flag estava ligada nessas corridas de
+produção. Não provam qual delas corresponde exatamente ao comentário do
+usuário. A segunda registra 343 submits, 235 substituições latest-wins;
+o relatório amostrado marca 93 amostras em idle e mão presente em 2%.
+Isso favorece a hipótese de cadência ociosa sobre o orçamento nominal de
+250 ms: três votos a 1 Hz levam segundos, mesmo com ONNX de ~120 ms.
+Não há medição que atribua o atraso à soma serial folha+tinta; ambos têm
+workers, competem por CPU e a régua deve medir os carimbos reais.
+
+Há participação de F-11: na geração 3, recall 0,827 foi vetado pela
+contenção 0,223 e decidiu `new_page`. Sem GT de página/tempo não se pode
+chamar isso de falso split nem distinguir automaticamente F-07/F-09 de
+tinta nova. O replay usa mapas prontos re-warpados, não reexecuta ONNX em
+fotos com mão/luz; seus portões não cobrem essa mudança de distribuição.
+
+**Observabilidade nova:** cada passada registra flag efetiva inclusive
+OFF, sequência, gap real, queue/inferência/publicação, deslocamento e
+identidade da matriz de registro, scores/streak/veredito de arbitragem,
+decisão de identidade, visibilidade, pixels adicionados/removidos. O
+gravador escreve `ink_passes.jsonl` continuamente, privado e limitado a
+200.000 registros; deduplica sequências e conta lacunas/cortes no manifesto.
+O início não desaparece mais no deque final de 256 passadas. Se houver
+queda antes do fechamento, as linhas já gravadas continuam disponíveis.
+Limiar de latência percebida e vídeo real anotado ainda faltam; não há
+novo veredito ao vivo nesta mudança.
 
 **Sucessora do M2.** A prova da arbitragem (frente 19, no
 laboratório) separou as hipóteses com margem larga: no streak de
@@ -773,6 +867,30 @@ Não recalibrar F-11 junto com o portão de tremor.
   ainda sem nova rodada com página real.
 
 ## F-10 — Apagar no papel não apaga no digital
+
+### Canal de remoção opt-in (2026-11-12)
+
+`DRAW_INK_REMOVAL=1`, padrão 0, acrescenta evidência negativa à confirmada.
+Protocolo inicial fixado antes dos testes: probabilidade ≤0,1 em seis
+passadas consecutivas **visíveis**, com pelo menos 65% do canvas antigo
+ainda visto como tinta. A trabalhadora exige registro estável, sem
+identidade/quarentena/abstenção em curso e sem ECC rejeitado. Oclusão,
+geometria em movimento, ausência de visibilidade e perda global de tinta
+não autorizam remoção. Uma trilha pendente impede descanso prematuro.
+
+Ao remover, publica `confirmed_changed`, conta `removed_confirmed_px` e
+limpa a memória de voto desses pixels (inclusive E3), para o traço não
+ressuscitar da janela velha. Redesenhar continua possível. Reset e migração
+transportam/zeram também a trilha negativa. OFF mantém a monotonicidade
+anterior e o canvas byte a byte. Régua parcial em
+`tests/test_ink_removal_registration.py`: borracha localizada, redesenho,
+oclusão, flicker, virada, registro inseguro, E3/FAST e paridade OFF.
+
+Limite explícito: apagar mais de 35% de uma vez ou toda a página fica
+retido, pois a ausência total não diferencia borracha de página nova.
+Também não há remoção sem máscara de visibilidade. Falta validar o canal
+no papel real; o texto histórico de "sem canal" abaixo descreve o padrão
+OFF, não a implementação opt-in.
 
 **Sintoma:** a pessoa apaga um trecho com a borracha e o traço
 continua no canvas para sempre (até trocar de folha/geração).

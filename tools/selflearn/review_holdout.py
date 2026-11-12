@@ -30,8 +30,10 @@ from draw.selflearn import review  # noqa: E402
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pool", default="captures/pool")
+    parser.add_argument("--split", choices=("train", "holdout"), default="holdout")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("status")
+    sub.add_parser("audit")
     mark = sub.add_parser("mark")
     mark.add_argument("session")
     mark.add_argument("generation", type=int)
@@ -43,8 +45,10 @@ def main(argv=None):
     export.add_argument("--out", required=True)
     args = parser.parse_args(argv)
 
-    if args.command == "status":
-        print(review.format_status(review.status(args.pool)))
+    if args.command == "audit":
+        print(json.dumps(review.audit_pool(args.pool, split=args.split), indent=2))
+    elif args.command == "status":
+        print(review.format_status(review.status(args.pool, split=args.split)))
     elif args.command == "mark":
         entry = review.mark_reviewed(
             args.pool,
@@ -53,11 +57,16 @@ def main(argv=None):
             accept_draft=args.accept_draft,
             label_path=args.label,
             reviewer=args.reviewer,
+            split=args.split,
         )
         print(json.dumps(entry, indent=2, sort_keys=True))
-        print(review.format_status(review.status(args.pool)))
+        print(review.format_status(review.status(args.pool, split=args.split)))
     else:
-        print(json.dumps(review.export_holdout(args.pool, args.out), indent=2))
+        print(
+            json.dumps(
+                review.export_reviewed(args.pool, args.out, split=args.split), indent=2
+            )
+        )
     return 0
 
 

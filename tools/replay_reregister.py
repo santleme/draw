@@ -358,8 +358,8 @@ class CountingAccumulator(_LayeredInkAccumulator):
         self.turn_signals = 0
         self.last_result = None
 
-    def add(self, prob, visible=None):
-        result = super().add(prob, visible)
+    def add(self, prob, visible=None, **kwargs):
+        result = super().add(prob, visible, **kwargs)
         if result["turn"]:
             self.turn_signals += 1
         self.last_result = result

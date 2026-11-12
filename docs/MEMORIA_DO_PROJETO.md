@@ -319,6 +319,93 @@ história:
 
 ## 8. A esteira de tradução e o self-learning
 
+### Revisão das 25 páginas — diagnóstico de 2026-11-12
+
+@santleme revisou as 25 páginas com `review_holdout.py` e relatou resultado
+ruim. Isso substitui o estado histórico de zero revisadas abaixo; não é um
+veredito positivo do modelo. `reviews.json`, `reviews_log.jsonl` e o pool
+processado não foram encontrados nem neste clone nem nas árvores Draw,
+draw-lab e draw-data do WSL conectado. Portanto não há contagem verificável
+de aceites/correções; não confundir inspeção visual relatada com um ledger
+de aprovação persistido.
+
+No WSL foi possível reconstruir os rascunhos a partir das oito sessões
+originais, sem escrever/re-selar nada: fração 0,5 → cinco sessões holdout,
+25 páginas, as mesmas quantidades do inventário. Inspeção de exemplos
+confirmou teclado, mão/bandeja e mesa em vez de desenho. O rascunho de
+1793654047/gen_0001 marca 65,32% dos pixels de um teclado; o de
+1793666553/gen_0005 marca 85,93% de uma cena com mão. São diferenças de
+cena/exposição, não rótulos de tinta. A ferramenta não está trocando o
+arquivo: está mostrando uma subtração inadequada de entradas inadequadas.
+
+A leitura do código confirma três limitações diferentes: o gravador usa o
+primeiro warp da geração como referência (não necessariamente folha limpa);
+`final_minus_reference` só rotula escurecimentos novos e perde desenho já
+presente, além de confundir sombra/movimento com tinta; a CLI apenas registra
+aceite ou máscara editada fora dela, sem editor visual ou julgamento de
+representatividade. O inventário anterior já descrevia câmera/mesa, não
+sessões representativas de desenho. Logo, completar 25 revisões não corrige
+a distribuição e não prova erro do modelo; atribuir cada falha a uma dessas
+causas ainda depende dos artefatos privados.
+
+O catálogo `REVISAO_DADOS_KAGGLE_2026-11-06.md` descreve **um pool real de
+capturas** (5.086 frames, 4.789 sem máscara), não um inventário de vários
+datasets públicos de autores diferentes. Não confundir privacidade aprovada
+com rótulo aprovado, nem as 2.518 imagens já usadas em treino com holdout novo.
+
+### Tradução externa e régua ao vivo — 2026-11-12
+
+`tools/selflearn/import_external.py` aceita o `frames.csv` desse pool e CSV
+genérico/pasta de páginas de outros autores. Frames crus passam pelo detector
+de folha e retificação; páginas já retificadas exigem declaração explícita.
+Cada sessão/lote recebe selo imutável; o lote mora em pool próprio, não se
+mistura com a saída de `process_sessions.py`. Entradas já usadas em treino
+ficam só em treino. O incumbente gera propostas **só no treino**, com hash e
+linhagem. A CLI existente revisa/exporta ambos os lados com `--split`.
+Holdout sem referência exige máscara humana feita do zero; a máscara vazia
+é apenas suporte para o editor e `--accept-draft` é recusado. Nenhum
+pseudo-rótulo passa a ser independente por renomeação ou por aceite humano.
+
+Exemplo para imagens já retificadas (para fotos cruas, retirar
+`--images-are-pages` e indicar `--sheet-model` se necessário):
+
+```bash
+python tools/selflearn/import_external.py --root /dados/desenhos \
+  --dataset autor/lote --manifest /dados/desenhos/frames.csv \
+  --images-are-pages --out captures/external-desenhos
+python tools/selflearn/review_holdout.py --pool captures/external-desenhos --split train status
+python tools/selflearn/review_holdout.py --pool captures/external-desenhos --split holdout audit
+```
+
+CSV mínimo: `image_path,session_id` (ou `batch_id`); quando a fonte não tem
+grupos identificáveis, usar um único `--batch` conservador para a pasta,
+nunca inventar autor/sessão por imagem. No pool catalogado o CSV também
+informa `session_used_for_prior_training`; para novos dados, é responsabilidade
+do operador auditar treino anterior antes de reservá-los. O resumo informa
+páginas em cada lado e rejeições `no_page`, sem certificar a qualidade da
+retificação. `mark SESSAO GERACAO --label mascara.png` registra a revisão;
+`export --out /dados/revisado` só leva sessões inteiramente revisadas do
+`--split` escolhido. Nem a importação nem o aceite treinam/promovem modelo.
+
+O relato do teste de arbitragem foi negativo: "ficou uma merda". Nos
+manifestos locais há prova de execução ligada, não só env presumida:
+1794341688 tem veredito `spurious`; 1794443693 tem `landing_default` e sete
+`new_page`. A segunda sessão tem intervalo mediano de 1,0001 s entre
+passadas e inferência mediana de 120 ms; a lentidão não se explica só pelos
+168 ms históricos do modelo. Há indício de participação de F-11, mas sem
+GT temporal não se pode afirmar que cada `new_page` é erro ou atribuir cada
+pixel a F-07/F-09. A régua por passada agora é persistida durante a corrida
+em `ink_passes.jsonl`, além do resumo final; ver diagnóstico em FALHAS.
+
+As correções `DRAW_REG_CONTENT_GUARD` e `DRAW_INK_REMOVAL` são opt-in,
+default 0; não promovem modelo nem substituem validação ao vivo. A primeira
+evita votar a cópia reprojetada quando o conteúdo favorece identidade e
+reancora só após assentamento. A segunda retira tinta confirmada com
+ausência forte, visível e persistente e testemunho positivo da mesma página;
+apagar a página inteira segue ambíguo com virada, portanto não é autorizado
+automaticamente. O histórico anterior de F-10 aberta refere-se ao padrão
+monotônico, que continua preservado com a flag desligada.
+
 - **O gravador já estava lá (descoberto em 2026-11-06).** O app já
   gravava sessões por padrão (`draw/selflearn/session.py`): na
   máquina dele havia 9 sessões (60 MB, 04–06/11). Faltava a etapa de

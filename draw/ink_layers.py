@@ -244,9 +244,7 @@ _INK_VOTE_E3_DILATE_KERNEL = cv2.getStructuringElement(
     cv2.MORPH_ELLIPSE,
     (2 * _INK_FRONTIER_RADIUS + 1, 2 * _INK_FRONTIER_RADIUS + 1),
 )
-_INK_VOTE_E3_REGION_KERNEL = cv2.getStructuringElement(
-    cv2.MORPH_ELLIPSE, (13, 13)
-)
+_INK_VOTE_E3_REGION_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))
 
 
 def _ink_vote_e3_enabled():
@@ -335,9 +333,7 @@ def _e3_phase1_core(maps, threshold):
             out=neighbours,
         )
     return (
-        (neighbours >= len(maps))
-        & (hits >= 1)
-        & (total >= _INK_VOTE_E3_CORE_MIN_SUM)
+        (neighbours >= len(maps)) & (hits >= 1) & (total >= _INK_VOTE_E3_CORE_MIN_SUM)
     )
 
 
@@ -404,9 +400,7 @@ class _E3SideVote:
         rule = (hits >= self._window_len) & (score >= self._min_score)
         if np.any(rule):
             anchor = seen | self._confirmed
-            near_anchor = (
-                cv2.dilate(anchor.astype(np.uint8), _INK_FRONTIER_KERNEL) > 0
-            )
+            near_anchor = cv2.dilate(anchor.astype(np.uint8), _INK_FRONTIER_KERNEL) > 0
             rule &= seen | ~near_anchor
         self._confirmed |= rule
         return self._confirmed
@@ -641,6 +635,17 @@ def _registration_is_identity(matrix):
         np.max(np.abs(matrix - np.eye(3, dtype=np.float64)))
         < _REGISTRATION_IDENTITY_TOL
     )
+
+
+def _experimental_enabled(name):
+    return os.environ.get(name, "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+# Protocolo inicial F-10: ausência forte, visível e persistente, com
+# testemunho positivo da mesma página. Não confundir apagar tudo com virada.
+_REMOVAL_LOW_PROB = 0.1
+_REMOVAL_PASSES = 6
+_REMOVAL_RETAINED_FRACTION = 0.65
 
 
 # Disciplina de registro (M1, auditoria de 2026-11-10, draw-lab/
@@ -956,6 +961,7 @@ class _LayeredInkAccumulator:
 
     def reset(self):
         self._window = deque(maxlen=_INK_VOTE_WINDOW)
+        self._removal_streak = None
         self._confirmed = None
         self._provisional = None
         self._provisional_ever = None
@@ -1024,9 +1030,7 @@ class _LayeredInkAccumulator:
             self._e3_passes += 1
             return confirmed
         old_dilated = (
-            cv2.dilate(
-                self._e3_old_union.astype(np.uint8), _INK_VOTE_E3_DILATE_KERNEL
-            )
+            cv2.dilate(self._e3_old_union.astype(np.uint8), _INK_VOTE_E3_DILATE_KERNEL)
             > 0
         )
         regions = self._e3_region_big | self._e3_region_small
@@ -1042,16 +1046,12 @@ class _LayeredInkAccumulator:
                 continue
             component = labels == index
             frac_old = float(np.count_nonzero(component & old_dilated) / area)
-            frac_region = float(
-                np.count_nonzero(component & regions_dilated) / area
-            )
+            frac_region = float(np.count_nonzero(component & regions_dilated) / area)
             if frac_old >= 0.5:
                 self._e3_old_union |= component
             elif frac_region < 0.5:
                 dilated = (
-                    cv2.dilate(
-                        component.astype(np.uint8), _INK_VOTE_E3_REGION_KERNEL
-                    )
+                    cv2.dilate(component.astype(np.uint8), _INK_VOTE_E3_REGION_KERNEL)
                     > 0
                 )
                 if area >= _INK_VOTE_E3_BIG_COMPONENT_PX:
@@ -1061,14 +1061,10 @@ class _LayeredInkAccumulator:
                     self._e3_region_small |= dilated
                     self._e3_tracks_small += 1
         if np.any(self._e3_region_big):
-            masked = np.where(self._e3_region_big, evidence, 0.0).astype(
-                np.float32
-            )
+            masked = np.where(self._e3_region_big, evidence, 0.0).astype(np.float32)
             confirmed = confirmed | self._e3_side_big.add(masked)
         if np.any(self._e3_region_small):
-            masked = np.where(self._e3_region_small, evidence, 0.0).astype(
-                np.float32
-            )
+            masked = np.where(self._e3_region_small, evidence, 0.0).astype(np.float32)
             confirmed = confirmed | self._e3_side_small.add(masked)
         self._e3_passes += 1
         return confirmed
@@ -1096,6 +1092,8 @@ class _LayeredInkAccumulator:
             )
 
         self._confirmed = nearest(self._confirmed)
+        if self._removal_streak is not None:
+            self._removal_streak = nearest(self._removal_streak)
         self._provisional = nearest(self._provisional)
         self._provisional_ever = nearest(self._provisional_ever.astype(np.uint8)) > 0
         self._retracted_ever = nearest(self._retracted_ever.astype(np.uint8)) > 0
@@ -1117,19 +1115,18 @@ class _LayeredInkAccumulator:
             # mais proximo, mapas de evidencia/trilha bilineares —
             # o mesmo tratamento do resto do estado da geracao.
             if self._e3_old_union is not None:
-                self._e3_old_union = nearest(
-                    self._e3_old_union.astype(np.uint8)
-                ) > 0
-                self._e3_region_big = nearest(
-                    self._e3_region_big.astype(np.uint8)
-                ) > 0
-                self._e3_region_small = nearest(
-                    self._e3_region_small.astype(np.uint8)
-                ) > 0
+                self._e3_old_union = nearest(self._e3_old_union.astype(np.uint8)) > 0
+                self._e3_region_big = nearest(self._e3_region_big.astype(np.uint8)) > 0
+                self._e3_region_small = (
+                    nearest(self._e3_region_small.astype(np.uint8)) > 0
+                )
                 self._e3_phase1_maps = [
                     cv2.warpPerspective(
-                        item, matrix, size,
-                        flags=cv2.INTER_LINEAR, borderValue=0.0,
+                        item,
+                        matrix,
+                        size,
+                        flags=cv2.INTER_LINEAR,
+                        borderValue=0.0,
                     )
                     for item in self._e3_phase1_maps
                 ]
@@ -1169,13 +1166,14 @@ class _LayeredInkAccumulator:
             np.logical_or(seen, item > self.threshold, out=seen)
         return score, hits, seen
 
-    def add(self, prob, visible=None):
+    def add(self, prob, visible=None, *, removal_allowed=True):
         prob = np.asarray(prob, dtype=np.float32)
         if visible is not None:
             visible = np.asarray(visible, dtype=bool)
             if visible.shape != prob.shape:
                 visible = None
         if self._confirmed is None or self._confirmed.shape != prob.shape:
+            self._removal_streak = None
             self._confirmed = np.zeros(prob.shape, dtype=np.uint8)
             self._provisional = np.zeros(prob.shape, dtype=np.uint8)
             self._provisional_ever = np.zeros(prob.shape, dtype=bool)
@@ -1266,6 +1264,41 @@ class _LayeredInkAccumulator:
         new_confirmed_px = int(np.count_nonzero(new_confirmed))
         if new_confirmed_px:
             self._confirmed[new_confirmed] = 255
+        removed_px = 0
+        if _experimental_enabled("DRAW_INK_REMOVAL"):
+            if self._removal_streak is None:
+                self._removal_streak = np.zeros(prob.shape, dtype=np.uint8)
+            # Sem máscara de visibilidade não há evidência negativa confiável.
+            witnessed = False
+            if removal_allowed and visible is not None and canvas_before:
+                retained = np.count_nonzero(confirmed_before & visible & mask_now)
+                witnessed = retained >= _REMOVAL_RETAINED_FRACTION * canvas_before
+            missing = (
+                confirmed_before
+                & visible
+                & np.isfinite(prob)
+                & (prob <= _REMOVAL_LOW_PROB)
+                if witnessed
+                else np.zeros(prob.shape, dtype=bool)
+            )
+            self._removal_streak[~missing] = 0
+            self._removal_streak[missing] = np.minimum(
+                self._removal_streak[missing].astype(np.uint16) + 1, _REMOVAL_PASSES
+            ).astype(np.uint8)
+            removed = self._removal_streak >= _REMOVAL_PASSES
+            removed_px = int(np.count_nonzero(removed))
+            if removed_px:
+                self._confirmed[removed] = 0
+                self._removal_streak[removed] = 0
+                # Nenhuma memória de voto pode ressuscitar o traço apagado.
+                for item in self._window:
+                    item[removed] = 0
+                self._score_buf = self._hits_buf = self._seen_buf = None
+                if self._e3_active:
+                    self._reset_e3_state()
+                seen_as_ink[removed] = False
+                score[removed] = 0
+                hits[removed] = 0
         confirmed_now = self._confirmed > 0
         provisional_now = seen_as_ink & ~confirmed_now
         if self._fast_active:
@@ -1296,7 +1329,7 @@ class _LayeredInkAccumulator:
         result = {
             "confirmed": self._confirmed.copy(),
             "provisional": self._provisional.copy(),
-            "confirmed_changed": new_confirmed_px > 0,
+            "confirmed_changed": new_confirmed_px > 0 or removed_px > 0,
             "provisional_changed": provisional_changed,
             "new_confirmed_px": new_confirmed_px,
             "confirmed_px": int(np.count_nonzero(self._confirmed)),
@@ -1305,6 +1338,8 @@ class _LayeredInkAccumulator:
             "retracted_px_total": int(np.count_nonzero(self._retracted_ever)),
             "turn": turn,
         }
+        if _experimental_enabled("DRAW_INK_REMOVAL"):
+            result["removed_confirmed_px"] = removed_px
         if self._e3_active:
             # Telemetria da E3: so existe com a flag ligada, como os
             # demais mecanismos atras de flag deste arquivo.
@@ -1398,6 +1433,7 @@ class _PageCleanWorker:
         # chamadores que nao informam cantos (ferramentas, testes
         # antigos) seguem com a evidencia na propria geometria.
         self._anchor_corners = None
+        self._content_guard_quads = []
         # Disciplina de registro (flags DRAW_REG_*, desligadas por
         # padrao): amostras de cantos da ancora-mediana e o quad
         # congelado da banda morta, ambos por geracao.
@@ -1491,6 +1527,7 @@ class _PageCleanWorker:
         self._telemetry_replaced = 0
         self._telemetry_passes = 0
         self._telemetry_publishes = 0
+        self._previous_pass_started_at = None
         self._telemetry_records = deque(maxlen=history[0])
         self._identity_events = deque(maxlen=history[1])
         # Evento de virada (desligado por padrao): pendente
@@ -1532,6 +1569,7 @@ class _PageCleanWorker:
                 self._identity_reference_corners = None
             self._generation += 1
             self._anchor_samples = []
+            self._content_guard_quads = []
             self._reg_frozen_corners = None
             self._reg_deadband_over = 0
             self._migration_streak = 0
@@ -1645,6 +1683,17 @@ class _PageCleanWorker:
         propria mao, reportado pela assinatura da mascara.
         Ver _REST_MIN_GENERATION_PASSES/_REST_QUIET_PASSES.
         """
+        if (
+            _experimental_enabled("DRAW_INK_REMOVAL")
+            and self._accumulator._removal_streak is not None
+            and np.any(self._accumulator._removal_streak)
+        ):
+            return False
+        if (
+            _experimental_enabled("DRAW_REG_CONTENT_GUARD")
+            and self._content_guard_quads
+        ):
+            return False
         if (
             _ink_active_cadence_enabled()
             and self._activity_quiet_passes < _NO_HAND_REST_AFTER_STILL_PASSES
@@ -1769,6 +1818,72 @@ class _PageCleanWorker:
         self._arb_streak_quads = []
         self._arb_scores = []
         self._arb_snapshot = None
+
+    def _content_registration_guard(
+        self, raw, registered, visible, registered_visible, corners, identity_owned
+    ):
+        """Identidade de conteúdo vence reprojeção só com suporte positivo.
+
+        Enquanto a pose não assenta, não há voto. No pouso, só a âncora
+        muda: confirmado e janela continuam nas coordenadas da página.
+        """
+        info = {"reg_content_guard": True, "reg_content_blocked": False}
+        confirmed = self._accumulator._confirmed
+        if (
+            identity_owned
+            or corners is None
+            or self._anchor_corners is None
+            or self._anchor_roll
+            or confirmed is None
+        ):
+            self._content_guard_quads = []
+            return registered, registered_visible, info
+        displacement = _matrix_grid_displacement(
+            _registration_matrix(self._anchor_corners, corners, raw.shape), raw.shape
+        )
+        if displacement <= _ANCHOR_MIGRATION_DISPLACEMENT_PX:
+            self._content_guard_quads = []
+            return registered, registered_visible, info
+        snapshot = confirmed > 0
+        raw_evidence = raw if visible is None else np.where(visible, raw, 0.0)
+        reg_evidence = (
+            registered
+            if registered_visible is None
+            else np.where(registered_visible, registered, 0.0)
+        )
+        raw_mass, reg_mass = float(np.sum(raw_evidence)), float(np.sum(reg_evidence))
+        sp = float(np.sum(raw_evidence * snapshot)) / max(raw_mass, 1e-9)
+        sc = float(np.sum(reg_evidence * snapshot)) / max(reg_mass, 1e-9)
+        info.update(
+            reg_content_score_identity=sp,
+            reg_content_score_projected=sc,
+            reg_content_displacement_px=displacement,
+        )
+        enough = (
+            np.count_nonzero(snapshot) >= _ARB_MIN_CANVAS_PX
+            and np.count_nonzero(raw_evidence > self._accumulator.threshold)
+            >= _ARB_MIN_PASS_PX
+        )
+        if not enough or sp <= sc + _ARB_DELTA:
+            self._content_guard_quads = []
+            return registered, registered_visible, info
+        if any(
+            np.max(np.linalg.norm(corners - q, axis=1)) > _ARB_SETTLE_PX
+            for q in self._content_guard_quads
+        ):
+            self._content_guard_quads = []
+        self._content_guard_quads.append(corners.copy())
+        info["reg_content_streak"] = len(self._content_guard_quads)
+        if len(self._content_guard_quads) < _ANCHOR_MIGRATION_PASSES:
+            info["reg_content_blocked"] = True
+            return registered, np.zeros(raw.shape, dtype=bool), info
+        self._anchor_corners = _median_anchor(self._content_guard_quads)
+        self._anchor_samples = [q.copy() for q in self._content_guard_quads]
+        self._reg_frozen_corners = self._anchor_corners.copy()
+        self._reg_deadband_over = 0
+        self._content_guard_quads = []
+        info["reg_content_identity_won"] = True
+        return raw, visible, info
 
     def _follow_close_event(self):
         self._follow_event_open = False
@@ -2092,6 +2207,7 @@ class _PageCleanWorker:
         """
         with self._condition:
             snapshot = {
+                "anchor_arbitration_enabled": _anchor_arbitration_enabled(),
                 "submits": self._telemetry_submits,
                 "submits_replaced": self._telemetry_replaced,
                 "passes": self._telemetry_passes,
@@ -2579,6 +2695,12 @@ class _PageCleanWorker:
             registered_prob, registered_visible, ecc_info = _register_ink_probability(
                 prob, anchor, registration_corners, ecc_reference, visible
             )
+            if anchor is not None and registration_corners is not None:
+                matrix = _registration_matrix(anchor, registration_corners, prob.shape)
+                reg_info["registration_displacement_px"] = _matrix_grid_displacement(
+                    matrix, prob.shape
+                )
+                reg_info["registration_is_identity"] = _registration_is_identity(matrix)
         except Exception as error:  # noqa: BLE001 - vai para o laco
             with self._condition:
                 self._error = error
@@ -2845,7 +2967,14 @@ class _PageCleanWorker:
                 arbitration_abstain = arb_status == "open"
                 reg_info["arb_event_open"] = self._arb_event_open
                 reg_info["arb_abstained"] = arbitration_abstain
+                reg_info["arb_streak"] = len(self._arb_streak_quads)
+                if self._arb_scores:
+                    scores = self._arb_scores[-1]
+                    reg_info["arb_pass_score_page"] = scores[0]
+                    reg_info["arb_pass_score_camera"] = scores[1]
+                    reg_info["arb_pass_scores_cyclic"] = list(scores[2:5])
                 if arb_event is not None:
+                    reg_info["arbitration_event"] = dict(arb_event)
                     reg_info["arb_verdict"] = arb_event["verdict"]
                     reg_info["arb_score_page"] = arb_event["score_page"]
                     reg_info["arb_score_camera"] = arb_event["score_camera"]
@@ -2974,6 +3103,26 @@ class _PageCleanWorker:
                     registered_prob, registered_visible, corners, watch_step_px
                 )
                 reg_info["identity_watch_streak"] = self._identity_watch_streak
+            content_blocked = False
+            if _experimental_enabled("DRAW_REG_CONTENT_GUARD"):
+                registered_prob, registered_visible, content_info = (
+                    self._content_registration_guard(
+                        prob,
+                        registered_prob,
+                        visible,
+                        registered_visible,
+                        corners,
+                        identity_owned
+                        or arbitration_abstain
+                        or follow_abstain
+                        or identity_watch_suspect,
+                    )
+                )
+                content_blocked = content_info["reg_content_blocked"]
+                force_publish = force_publish or content_info.get(
+                    "reg_content_identity_won", False
+                )
+                reg_info.update(content_info)
             if (
                 (first_pass or identity_pending)
                 and not identity_deferred
@@ -3008,14 +3157,28 @@ class _PageCleanWorker:
                 # confirmar no canvas da antiga antes do
                 # veredito de identidade.
                 visible = np.zeros(prob.shape, dtype=bool)
-            result = self._accumulator.add(prob, visible)
+            result = self._accumulator.add(
+                prob,
+                visible,
+                removal_allowed=(
+                    not identity_owned
+                    and not identity_watch_suspect
+                    and not arbitration_abstain
+                    and not follow_abstain
+                    and not content_blocked
+                    and not ecc_info.get("ecc_rejected")
+                    and corners is not None
+                    and watch_step_px is not None
+                    and watch_step_px <= _ARB_SETTLE_PX
+                    and reg_info.get("registration_displacement_px", float("inf"))
+                    <= _ANCHOR_MIGRATION_DISPLACEMENT_PX
+                ),
+            )
             if result.get("ink_vote_e3"):
                 # Telemetria da regra E3 (so com DRAW_INK_VOTE_E3
                 # ligada): fase da geracao e trilhas abertas.
                 reg_info["ink_vote_e3_passes"] = result["ink_vote_e3_passes"]
-                reg_info["ink_vote_e3_tracks_big"] = result[
-                    "ink_vote_e3_tracks_big"
-                ]
+                reg_info["ink_vote_e3_tracks_big"] = result["ink_vote_e3_tracks_big"]
                 reg_info["ink_vote_e3_tracks_small"] = result[
                     "ink_vote_e3_tracks_small"
                 ]
@@ -3098,6 +3261,12 @@ class _PageCleanWorker:
                     **identity_chamfer,
                     **reg_info,
                     "ecc_refine_enabled": ecc_refine_enabled,
+                    "anchor_arbitration_enabled": anchor_arbitration,
+                    "sequence": self._telemetry_passes,
+                    "pass_gap_s": None
+                    if self._previous_pass_started_at is None
+                    else pass_started_at - self._previous_pass_started_at,
+                    "corner_step_px": watch_step_px,
                     "quarantine_reason": quarantine_reason,
                     "quarantine_frames": quarantine_frames,
                     "deferred": identity_deferred,
@@ -3125,8 +3294,14 @@ class _PageCleanWorker:
                         np.count_nonzero(prob > self._accumulator.threshold)
                     ),
                     "confirmed_px": result["confirmed_px"],
+                    "new_confirmed_px": result["new_confirmed_px"],
+                    "removed_confirmed_px": result.get("removed_confirmed_px", 0),
+                    "visible_fraction": 1.0
+                    if visible is None
+                    else float(np.mean(visible)),
                 }
             )
+            self._previous_pass_started_at = pass_started_at
             self._condition.notify_all()
         return True
 
