@@ -13,6 +13,8 @@ pre-registration only proves something if its bytes never move.
   any model or behavior change. Guarded by `tests/test_falhas_doc.py`.
 - `SETUP_WINDOWS.md` — camera setup on Windows with WSL.
 - `TREINO.md` — training, evaluation and export guide.
+- [SIMULATOR.md](SIMULATOR.md) — text-driven synthetic camera, MP4/ground
+  truth export and evaluation through the real capture loop.
 - `MEMORIA_DO_PROJETO.md` — running memory of decisions, situations
   and mistakes.
 
