@@ -238,3 +238,109 @@ def test_final_checkpoint_missing_terminal_event():
     final = _final_checkpoint(checkpoints, events)
     assert "iou" not in final
     assert "evento final" in final["status"]
+
+
+def test_lift_return_timeline_and_absent_scene():
+    """lift & return: a folha some de cena por inteiro (só mesa nos
+    frames de absent) e volta na pose declarada por return_pose."""
+    capture = scenario(
+        erase_stroke=None,
+        redraw_text=None,
+        move=None,
+        lift=(300, 200),
+        return_pose=(-40, 30, 18),
+        absent_seconds=0.8,
+        lift_seconds=0.4,
+        return_seconds=0.4,
+    )
+    assert kinds(capture) == [
+        "warmup",
+        "write",
+        "lift_out",
+        "absent",
+        "return",
+        "settle",
+    ]
+    masks = {}
+    while True:
+        ok, _ = capture.read()
+        if not ok:
+            break
+        if capture.last_scene is not None:
+            masks[capture._position - 1] = capture.last_scene["mask"]
+    import tools.gen_synthetic as gs
+
+    for phase in capture.phases:
+        end = phase["end"] - 1
+        if phase["kind"] == "absent":
+            # durante a ausência, nada de papel nem tinta na cena
+            assert not (masks[end] == gs.PAPER).any()
+            assert not (masks[end] == gs.INK).any()
+        elif phase["kind"] == "return":
+            assert (masks[end] == gs.PAPER).sum() > 0
+    # a volta obedece a return_pose: pose final difere da inicial
+    assert not np.allclose(capture._quad_now, capture.quad)
+
+
+def test_lift_return_ground_truth(tmp_path):
+    """GT declara as fases novas e a pose final rodada."""
+    capture = scenario(
+        erase_stroke=None,
+        redraw_text=None,
+        move=None,
+        lift=(200, 150),
+        return_pose=(0, 0, 25),
+        absent_seconds=0.5,
+    )
+    drain(capture)
+    gt = tmp_path / "lift.gt.npz"
+    capture.save_ground_truth(gt)
+    with np.load(gt, allow_pickle=False) as bundle:
+        events = json.loads(str(bundle["events"]))
+        assert [e["kind"] for e in events] == kinds(capture)
+        assert "absent" in [e["kind"] for e in events]
+        # a tinta sobrevive à saída: estado final = plano completo
+        np.testing.assert_array_equal(
+            bundle["page_ink_final"] > 0, bundle["page_ink_full"] > 0
+        )
+        assert not np.allclose(bundle["quad_final"], bundle["quad"])
+        assert not np.allclose(bundle["page_to_scene_final"], bundle["page_to_scene"])
+
+
+def test_lift_validations():
+    with pytest.raises(ValueError):
+        SyntheticCapture("ab", return_pose=(10, 0, 15))
+    with pytest.raises(ValueError):
+        SyntheticCapture("ab", lift=(0, 0))
+    with pytest.raises(ValueError):
+        SyntheticCapture("ab", lift=(10, 0, 0))
+
+
+def test_lift_starts_from_post_move_pose():
+    """Combinação move+lift: a saída parte da pose DEPOIS do move —
+    o quad_at_lift é composto em __init__, não pode saltar de volta
+    para a pose inicial quando o lift_out começa."""
+    capture = scenario(
+        erase_stroke=None,
+        redraw_text=None,
+        move=(60, 30, 5),
+        lift=(300, 200),
+        return_pose=(0, 0, 0),
+        absent_seconds=0.4,
+        lift_seconds=0.4,
+        return_seconds=0.4,
+    )
+    lift_out = next(p for p in capture.phases if p["kind"] == "lift_out")
+    move_end = next(p for p in capture.phases if p["kind"] == "move")
+    # o quad_from do lift é a pose pós-move: distinto da pose inicial
+    # (que é o quad_from do move) e igual ao quad que o move produz
+    # no seu último frame — sem salto na transição
+    assert not np.allclose(lift_out["quad_from"], move_end["quad_from"])
+    moved_quads = {}
+    while True:
+        ok, _ = capture.read()
+        if not ok:
+            break
+        moved_quads[capture._position - 1] = capture._quad_now.copy()
+    end_move = moved_quads[move_end["end"] - 1]
+    np.testing.assert_allclose(lift_out["quad_from"], end_move, atol=1.0)
