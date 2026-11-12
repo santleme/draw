@@ -136,6 +136,25 @@ def build_command(args: argparse.Namespace, backend: str) -> list[str]:
         return cmd
 
     if backend == "xla":
+        if getattr(args, "recipe", "segformer") == "finetune-real":
+            # Frente 54: o fine-tune de tinta em TPU vive em
+            # training/finetune_tpu.py (port do finetune_real); a
+            # rota SegFormer (train_tpu.py, abaixo) nao muda.
+            cmd = [
+                py,
+                str(HERE / "finetune_tpu.py"),
+                "--config",
+                args.config,
+                "--data-dir",
+                data,
+                "--out-dir",
+                out,
+            ]
+            if args.batch_size != "auto":
+                cmd += ["--batch-per-core", str(args.batch_size)]
+            if args.smoke:
+                cmd.append("--smoke")
+            return cmd
         if args.real_train_dir:
             raise ValueError("este adaptador TPU ainda não aceita --real-train-dir")
         cmd = [py, str(HERE / "train_tpu.py"), "--data-dir", data, "--out-dir", out]
@@ -214,6 +233,15 @@ def main(argv: list[str] | None = None) -> int:
         choices=("auto", "cuda", "xla", "torchtpu", "cpu"),
         default="auto",
         help="auto detecta o runtime; use um valor para fixá-lo.",
+    )
+    parser.add_argument(
+        "--recipe",
+        choices=("segformer", "finetune-real"),
+        default="segformer",
+        help="segformer: training/train.py ou train_tpu.py (o "
+        "comportamento de sempre); finetune-real: o fine-tune de "
+        "tinta training/finetune_real.py em CUDA ou "
+        "training/finetune_tpu.py em TPU (frente 54).",
     )
     parser.add_argument("--config", default="training/configs/base.json")
     parser.add_argument("--data-dir", default="dataset/synthetic")
