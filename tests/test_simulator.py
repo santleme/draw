@@ -274,6 +274,9 @@ def test_one_frame_does_not_fabricate_temporal_sheet_confirmation(monkeypatch):
     assert detector.poll(0)[1] is not None
 
     class OneFrame:
+        def isOpened(self):
+            return True
+
         def get(self, prop):
             return 6 if prop == cv2.CAP_PROP_FPS else 0
 
@@ -283,7 +286,7 @@ def test_one_frame_does_not_fabricate_temporal_sheet_confirmation(monkeypatch):
             return current is not None, current
 
     result = run_pipeline(OneFrame(), legacy_ink=True)
-    assert result["frames"] == result["detector_results"] == 1
+    assert result["frames"] == result["detections"] == 1
     assert result["mask"] is None and result["corners"] is None
 
 
