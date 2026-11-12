@@ -267,6 +267,86 @@ def _ink_vote_e3_enabled():
     return value in {"1", "true", "yes", "on"}
 
 
+# Regra de voto E5-S (frentes 106/107, implementacao da frente 108;
+# draw-lab/live-audit-2026-11-10/106-voto-e4-sucessor-e3.md e
+# 107-voto-e5-subdivisao.md): sucessora da E3, atras de
+# DRAW_INK_VOTE_E4 (o nome da flag e o da familia E4 desenhada na
+# F106; o mecanismo implementado e a E5-S = E4j + subdivisao por
+# nascimento, a configuracao que a F107 validou em prototipo).
+# A E3 confunde "visto" com "velho" (a uniao de tudo que foi visto
+# na fase 1 vira barreira e conteudo nascido encostado nela nunca
+# abre trilha: hachura progressiva 0,072 no simulador). A E5-S
+# separa as duas coisas e subdivide o resto:
+# - "Velho" = so o instantaneo de ABERTURA da geracao: a mascara
+#   da 1a passada congelada, que nunca expande por absorcao, mais
+#   o MAPA de probabilidade da abertura — componente com >=50%
+#   da area sobre o velho dilatado (r3) OU com >=50% dos pixels
+#   com evidencia de abertura >= _INK_VOTE_E4_OPENING_EVIDENCE
+#   e pre-existente naquela passada, sem virar estado.
+# - Fase 1 identica a da E3 (nucleo de consenso espacial das 3
+#   primeiras passadas, _e3_phase1_core), mas o residuo dela —
+#   visto, nao confirmado — NAO vira barreira: na fase 2 ele e
+#   reclassificado como qualquer componente novo.
+# - Novidade e cobertura medidas contra o CONFIRMADO dilatado e
+#   as regioes de trilhas ja abertas, nunca contra a uniao do
+#   visto. Componente com <50% sobre a cobertura abre trilha pela
+#   propria forma/distancia: longe do confirmado (>=50% da area
+#   a mais de 8 px dele) abre trilha por tamanho — grande
+#   (>=100 px, 3 consecutivas, soma >= 2,1, regiao r6), pequena
+#   (20-99 px, 5 consecutivas, soma >= 3,5, regiao r6) ou FINA
+#   (forma de linha: lado maior >= 50 e area <= 3,5x o lado;
+#   voto com tolerancia espacial de 1 px, 3 consecutivas,
+#   soma >= 2,1, regiao r3 — a linha de 1 px tremula +-1 px e o
+#   hit estrito no mesmo pixel nao fecha); na banda 3-8 px do
+#   confirmado abre a trilha LENTA (5 consecutivas, soma >= 3,5,
+#   regiao r3) — a persistencia estrita separa a copia deslocada
+#   do traco novo encostado.
+# - SUBDIVISAO POR NASCIMENTO (a peca da F107): componente com
+#   >=50% sobre a cobertura nao morre inteiro — o RESIDUO fora
+#   da cobertura e re-componentizado e cada sub-componente
+#   >= 20 px abre a SUA trilha, classificado pela sua propria
+#   forma/distancia, com regiao r3. E o que fecha a classe da
+#   absorcao da hachura (bloco de um componente so: as linhas
+#   novas, minoria dele, nunca abriam trilha): prototipo
+#   hachura 0,749 -> 0,996, cursiva 0,886 -> 0,997, CAD
+#   0,943 -> 1,000. A parte coberta segue ignorada.
+# Portoes e ressalvas assumidas (F107, re-registro do Lucas de
+# 2026-11-12): o crescimento no simulador e julgado como
+# "<= default em recall equalizado, por cenario" (nao na classe
+# da E3); 1 px segue teto de modelo (forte 0,641 no prototipo;
+# medio com teto 0,35); eventos crescem um pouco sobre a E3
+# (3,73 x 3,34 no prototipo — copia deslocada e indistinguivel
+# de conteudo novo para a regra local; e problema de registro).
+# Coexistencia com a E3: as duas flags podem estar ligadas; a
+# PRECEDENCIA DECLARADA e E4 > E3 — com as duas ligadas roda so
+# a E5-S (a telemetria e a da E4). Como a E3, a flag e LIDA UMA
+# VEZ por geracao; com ela desligada o acumulador roda a regra
+# de sempre sem tocar em nenhum estado da E4.
+_INK_VOTE_E4_ENV = "DRAW_INK_VOTE_E4"
+_INK_VOTE_E4_OPENING_EVIDENCE = 0.35
+_INK_VOTE_E4_MIN_COMPONENT_PX = 20
+_INK_VOTE_E4_BIG_COMPONENT_PX = 100
+_INK_VOTE_E4_BIG_WINDOW = 3
+_INK_VOTE_E4_BIG_SCORE = 2.1
+_INK_VOTE_E4_SMALL_WINDOW = 5
+_INK_VOTE_E4_SMALL_SCORE = 3.5
+_INK_VOTE_E4_SLOW_WINDOW = 5
+_INK_VOTE_E4_SLOW_SCORE = 3.5
+_INK_VOTE_E4_THIN_WINDOW = 3
+_INK_VOTE_E4_THIN_SCORE = 2.1
+_INK_VOTE_E4_THIN_MIN_LENGTH = 50
+_INK_VOTE_E4_THIN_MAX_AREA_RATIO = 3.5
+_INK_VOTE_E4_FAR_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17))
+_INK_VOTE_E4_TOLERANCE_KERNEL = cv2.getStructuringElement(
+    cv2.MORPH_ELLIPSE, (3, 3)
+)
+
+
+def _ink_vote_e4_enabled():
+    value = os.environ.get(_INK_VOTE_E4_ENV, "0").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
 # Cadencia ativa por atividade (frente 92): com a flag ligada, a
 # sonda ociosa de _IDLE_PROBE_SECONDS nao governa enquanto a
 # saida do acumulador esta mudando — ver _PageCleanWorker.
@@ -413,6 +493,90 @@ class _E3SideVote:
             np.add(hits, item > self._threshold, out=hits)
         seen = hits > 0
         rule = (hits >= self._window_len) & (score >= self._min_score)
+        if np.any(rule):
+            anchor = seen | self._confirmed
+            near_anchor = cv2.dilate(anchor.astype(np.uint8), _INK_FRONTIER_KERNEL) > 0
+            rule &= seen | ~near_anchor
+        self._confirmed |= rule
+        return self._confirmed
+
+
+class _E4ThinSideVote:
+    """Voto da trilha fina da E5-S: estrito com tolerancia de 1 px.
+
+    Porto do SideTol dos prototipos das F106/F107: a linha de
+    1 px tremula +-1 px entre passadas e o hit no mesmo pixel em
+    toda a janela nao fecha. Aqui o hit conta na vizinhanca r1
+    (vizinhanca >= janela), o pixel precisa de >= 1 hit proprio
+    e a soma da janela sobre os mapas dilatados r1 fecha em
+    min_score. A porta de fronteira e a mesma das outras
+    trilhas. Interface identica a do _E3SideVote (reset/migrate/
+    add; _confirmed/_maps com os mesmos nomes) para o caminho de
+    remocao (DRAW_INK_REMOVAL) limpar as duas familias igual.
+    """
+
+    def __init__(self, window, min_score, threshold):
+        self._window_len = int(window)
+        self._min_score = float(min_score)
+        self._threshold = float(threshold)
+        self.reset()
+
+    def reset(self):
+        self._maps = deque(maxlen=self._window_len)
+        self._confirmed = None
+
+    def migrate(self, matrix, size):
+        if self._confirmed is None:
+            return
+        self._confirmed = (
+            cv2.warpPerspective(
+                self._confirmed.astype(np.uint8),
+                matrix,
+                size,
+                flags=cv2.INTER_NEAREST,
+                borderValue=0,
+            )
+            > 0
+        )
+        self._maps = deque(
+            (
+                cv2.warpPerspective(
+                    item, matrix, size, flags=cv2.INTER_LINEAR, borderValue=0.0
+                )
+                for item in self._maps
+            ),
+            maxlen=self._window_len,
+        )
+
+    def add(self, prob):
+        if self._confirmed is None or self._confirmed.shape != prob.shape:
+            self._confirmed = np.zeros(prob.shape, dtype=bool)
+            self._maps.clear()
+        self._maps.append(prob.copy())
+        maps = list(self._maps)
+        if len(maps) < self._window_len:
+            return self._confirmed
+        score = None
+        hits = None
+        neighbours = None
+        seen = None
+        for item in maps:
+            dilated = cv2.dilate(item, _INK_VOTE_E4_TOLERANCE_KERNEL)
+            score = dilated.copy() if score is None else score + dilated
+            hit = (item > self._threshold).astype(np.int32)
+            hits = hit if hits is None else hits + hit
+            near_hit = (
+                cv2.dilate(
+                    (item > self._threshold).astype(np.uint8),
+                    _INK_VOTE_E4_TOLERANCE_KERNEL,
+                )
+                > 0
+            ).astype(np.int32)
+            neighbours = near_hit if neighbours is None else neighbours + near_hit
+            seen = (hit > 0) if seen is None else (seen | (hit > 0))
+        rule = (neighbours >= self._window_len) & (hits >= 1) & (
+            score >= self._min_score
+        )
         if np.any(rule):
             anchor = seen | self._confirmed
             near_anchor = cv2.dilate(anchor.astype(np.uint8), _INK_FRONTIER_KERNEL) > 0
@@ -991,10 +1155,16 @@ class _LayeredInkAccumulator:
         # todo o estado da regra zera junto com o da geracao — uma
         # geracao nova nao herda nucleo, uniao velha nem trilhas.
         self._e3_active = None
+        # Regra E5-S (DRAW_INK_VOTE_E4): idem — decidida na
+        # primeira passada da geracao, com precedencia sobre a
+        # E3 quando as duas flags estao ligadas (ver a constante
+        # _INK_VOTE_E4_ENV).
+        self._e4_active = None
         # Corte de latencia (DRAW_INK_VOTE_FAST): decidido junto
         # com o modo E3, na mesma primeira passada da geracao.
         self._fast_active = None
         self._reset_e3_state()
+        self._reset_e4_state()
 
     def _reset_e3_state(self):
         self._e3_passes = 0
@@ -1084,6 +1254,205 @@ class _LayeredInkAccumulator:
         self._e3_passes += 1
         return confirmed
 
+    def _reset_e4_state(self):
+        self._e4_passes = 0
+        self._e4_phase1_maps = []
+        self._e4_opening = None
+        self._e4_opening_prob = None
+        self._e4_region_big = None
+        self._e4_region_small = None
+        self._e4_region_slow = None
+        self._e4_region_thin = None
+        self._e4_side_big = _E3SideVote(
+            _INK_VOTE_E4_BIG_WINDOW, _INK_VOTE_E4_BIG_SCORE, self.threshold
+        )
+        self._e4_side_small = _E3SideVote(
+            _INK_VOTE_E4_SMALL_WINDOW, _INK_VOTE_E4_SMALL_SCORE, self.threshold
+        )
+        self._e4_side_slow = _E3SideVote(
+            _INK_VOTE_E4_SLOW_WINDOW, _INK_VOTE_E4_SLOW_SCORE, self.threshold
+        )
+        self._e4_side_thin = _E4ThinSideVote(
+            _INK_VOTE_E4_THIN_WINDOW, _INK_VOTE_E4_THIN_SCORE, self.threshold
+        )
+        self._e4_tracks_big = 0
+        self._e4_tracks_small = 0
+        self._e4_tracks_slow = 0
+        self._e4_tracks_thin = 0
+        self._e4_tracks_sub = 0
+
+    def _e4_open_track(self, component, area, width, height, far_mask, sub=False):
+        """Abre a trilha de um componente (ou sub-componente) novo.
+
+        Classificacao do prototipo da F107 (E5._open): a banda de
+        distancia ao confirmado decide lenta x longe; longe, a
+        forma de linha decide fina x por-tamanho. Sub-componente
+        de nascimento abre com regiao r3 (a regiao r6 colaria a
+        sub-trilha no conteudo coberto que a gerou).
+        """
+        frac_far = float(np.count_nonzero(component & far_mask) / area)
+        dil3 = (
+            cv2.dilate(component.astype(np.uint8), _INK_VOTE_E3_DILATE_KERNEL) > 0
+        )
+        if frac_far < 0.5:
+            self._e4_region_slow |= dil3
+            self._e4_tracks_slow += 1
+        elif (
+            max(width, height) >= _INK_VOTE_E4_THIN_MIN_LENGTH
+            and area <= _INK_VOTE_E4_THIN_MAX_AREA_RATIO * max(width, height)
+        ):
+            self._e4_region_thin |= dil3
+            self._e4_tracks_thin += 1
+        elif area >= _INK_VOTE_E4_BIG_COMPONENT_PX:
+            self._e4_region_big |= (
+                dil3
+                if sub
+                else cv2.dilate(
+                    component.astype(np.uint8), _INK_VOTE_E3_REGION_KERNEL
+                )
+                > 0
+            )
+            self._e4_tracks_big += 1
+        else:
+            self._e4_region_small |= (
+                dil3
+                if sub
+                else cv2.dilate(
+                    component.astype(np.uint8), _INK_VOTE_E3_REGION_KERNEL
+                )
+                > 0
+            )
+            self._e4_tracks_small += 1
+        if sub:
+            self._e4_tracks_sub += 1
+
+    def _e4_step(self, evidence):
+        """Uma passada da regra E5-S; devolve a mascara confirmada.
+
+        Porto fiel do prototipo validado da F107 (frente107/
+        f107_proto.py, classe E5 com use_subdiv=True,
+        use_weak=False, use_thinweak=False — so a subdivisao por
+        nascimento sobre a E4j): fase 1 = nucleo da E3 com a
+        abertura (mascara + mapa de prob da 1a passada) congelada
+        como unico "velho"; fase 2 classifica cada componente
+        contra abertura, confirmado e regioes (instantaneos do
+        inicio da passada, como no prototipo) e alimenta as
+        quatro trilhas com a evidencia mascarada pela regiao.
+        """
+        shape = evidence.shape
+        if self._e4_opening is None or self._e4_opening.shape != shape:
+            self._e4_opening = np.zeros(shape, dtype=bool)
+            self._e4_opening_prob = np.zeros(shape, dtype=np.float32)
+            self._e4_region_big = np.zeros(shape, dtype=bool)
+            self._e4_region_small = np.zeros(shape, dtype=bool)
+            self._e4_region_slow = np.zeros(shape, dtype=bool)
+            self._e4_region_thin = np.zeros(shape, dtype=bool)
+            self._e4_phase1_maps = []
+            self._e4_passes = 0
+            self._e4_side_big.reset()
+            self._e4_side_small.reset()
+            self._e4_side_slow.reset()
+            self._e4_side_thin.reset()
+            self._e4_tracks_big = 0
+            self._e4_tracks_small = 0
+            self._e4_tracks_slow = 0
+            self._e4_tracks_thin = 0
+            self._e4_tracks_sub = 0
+        ink = evidence > self.threshold
+        confirmed = self._confirmed > 0
+        if self._e4_passes == 0:
+            self._e4_opening = ink.copy()
+            self._e4_opening_prob = evidence.copy()
+        if self._e4_passes < _INK_VOTE_E3_PHASE1_PASSES:
+            self._e4_phase1_maps.append(evidence.copy())
+            if self._e4_passes == _INK_VOTE_E3_PHASE1_PASSES - 1:
+                confirmed = confirmed | _e3_phase1_core(
+                    self._e4_phase1_maps, self.threshold
+                )
+            self._e4_passes += 1
+            return confirmed
+        confirmed_d3 = (
+            cv2.dilate(confirmed.astype(np.uint8), _INK_VOTE_E3_DILATE_KERNEL) > 0
+        )
+        confirmed_d8 = (
+            cv2.dilate(confirmed.astype(np.uint8), _INK_VOTE_E4_FAR_KERNEL) > 0
+        )
+        far_mask = ~confirmed_d8
+        opening_d3 = (
+            cv2.dilate(self._e4_opening.astype(np.uint8), _INK_VOTE_E3_DILATE_KERNEL)
+            > 0
+        )
+        opening_evidence = self._e4_opening_prob >= _INK_VOTE_E4_OPENING_EVIDENCE
+        regions = (
+            self._e4_region_big
+            | self._e4_region_small
+            | self._e4_region_slow
+            | self._e4_region_thin
+        )
+        regions_dilated = (
+            cv2.dilate(regions.astype(np.uint8), _INK_VOTE_E3_DILATE_KERNEL) > 0
+        )
+        covered = confirmed_d3 | regions_dilated
+        count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+            ink.astype(np.uint8), 8
+        )
+        for index in range(1, count):
+            area = int(stats[index, cv2.CC_STAT_AREA])
+            if area < _INK_VOTE_E4_MIN_COMPONENT_PX:
+                continue
+            component = labels == index
+            if (
+                float(np.count_nonzero(component & opening_d3) / area) >= 0.5
+                or float(np.count_nonzero(component & opening_evidence) / area)
+                >= 0.5
+            ):
+                # Pre-existente na abertura: ignorado NESTA
+                # passada, sem virar estado — nada absorve pra
+                # sempre (a diferenca central contra a E3).
+                continue
+            frac_covered = float(np.count_nonzero(component & covered) / area)
+            if frac_covered < 0.5:
+                self._e4_open_track(
+                    component,
+                    area,
+                    int(stats[index, cv2.CC_STAT_WIDTH]),
+                    int(stats[index, cv2.CC_STAT_HEIGHT]),
+                    far_mask,
+                )
+                continue
+            # Subdivisao por nascimento: o residuo fora da
+            # cobertura e re-componentizado e cada pedaco abre a
+            # sua trilha; a parte coberta segue ignorada.
+            residual = component & ~covered
+            if np.count_nonzero(residual) < _INK_VOTE_E4_MIN_COMPONENT_PX:
+                continue
+            sub_count, sub_labels, sub_stats, _sub = (
+                cv2.connectedComponentsWithStats(residual.astype(np.uint8), 8)
+            )
+            for sub_index in range(1, sub_count):
+                sub_area = int(sub_stats[sub_index, cv2.CC_STAT_AREA])
+                if sub_area < _INK_VOTE_E4_MIN_COMPONENT_PX:
+                    continue
+                self._e4_open_track(
+                    sub_labels == sub_index,
+                    sub_area,
+                    int(sub_stats[sub_index, cv2.CC_STAT_WIDTH]),
+                    int(sub_stats[sub_index, cv2.CC_STAT_HEIGHT]),
+                    far_mask,
+                    sub=True,
+                )
+        for region, side in (
+            (self._e4_region_big, self._e4_side_big),
+            (self._e4_region_small, self._e4_side_small),
+            (self._e4_region_slow, self._e4_side_slow),
+            (self._e4_region_thin, self._e4_side_thin),
+        ):
+            if np.any(region):
+                masked = np.where(region, evidence, 0.0).astype(np.float32)
+                confirmed = confirmed | side.add(masked)
+        self._e4_passes += 1
+        return confirmed
+
     def migrate(self, matrix):
         """Re-projeta todo o estado da geracao para outra grade.
 
@@ -1147,6 +1516,44 @@ class _LayeredInkAccumulator:
                 ]
                 self._e3_side_big.migrate(matrix, size)
                 self._e3_side_small.migrate(matrix, size)
+        if self._e4_active:
+            # Estado da E5-S acompanha a grade, como o da E3:
+            # abertura e regioes por vizinho mais proximo, mapa
+            # de probabilidade da abertura e mapas de evidencia/
+            # trilha bilineares.
+            if self._e4_opening is not None:
+                self._e4_opening = nearest(self._e4_opening.astype(np.uint8)) > 0
+                self._e4_region_big = nearest(self._e4_region_big.astype(np.uint8)) > 0
+                self._e4_region_small = (
+                    nearest(self._e4_region_small.astype(np.uint8)) > 0
+                )
+                self._e4_region_slow = (
+                    nearest(self._e4_region_slow.astype(np.uint8)) > 0
+                )
+                self._e4_region_thin = (
+                    nearest(self._e4_region_thin.astype(np.uint8)) > 0
+                )
+                self._e4_opening_prob = cv2.warpPerspective(
+                    self._e4_opening_prob,
+                    matrix,
+                    size,
+                    flags=cv2.INTER_LINEAR,
+                    borderValue=0.0,
+                )
+                self._e4_phase1_maps = [
+                    cv2.warpPerspective(
+                        item,
+                        matrix,
+                        size,
+                        flags=cv2.INTER_LINEAR,
+                        borderValue=0.0,
+                    )
+                    for item in self._e4_phase1_maps
+                ]
+                self._e4_side_big.migrate(matrix, size)
+                self._e4_side_small.migrate(matrix, size)
+                self._e4_side_slow.migrate(matrix, size)
+                self._e4_side_thin.migrate(matrix, size)
 
     def _window_stats(self):
         """(soma, hits, visto-como-tinta) da janela, sem empilhar.
@@ -1197,13 +1604,18 @@ class _LayeredInkAccumulator:
             self._low_overlap_streak = 0
             self._turn_fired = False
             self._e3_active = None
+            self._e4_active = None
             self._fast_active = None
             self._reset_e3_state()
+            self._reset_e4_state()
         if self._e3_active is None:
             # A regra da geracao decide na primeira passada e nao
             # muda no meio dela (ver _INK_VOTE_E3_ENV). O corte de
             # latencia da F94 decide junto, na mesma passada.
-            self._e3_active = _ink_vote_e3_enabled()
+            # Precedencia declarada: DRAW_INK_VOTE_E4 ligada vence
+            # a E3 — com as duas ligadas roda so a E5-S.
+            self._e4_active = _ink_vote_e4_enabled()
+            self._e3_active = _ink_vote_e3_enabled() and not self._e4_active
             self._fast_active = _ink_vote_fast_enabled()
         confirmed_before = self._confirmed > 0
         canvas_before = int(np.count_nonzero(self._confirmed))
@@ -1247,7 +1659,13 @@ class _LayeredInkAccumulator:
                 else:
                     self._low_overlap_streak = 0
         self._window.append(evidence.copy())
-        if self._e3_active:
+        if self._e4_active:
+            # Regra E5-S (DRAW_INK_VOTE_E4): a confirmacao sai de
+            # _e4_step; a provisoria segue a janela corrente, como
+            # nas outras regras — quem muda e quem confirma.
+            score, hits, seen_as_ink = self._window_stats()
+            new_confirmed = self._e4_step(evidence) & ~confirmed_before
+        elif self._e3_active:
             # Regra E3 (DRAW_INK_VOTE_E3): a confirmacao sai de
             # _e3_step; o "visto" da camada provisoria segue sendo a
             # janela corrente, como na regra principal — a E3 muda
@@ -1320,6 +1738,33 @@ class _LayeredInkAccumulator:
                             side._confirmed[removed] = False
                         for item in side._maps:
                             item[removed] = 0
+                if self._e4_active:
+                    # Acomodacao com o DRAW_INK_REMOVAL do PR #67:
+                    # a memoria de voto da E5-S tambem nao pode
+                    # ressuscitar o traco apagado.
+                    for item in self._e4_phase1_maps:
+                        item[removed] = 0
+                    if self._e4_opening is not None:
+                        self._e4_opening[removed] = False
+                        self._e4_opening_prob[removed] = 0
+                    for mask in (
+                        self._e4_region_big,
+                        self._e4_region_small,
+                        self._e4_region_slow,
+                        self._e4_region_thin,
+                    ):
+                        if mask is not None:
+                            mask[removed] = False
+                    for side in (
+                        self._e4_side_big,
+                        self._e4_side_small,
+                        self._e4_side_slow,
+                        self._e4_side_thin,
+                    ):
+                        if side._confirmed is not None:
+                            side._confirmed[removed] = False
+                        for item in side._maps:
+                            item[removed] = 0
                 seen_as_ink[removed] = False
                 score[removed] = 0
                 hits[removed] = 0
@@ -1371,6 +1816,17 @@ class _LayeredInkAccumulator:
             result["ink_vote_e3_passes"] = self._e3_passes
             result["ink_vote_e3_tracks_big"] = self._e3_tracks_big
             result["ink_vote_e3_tracks_small"] = self._e3_tracks_small
+        if self._e4_active:
+            # Telemetria da E5-S: idem, so com DRAW_INK_VOTE_E4
+            # ligada (com E3+E4 ligadas, a precedencia e da E4 e
+            # a telemetria e esta).
+            result["ink_vote_e4"] = True
+            result["ink_vote_e4_passes"] = self._e4_passes
+            result["ink_vote_e4_tracks_big"] = self._e4_tracks_big
+            result["ink_vote_e4_tracks_small"] = self._e4_tracks_small
+            result["ink_vote_e4_tracks_slow"] = self._e4_tracks_slow
+            result["ink_vote_e4_tracks_thin"] = self._e4_tracks_thin
+            result["ink_vote_e4_tracks_sub"] = self._e4_tracks_sub
         if self._fast_active:
             # Telemetria do corte de latencia (F94): idem, so com
             # DRAW_INK_VOTE_FAST ligada.
@@ -3318,6 +3774,25 @@ class _PageCleanWorker:
                 reg_info["ink_vote_e3_tracks_big"] = result["ink_vote_e3_tracks_big"]
                 reg_info["ink_vote_e3_tracks_small"] = result[
                     "ink_vote_e3_tracks_small"
+                ]
+            if result.get("ink_vote_e4"):
+                # Telemetria da regra E5-S (so com
+                # DRAW_INK_VOTE_E4 ligada): fase e trilhas.
+                reg_info["ink_vote_e4_passes"] = result["ink_vote_e4_passes"]
+                reg_info["ink_vote_e4_tracks_big"] = result[
+                    "ink_vote_e4_tracks_big"
+                ]
+                reg_info["ink_vote_e4_tracks_small"] = result[
+                    "ink_vote_e4_tracks_small"
+                ]
+                reg_info["ink_vote_e4_tracks_slow"] = result[
+                    "ink_vote_e4_tracks_slow"
+                ]
+                reg_info["ink_vote_e4_tracks_thin"] = result[
+                    "ink_vote_e4_tracks_thin"
+                ]
+                reg_info["ink_vote_e4_tracks_sub"] = result[
+                    "ink_vote_e4_tracks_sub"
                 ]
             if result.get("ink_vote_fast"):
                 # Telemetria do corte de latencia (so com
