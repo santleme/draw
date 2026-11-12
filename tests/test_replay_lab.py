@@ -1,14 +1,13 @@
 """Testes do laboratório de replay (frente 102): sinais, seleção e
 prancha — funções puras, sem ONNX."""
+
 import sys
 from pathlib import Path
 
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-sys.path.insert(
-    0, str(Path(__file__).resolve().parent.parent / "tools")
-)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 
 from replay_lab import (  # noqa: E402
     build_panel,
@@ -23,7 +22,9 @@ QUAD = [[100.0, 100.0], [500.0, 100.0], [500.0, 400.0], [100.0, 400.0]]
 
 def _rec(i, quad=QUAD, canvas=0, present=True):
     return {
-        "frame": i, "quad": quad, "canvas_px": canvas,
+        "frame": i,
+        "quad": quad,
+        "canvas_px": canvas,
         "present": present,
     }
 
@@ -35,8 +36,11 @@ def test_quad_jump_none_and_value():
 
 
 def test_signals_growth_and_flip():
-    recs = [_rec(0, canvas=100), _rec(1, canvas=350),
-            _rec(2, canvas=300, present=False)]
+    recs = [
+        _rec(0, canvas=100),
+        _rec(1, canvas=350),
+        _rec(2, canvas=300, present=False),
+    ]
     compute_signals(recs)
     assert recs[1]["sig_canvas_growth_px"] == 250
     assert recs[2]["sig_canvas_growth_px"] == 0  # encolher não conta
@@ -72,7 +76,8 @@ def test_list_corpus_prefers_raw(tmp_path):
     (tmp_path / "other.png").write_bytes(b"x")
     files = list_corpus_frames(tmp_path)
     assert [f.name for f in files] == [
-        "frame_000001.png", "frame_000002.png",
+        "frame_000001.png",
+        "frame_000002.png",
     ]
 
 

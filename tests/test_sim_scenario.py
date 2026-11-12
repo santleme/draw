@@ -187,3 +187,54 @@ def test_export_manifest_marks_scenario(tmp_path):
         SyntheticCapture("ab", fps=4, settle_seconds=0.5), tmp_path / "f.mp4"
     )
     assert fixed["pose"] == "fixed"
+
+
+def test_page_expected_matches_simulator_final(tmp_path):
+    """O gabarito do avaliador segue a ordem do simulador: a borracha
+    correu antes do redesenho, então traço de fase 1 dentro do
+    retângulo apagado é tinta esperada — não falso positivo."""
+    from tools.eval_scenario import _page_expected
+
+    capture = scenario(move=(20, 10, 1.5))
+    drain(capture)
+    gt = tmp_path / "scenario.gt.npz"
+    capture.save_ground_truth(gt)
+    with np.load(gt, allow_pickle=False) as bundle:
+        # fase de redraw aplicada e borracha já corrida: o esperado
+        # do checkpoint final tem que ser exatamente o estado da folha
+        expected = _page_expected(bundle, int(bundle["stroke_phase"].size), erased=True)
+        np.testing.assert_array_equal(expected > 0, bundle["page_ink_final"] > 0)
+        # e o redesenho DENTRO do retângulo apagado sobrevive no
+        # gabarito (era o que o apagar-em-bloco zerava)
+        x, y, w, h = (int(v) for v in bundle["erase_rect"])
+        redraw = _raster(bundle, np.nonzero(bundle["stroke_phase"] == 1)[0]) > 0
+        inside = np.zeros_like(redraw)
+        inside[y : y + h, x : x + w] = True
+        assert (expected > 0)[inside & redraw].all()
+
+
+def test_final_checkpoint_terminal_canvas_loss():
+    """Canvas perdido no evento final não empresta o IoU de fases
+    anteriores: o veredito expõe o status em vez de métricas."""
+    from tools.eval_scenario import _final_checkpoint
+
+    events = [{"kind": "hold", "end": 10}, {"kind": "settle", "end": 20}]
+    checkpoints = [
+        {"frame": 9, "phase": "hold", "iou": 0.9, "confirmed_px": 100},
+        {"frame": 19, "phase": "settle", "status": "sem âncora/canvas"},
+    ]
+    final = _final_checkpoint(checkpoints, events)
+    assert "iou" not in final
+    assert "canvas ausente" in final["status"]
+
+
+def test_final_checkpoint_missing_terminal_event():
+    """Vídeo truncado antes do último evento: veredito sem métrica,
+    com status explicando — nunca o sucesso de uma fase anterior."""
+    from tools.eval_scenario import _final_checkpoint
+
+    events = [{"kind": "hold", "end": 10}, {"kind": "settle", "end": 20}]
+    checkpoints = [{"frame": 9, "phase": "hold", "iou": 0.9}]
+    final = _final_checkpoint(checkpoints, events)
+    assert "iou" not in final
+    assert "evento final" in final["status"]

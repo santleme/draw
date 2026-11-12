@@ -445,6 +445,13 @@ def _detect_sheet_combined_traced(frame, neural_detector):
                     and coverage_mask is not None
                     and np.count_nonzero(coverage_mask) > coverage_mask.size * 0.05
                 ):
+                    frame_h, frame_w = frame.shape[:2]
+                    if coverage_mask.shape != (frame_h, frame_w):
+                        coverage_mask = cv2.resize(
+                            coverage_mask,
+                            (frame_w, frame_h),
+                            interpolation=cv2.INTER_NEAREST,
+                        )
                     extras["coverage_mask"] = coverage_mask
         else:
             corners, verdict = neural_detector.detect_sheet_with_confidence(frame)

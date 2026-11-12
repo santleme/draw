@@ -1694,11 +1694,7 @@ class _PageCleanWorker:
                 # moldura ou a saida prova que nao ha nada novo.
                 away = (
                     float(
-                        np.max(
-                            np.linalg.norm(
-                                corners - self._anchor_corners, axis=1
-                            )
-                        )
+                        np.max(np.linalg.norm(corners - self._anchor_corners, axis=1))
                     )
                     > _GEO_WAKE_MOVE_PX
                 )

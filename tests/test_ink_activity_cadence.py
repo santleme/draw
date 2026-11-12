@@ -75,9 +75,7 @@ def _feed(worker, generation, seconds):
 def _patched(monkeypatch):
     monkeypatch.setattr(ink_layers_module, "_PAGE_CLEAN_INTERVAL_SECONDS", 0.02)
     monkeypatch.setattr(ink_layers_module, "_IDLE_PROBE_SECONDS", 0.30)
-    monkeypatch.setattr(
-        ink_layers_module, "_NO_HAND_REST_AFTER_STILL_PASSES", 3
-    )
+    monkeypatch.setattr(ink_layers_module, "_NO_HAND_REST_AFTER_STILL_PASSES", 3)
 
 
 @pytest.mark.lento

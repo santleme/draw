@@ -277,7 +277,11 @@ def test_gate_on_reentry_after_drop_is_gated_again(monkeypatch):
         if phase["kind"] == "strong":
             return QUAD.copy(), "paper", dict(STRONG)
         if phase["kind"] == "absent":
-            return None, None, {"source": "veto", "presence_logit": -6.0, "edge_in": None}
+            return (
+                None,
+                None,
+                {"source": "veto", "presence_logit": -6.0, "edge_in": None},
+            )
         return QUAD.copy(), "paper", dict(WEAK)
 
     loop = _make_loop(script)

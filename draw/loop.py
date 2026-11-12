@@ -766,9 +766,9 @@ class SheetInkLoop:
                 # movimento de verdade, nao jitter do detector. O
                 # historico reparte da pose nova para a mediana
                 # convergir ja, sem esperar a janela andar.
-                _frozen_med = np.median(
-                    np.stack(self.corner_history), axis=0
-                ).astype(np.float32)
+                _frozen_med = np.median(np.stack(self.corner_history), axis=0).astype(
+                    np.float32
+                )
                 if (
                     _corner_distance(_frozen_med, self.tracker.corners)
                     > _FROZEN_SHEET_MOVE_PX
@@ -825,9 +825,7 @@ class SheetInkLoop:
                     # abstem como sob a mao — mesa vazada no warp
                     # nao vota, sem fabricar papel limpo que
                     # retrairia tinta quando a mascara falha.
-                    visible = (
-                        coverage if visible is None else (visible & coverage)
-                    )
+                    visible = coverage if visible is None else (visible & coverage)
                 if self.session_ink is not None:
                     if not self.session_ink.ready:
                         if self.baseline_armed:

@@ -244,9 +244,9 @@ def test_frozen_geometry_stays_without_flag(monkeypatch):
     """Sem a flag, o congelamento de sempre segue: a mediana fica
     na pose antiga mesmo com o rastreador já na posição nova."""
     loop, ink, moved = _move_scenario(monkeypatch, flag=False)
-    assert np.max(
-        np.linalg.norm(loop.tracker.corners - moved, axis=1)
-    ) < 40.0, "o rastreador em si já acompanhou a folha"
+    assert np.max(np.linalg.norm(loop.tracker.corners - moved, axis=1)) < 40.0, (
+        "o rastreador em si já acompanhou a folha"
+    )
     last_corners = ink.submitted[-1][1]
     assert last_corners is not None
     assert np.max(np.abs(last_corners - QUAD)) < 5.0

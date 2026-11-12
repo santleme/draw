@@ -1022,14 +1022,12 @@ class NeuralSheetDetector:
         # Cobertura para o voto (DRAW_SHEET_COVERAGE): o que o
         # modelo diz não ser fundo, com buracos internos fechados —
         # uma mão que ele não reconheceu pairando sobre a folha não
-        # pode secar a tinta debaixo dela.
-        coverage = _fill_interior_holes(coverage_small) * 255
+        # pode secar a tinta debaixo dela. Fica na resolução nativa:
+        # quem consome (draw/app.py) faz o upsample no mesmo ponto
+        # em que a máscara de chamada ganha a resolução do frame.
+        self.last_coverage_mask = _fill_interior_holes(coverage_small) * 255
         if not native:
             mask = cv2.resize(mask, (frame_w, frame_h), interpolation=cv2.INTER_NEAREST)
-            coverage = cv2.resize(
-                coverage, (frame_w, frame_h), interpolation=cv2.INTER_NEAREST
-            )
-        self.last_coverage_mask = coverage
         if self._timing_enabled:
             postprocess_end = time.perf_counter()
             self._record_timing(
@@ -1056,11 +1054,6 @@ class NeuralSheetDetector:
         verdict = "paper" if corners is not None else None
         if return_mask:
             mask = cv2.resize(mask, (frame_w, frame_h), interpolation=cv2.INTER_NEAREST)
-            self.last_coverage_mask = cv2.resize(
-                self.last_coverage_mask,
-                (frame_w, frame_h),
-                interpolation=cv2.INTER_NEAREST,
-            )
         else:
             mask = None
         return corners, verdict, mask

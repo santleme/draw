@@ -155,9 +155,7 @@ class _FakeInkWorker:
         return self.generation
 
     def submit(self, warped, generation, corners=None, visible=None):
-        self.submitted.append(
-            (generation, None if corners is None else corners.copy())
-        )
+        self.submitted.append((generation, None if corners is None else corners.copy()))
 
     def poll_display(self, generation, version):
         return None

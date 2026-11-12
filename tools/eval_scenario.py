@@ -34,24 +34,60 @@ def _stroke_mask(shape, points, thickness):
 
 
 def _page_expected(bundle, applied_upto, erased):
-    """Tinta esperada na folha: traços aplicados até a fase, menos o
-    retângulo já apagado (a borracha corta qualquer traço dentro dele)."""
+    """Tinta esperada na folha por fase, na ordem do simulador.
+
+    A borracha correu ANTES do redesenho: ela corta os traços da
+    primeira escrita (fase 0), mas o redesenho (fase 1) nasce depois
+    dela — um traço de fase 1 dentro do retângulo apagado é tinta
+    esperada, não falso positivo. Apagar as duas fases juntas zerava
+    o redesenho do gabarito e punia a confirmação correta.
+    """
     shape = bundle["page_ink_full"].shape
     expected = np.zeros(shape, np.uint8)
     points, offsets = bundle["points"], bundle["offsets"]
-    for index in range(applied_upto):
-        geo = points[offsets[index] : offsets[index + 1]]
-        cv2.polylines(
-            expected,
-            [geo.astype(np.int32)],
-            False,
-            255,
-            int(bundle["thickness"][index]),
-        )
+    stroke_phase = bundle["stroke_phase"]
+
+    def _draw(indices):
+        for index in indices:
+            geo = points[offsets[index] : offsets[index + 1]]
+            cv2.polylines(
+                expected,
+                [geo.astype(np.int32)],
+                False,
+                255,
+                int(bundle["thickness"][index]),
+            )
+
+    applied = range(applied_upto)
+    _draw(i for i in applied if stroke_phase[i] == 0)
     if erased:
         x, y, w, h = (int(v) for v in bundle["erase_rect"])
         expected[y : y + h, x : x + w] = 0
+    _draw(i for i in applied if stroke_phase[i] != 0)
     return expected
+
+
+def _final_checkpoint(checkpoints, events):
+    """O checkpoint do ÚLTIMO evento declarado — nunca um anterior.
+
+    Escolher "o último com IoU" mascarava perda de canvas no fim
+    (movimento que tira a folha de cena, ou vídeo truncado): o
+    relatório cantava o sucesso de uma fase anterior como estado
+    final. Sem checkpoint do evento final, ou com canvas ausente
+    nele, as métricas ficam indisponíveis e o status diz por quê.
+    """
+    terminal_frame = int(events[-1]["end"]) - 1 if events else -1
+    final = next((c for c in checkpoints if c["frame"] == terminal_frame), None)
+    if final is None:
+        return {"status": "sem checkpoint do evento final"}
+    if "iou" not in final:
+        return {
+            "status": f"canvas ausente no evento final ({final.get('status')})",
+            "frame": final["frame"],
+            "phase": final["phase"],
+            "confirmed_px": final.get("confirmed_px"),
+        }
+    return final
 
 
 def _project(mask, corners, page_to_scene, canvas_hw):
@@ -197,12 +233,13 @@ def audit(video, gt_path, *, fps=None, models=(), save_masks=None):
             entry["redraw_provisional_px"] = int((provisional & redraw_canvas).sum())
         checkpoints.append(entry)
 
-    final = next((c for c in reversed(checkpoints) if "iou" in c), {})
+    final = _final_checkpoint(checkpoints, events)
     report = {
         "video": str(video),
         "checkpoints": checkpoints,
         "pipeline": pipeline,
         "verdict": {
+            "status": final.get("status"),
             "final_iou": final.get("iou"),
             "final_recall": final.get("recall"),
             "final_confirmed_px": final.get("confirmed_px"),
