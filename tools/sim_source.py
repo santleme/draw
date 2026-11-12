@@ -58,6 +58,11 @@ class SyntheticCapture:
         hold_seconds: float = 4.0,
         move: tuple[float, float, float] | None = None,
         move_seconds: float = 0.8,
+        lift: tuple[float, float] | None = None,
+        return_pose: tuple[float, float, float] | None = None,
+        absent_seconds: float = 2.0,
+        lift_seconds: float = 0.5,
+        return_seconds: float = 0.5,
     ):
         if not math.isfinite(fps) or not 0 < fps <= 120:
             raise ValueError("fps deve estar entre 0 e 120")
@@ -75,6 +80,9 @@ class SyntheticCapture:
             ("erase_seconds", erase_seconds),
             ("hold_seconds", hold_seconds),
             ("move_seconds", move_seconds),
+            ("absent_seconds", absent_seconds),
+            ("lift_seconds", lift_seconds),
+            ("return_seconds", return_seconds),
         ):
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} deve ser finito e não negativo")
@@ -138,6 +146,29 @@ class SyntheticCapture:
         ):
             raise ValueError("move espera (dx, dy, graus) finitos no espaço da cena")
 
+        # lift & return: a folha sai de cena por inteiro (lift_out),
+        # some por absent_seconds (só mesa — a tinta vai junto, fica
+        # na folha) e volta deslizando na pose `return_pose` relativa
+        # à pose de quando saiu. É o gesto mais comum da mesa real —
+        # pegar a folha, virar e repousar — e o que mais estressa a
+        # vigia de identidade: mesma página ou página nova?
+        lift_off = None
+        if lift is not None:
+            if len(lift) != 2 or not all(math.isfinite(v) for v in lift):
+                raise ValueError("lift espera (dx, dy) finitos na cena")
+            direction = np.float32(lift)
+            norm = float(np.linalg.norm(direction))
+            if norm < 1.0:
+                raise ValueError("lift precisa de direção não trivial")
+            # Deslocamento maior que o lado do frame garante saída
+            # completa para qualquer quad.
+            lift_off = self._quad_now + direction / norm * (gs.SIZE + 400)
+        if return_pose is not None:
+            if lift is None:
+                raise ValueError("return_pose exige lift")
+            if len(return_pose) != 3 or not all(math.isfinite(v) for v in return_pose):
+                raise ValueError("return_pose espera (dx, dy, graus) finitos na cena")
+
         # Linha do tempo em fases; sem cenário é exatamente
         # warmup → escrita → settle, como sempre foi.
         hold_frames = max(0, math.ceil(hold_seconds * fps))
@@ -173,6 +204,32 @@ class SyntheticCapture:
                 max(1, math.ceil(move_seconds * fps)),
                 delta=move,
                 quad_from=self._quad_now.copy(),
+            )
+        if lift_off is not None:
+            quad_at_lift = self._quad_now.copy()
+            push(
+                "lift_out",
+                max(1, math.ceil(lift_seconds * fps)),
+                quad_from=quad_at_lift,
+                quad_to=lift_off,
+            )
+            push("absent", max(1, math.ceil(absent_seconds * fps)))
+            if return_pose is None:
+                quad_return = quad_at_lift
+            else:
+                rdx, rdy, rdeg = return_pose
+                target = quad_at_lift + np.float32([rdx, rdy])
+                center = target.mean(axis=0)
+                rad = math.radians(rdeg)
+                rot = np.float32(
+                    [[math.cos(rad), -math.sin(rad)], [math.sin(rad), math.cos(rad)]]
+                )
+                quad_return = (target - center) @ rot.T + center
+            push(
+                "return",
+                max(1, math.ceil(return_seconds * fps)),
+                quad_from=lift_off,
+                quad_to=quad_return,
             )
         push("settle", max(1, math.ceil(settle_seconds * fps)))
         self.frame_count = start
@@ -283,6 +340,14 @@ class SyntheticCapture:
         )
         self._quad_now = (quad - center) @ rotation.T + center
 
+    def _step_quad_lerp(self, phase, local):
+        """Interpola o quad entre quad_from e quad_to — saída da folha
+        (lift_out) e o retorno dela deslizando para a pose nova."""
+        t = min(1.0, (local + 1) / (phase["end"] - phase["start"]))
+        self._quad_now = phase["quad_from"] + t * (
+            phase["quad_to"] - phase["quad_from"]
+        )
+
     def read(self):
         if not self._opened or self._position >= self.frame_count:
             return False, None
@@ -304,6 +369,8 @@ class SyntheticCapture:
             paper, ink = self._paper.copy(), self._ink.copy()
         elif phase["kind"] == "move":
             self._step_move(phase, local)
+        elif phase["kind"] in ("lift_out", "return"):
+            self._step_quad_lerp(phase, local)
         self.page_to_scene = cv2.getPerspectiveTransform(
             self._page_corners, self._quad_now
         )
@@ -551,6 +618,19 @@ def main(argv=None):
         help="desliza/gira a folha no fim: dx,dy,graus no espaço da cena",
     )
     parser.add_argument("--move-seconds", type=float, default=0.8)
+    parser.add_argument(
+        "--lift",
+        type=str,
+        help="tira a folha de cena (lift & return): dx,dy da direção de saída",
+    )
+    parser.add_argument(
+        "--return-pose",
+        type=str,
+        help="pose do retorno vs a pose da saída: dx,dy,graus (default: mesma pose)",
+    )
+    parser.add_argument("--absent-seconds", type=float, default=2.0)
+    parser.add_argument("--lift-seconds", type=float, default=0.5)
+    parser.add_argument("--return-seconds", type=float, default=0.5)
     args = parser.parse_args(argv)
     try:
         erase_rect = None
@@ -561,6 +641,12 @@ def main(argv=None):
         move = None
         if args.move:
             move = tuple(float(v) for v in args.move.split(","))
+        lift = None
+        if args.lift:
+            lift = tuple(float(v) for v in args.lift.split(","))
+        return_pose = None
+        if args.return_pose:
+            return_pose = tuple(float(v) for v in args.return_pose.split(","))
         capture = SyntheticCapture(
             args.text,
             seed=args.seed,
@@ -577,6 +663,11 @@ def main(argv=None):
             hold_seconds=args.hold_seconds,
             move=move,
             move_seconds=args.move_seconds,
+            lift=lift,
+            return_pose=return_pose,
+            absent_seconds=args.absent_seconds,
+            lift_seconds=args.lift_seconds,
+            return_seconds=args.return_seconds,
         )
         manifest = export_video(capture, args.out)
     except (ValueError, RuntimeError, OSError, cv2.error) as error:

@@ -110,6 +110,50 @@ python tools/mjpeg_server.py --video captures/sim-e3.mp4 --port 8554 &
 python main.py --source http://127.0.0.1:8554/video
 ```
 
+## Cenário lift & return (folha sai de cena e volta)
+
+`--lift dx,dy` encadeia três fases depois das anteriores: `lift_out`
+(a folha desliza até sair do frame), `absent` (só a mesa na cena por
+`--absent-seconds` — a tinta vai junto, fica na folha) e `return` (a
+folha desliza de volta). `--return-pose dx,dy,graus` define a pose do
+retorno relativa à pose de saída — rotação de verdade, como quem pega
+a folha, vira e repousa. É o gesto mais comum da mesa real e o que
+mais estressa a vigia de identidade: mesma página ou página nova?
+
+```sh
+python tools/sim_source.py --text "Draw v6" --fps 15 \
+  --warmup-seconds 1 --settle-seconds 8 --hold-seconds 4 \
+  --lift 400,250 --return-pose -50,40,20 \
+  --absent-seconds 2.5 --out captures/sim-lift.mp4
+```
+
+### Limite medido do detector (2026-11-12)
+
+A primeira auditoria deste cenário expôs um gap de dados, não de
+código: a folha retorna rodada 20° e **nenhum dos seis modelos de
+segmentação instalados a reconhece** — logit de presença ~-6,5 por
+8 s de settle com a folha inteira visível. Girando um frame que o
+modelo detecta, o envelope sai: logit positivo até ~12°, cruza zero
+perto de 15°, fundo confiante a partir de 20°. O gerador de corpus
+amostra rotação em `uniform(-18°, 18°)` (`_sample_normal_quad`,
+tools/gen_synthetic.py) — a folha nunca existiu no treino além desse
+teto, e o modelo falha logo na borda dele. Rotacionar a folha é gesto
+rotineiro na mesa real; a correção é augment de rotação no corpus do
+próximo treino, e este cenário vira a bancada de regressão dele.
+
+Efeito colateral medido na janela de perda do tracker: enquanto a
+folha some mas `tracker.corners` ainda está na graça
+(`_SHEET_LOST_SECONDS`), as passadas seguem no quad defasado sobre
+mesa — o provisório mediu 3,7k→346k px em ~1 s antes da queda fechar
+a sessão. Nada confirmou (as guardas de geração seguraram), mas é
+trabalho morto conhecido.
+
+A auditoria por fase trata `return` como o `move`: checkpoints após o
+retorno pontuam contra `page_to_scene_final`. Checkpoints de `absent`
+sem âncora/canvas registram status em vez de métrica — e o veredito
+final ancora no último evento declarado (sem IoU emprestado de fases
+anteriores).
+
 ## Capturar e avaliar sem interface
 
 Com os ONNX oficiais instalados (veja `tools/fetch_models.py`):
