@@ -388,8 +388,8 @@ CSV mínimo: `image_path,session_id` (ou `batch_id`); quando a fonte não tem
 grupos identificáveis, usar um único `--batch` conservador para a pasta,
 nunca inventar autor/sessão por imagem. No pool catalogado o CSV também
 informa `session_used_for_prior_training`; para novos dados, é responsabilidade
-do operador auditar treino anterior antes de reservá-los. O resumo informa
-Original `session_id` nunca é renomeado: continua comparável ao holdout
+do operador auditar treino anterior antes de reservá-los.
+O `session_id` original nunca é renomeado: continua comparável ao holdout
 dos checkpoints/rodadas anteriores. Para reutilizar sessões já divididas,
 passar `--sealed-split /pool/anterior/split.json` (se estiver na raiz bruta,
 é lido automaticamente); o selo anterior tem precedência e proíbe
