@@ -146,7 +146,7 @@ def translate(
     original_sessions = {r["group"] for r in catalog if r["session_id"]}
     ids = {
         g: g
-        if g in original_sessions or g in seals
+        if g in original_sessions
         else "external-" + hashlib.sha256(f"{dataset}:{g}".encode()).hexdigest()[:24]
         for g in groups
     }
@@ -158,14 +158,15 @@ def translate(
             if split == "auto"
             else split
         )
-        if ids[group] in seals:
-            if split != "auto" and side != seals[ids[group]]:
+        sealed_side = seals.get(ids[group], seals.get(group))
+        if sealed_side is not None:
+            if split != "auto" and side != sealed_side:
                 raise splits.LeakageError(
-                    f"sessão já selada como {seals[ids[group]]}: {group}"
+                    f"sessão já selada como {sealed_side}: {group}"
                 )
-            side = seals[ids[group]]
+            side = sealed_side
         if prior:
-            if split == "holdout" or seals.get(ids[group]) == "holdout":
+            if split == "holdout" or sealed_side == "holdout":
                 raise splits.LeakageError(f"sessão já usada em treino: {group}")
             side = "train"
         assignments[ids[group]] = side
