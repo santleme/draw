@@ -337,9 +337,7 @@ _INK_VOTE_E4_THIN_SCORE = 2.1
 _INK_VOTE_E4_THIN_MIN_LENGTH = 50
 _INK_VOTE_E4_THIN_MAX_AREA_RATIO = 3.5
 _INK_VOTE_E4_FAR_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17))
-_INK_VOTE_E4_TOLERANCE_KERNEL = cv2.getStructuringElement(
-    cv2.MORPH_ELLIPSE, (3, 3)
-)
+_INK_VOTE_E4_TOLERANCE_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
 
 def _ink_vote_e4_enabled():
@@ -574,8 +572,8 @@ class _E4ThinSideVote:
             ).astype(np.int32)
             neighbours = near_hit if neighbours is None else neighbours + near_hit
             seen = (hit > 0) if seen is None else (seen | (hit > 0))
-        rule = (neighbours >= self._window_len) & (hits >= 1) & (
-            score >= self._min_score
+        rule = (
+            (neighbours >= self._window_len) & (hits >= 1) & (score >= self._min_score)
         )
         if np.any(rule):
             anchor = seen | self._confirmed
@@ -1291,9 +1289,7 @@ class _LayeredInkAccumulator:
         sub-trilha no conteudo coberto que a gerou).
         """
         frac_far = float(np.count_nonzero(component & far_mask) / area)
-        dil3 = (
-            cv2.dilate(component.astype(np.uint8), _INK_VOTE_E3_DILATE_KERNEL) > 0
-        )
+        dil3 = cv2.dilate(component.astype(np.uint8), _INK_VOTE_E3_DILATE_KERNEL) > 0
         if frac_far < 0.5:
             self._e4_region_slow |= dil3
             self._e4_tracks_slow += 1
@@ -1307,9 +1303,7 @@ class _LayeredInkAccumulator:
             self._e4_region_big |= (
                 dil3
                 if sub
-                else cv2.dilate(
-                    component.astype(np.uint8), _INK_VOTE_E3_REGION_KERNEL
-                )
+                else cv2.dilate(component.astype(np.uint8), _INK_VOTE_E3_REGION_KERNEL)
                 > 0
             )
             self._e4_tracks_big += 1
@@ -1317,9 +1311,7 @@ class _LayeredInkAccumulator:
             self._e4_region_small |= (
                 dil3
                 if sub
-                else cv2.dilate(
-                    component.astype(np.uint8), _INK_VOTE_E3_REGION_KERNEL
-                )
+                else cv2.dilate(component.astype(np.uint8), _INK_VOTE_E3_REGION_KERNEL)
                 > 0
             )
             self._e4_tracks_small += 1
@@ -1403,8 +1395,7 @@ class _LayeredInkAccumulator:
             component = labels == index
             if (
                 float(np.count_nonzero(component & opening_d3) / area) >= 0.5
-                or float(np.count_nonzero(component & opening_evidence) / area)
-                >= 0.5
+                or float(np.count_nonzero(component & opening_evidence) / area) >= 0.5
             ):
                 # Pre-existente na abertura: ignorado NESTA
                 # passada, sem virar estado — nada absorve pra
@@ -1426,8 +1417,8 @@ class _LayeredInkAccumulator:
             residual = component & ~covered
             if np.count_nonzero(residual) < _INK_VOTE_E4_MIN_COMPONENT_PX:
                 continue
-            sub_count, sub_labels, sub_stats, _sub = (
-                cv2.connectedComponentsWithStats(residual.astype(np.uint8), 8)
+            sub_count, sub_labels, sub_stats, _sub = cv2.connectedComponentsWithStats(
+                residual.astype(np.uint8), 8
             )
             for sub_index in range(1, sub_count):
                 sub_area = int(sub_stats[sub_index, cv2.CC_STAT_AREA])
@@ -3779,21 +3770,13 @@ class _PageCleanWorker:
                 # Telemetria da regra E5-S (so com
                 # DRAW_INK_VOTE_E4 ligada): fase e trilhas.
                 reg_info["ink_vote_e4_passes"] = result["ink_vote_e4_passes"]
-                reg_info["ink_vote_e4_tracks_big"] = result[
-                    "ink_vote_e4_tracks_big"
-                ]
+                reg_info["ink_vote_e4_tracks_big"] = result["ink_vote_e4_tracks_big"]
                 reg_info["ink_vote_e4_tracks_small"] = result[
                     "ink_vote_e4_tracks_small"
                 ]
-                reg_info["ink_vote_e4_tracks_slow"] = result[
-                    "ink_vote_e4_tracks_slow"
-                ]
-                reg_info["ink_vote_e4_tracks_thin"] = result[
-                    "ink_vote_e4_tracks_thin"
-                ]
-                reg_info["ink_vote_e4_tracks_sub"] = result[
-                    "ink_vote_e4_tracks_sub"
-                ]
+                reg_info["ink_vote_e4_tracks_slow"] = result["ink_vote_e4_tracks_slow"]
+                reg_info["ink_vote_e4_tracks_thin"] = result["ink_vote_e4_tracks_thin"]
+                reg_info["ink_vote_e4_tracks_sub"] = result["ink_vote_e4_tracks_sub"]
             if result.get("ink_vote_fast"):
                 # Telemetria do corte de latencia (so com
                 # DRAW_INK_VOTE_FAST ligada).

@@ -299,8 +299,7 @@ def test_thin_track_tolerates_one_pixel_jitter(e4):
         page[250 + (k % 2), 50:350] = 0.85
         result = acc.add(page)
         frac = float(
-            np.count_nonzero((result["confirmed"] > 0) & line)
-            / np.count_nonzero(line)
+            np.count_nonzero((result["confirmed"] > 0) & line) / np.count_nonzero(line)
         )
         if frac >= 0.9:
             latency = k
