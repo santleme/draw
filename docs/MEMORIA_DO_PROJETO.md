@@ -410,6 +410,21 @@ pixel a F-07/F-09. A régua por passada agora é persistida durante a corrida
 em `ink_passes.jsonl`, além do resumo final; ver diagnóstico em FALHAS.
 
 As correções `DRAW_REG_CONTENT_GUARD` e `DRAW_INK_REMOVAL` são opt-in,
+com padrões preservados. Após revisão, o isolamento mantém `session_id`
+original e sela antes do teacher, mas nunca usa chave de lote como caminho.
+A remoção E3 mantém suporte geométrico para redesenho e limpa só a memória
+dos pixels apagados, sem reabrir a fase global. Os 125 testes focados
+passaram na VM e no WSL; a suíte completa teve 1.080 aprovações, uma falha
+herdada de fundos privados ausentes e quatro skips.
+
+A tentativa nativa automatizada em `01efd20` não validou mover/apagar:
+com os modelos oficiais verificados, o vídeo sintético teve folha detectada,
+mas nenhuma tinta confirmada em 101 passadas. Não se avançou sem esse
+estado inicial. Isso não prova regressão nem resultado ao vivo no papel;
+ainda é necessária uma fonte temporal reconhecida pelo modelo. O app também
+encerrou com falha de segmentação ao sair com Q; comparação-base pendente.
+
+As flags novas continuam desligadas por padrão,
 default 0; não promovem modelo nem substituem validação ao vivo. A primeira
 evita votar a cópia reprojetada quando o conteúdo favorece identidade e
 reancora só após assentamento. A segunda retira tinta confirmada com
