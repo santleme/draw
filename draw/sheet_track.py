@@ -12,6 +12,7 @@ Extraido de draw/app.py na modularizacao de 2026-11-05; o app
 re-exporta todos os nomes deste modulo.
 """
 
+import os
 import threading
 import time
 from collections import deque
@@ -472,6 +473,28 @@ def _lk_track_corners(prev_gray, next_gray, corners):
     return tracked.reshape(-1, 2)
 
 
+_SHEET_COVERAGE_ENV = "DRAW_SHEET_COVERAGE"
+
+
+def sheet_coverage_enabled():
+    """Cobertura da folha pelo próprio detector no voto de tinta.
+
+    DRAW_SHEET_COVERAGE=1 (default desligado): a detecção neural
+    publica a máscara de segmentação junto do resultado e o laço a
+    retifica com a mesma homografia do warp de tinta — pixel que a
+    cena mostra fora da folha (mesa que entra por quad largo ou
+    atrasado depois de movimento, a inundação de borda medida na
+    bancada do cenário E3 em 2026-11-12) não vota. Sem a flag o
+    resultado da detecção tem o formato de sempre, byte a byte.
+    """
+    return os.environ.get(_SHEET_COVERAGE_ENV, "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 def _gate_info_from_trace(trace):
     """O pacote do portão de primeira confirmação de um rastro.
 
@@ -591,6 +614,7 @@ class _SheetDetectionWorker:
                 return
             corners, verdict = outcome[0], outcome[1]
             trace = outcome[2] if len(outcome) > 2 else None
+            extras = outcome[3] if len(outcome) > 3 else None
             detect_ms = round((time.monotonic() - started) * 1000.0, 1)
             with self._condition:
                 if trace is not None:
@@ -625,6 +649,14 @@ class _SheetDetectionWorker:
                 gate_info = _gate_info_from_trace(trace)
                 if gate_info is not None:
                     result = result + (gate_info,)
+                # Sétimo elemento: extras da detecção (a máscara de
+                # cobertura de DRAW_SHEET_COVERAGE). Se chega sem
+                # portão, a posição 5 é preenchida com None para a
+                # posição do extra não depender do rastro.
+                if extras is not None:
+                    if gate_info is None:
+                        result = result + (None,)
+                    result = result + (extras,)
                 self._result = result
                 self._condition.notify_all()
 

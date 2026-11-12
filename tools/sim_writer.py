@@ -650,13 +650,18 @@ def audit_one(scen_dir, out_dir, flags, detector_kind="real"):
             self.traces = []
 
         def submit(self, frame, captured_at, frame_index=None):
-            corners, verdict, trace = _detect_sheet_combined_traced(
-                frame, detector)
+            outcome = _detect_sheet_combined_traced(frame, detector)
+            corners, verdict, trace = outcome[0], outcome[1], outcome[2]
+            extras = outcome[3] if len(outcome) > 3 else None
             self._seq += 1
             result = (self._seq, corners, verdict, captured_at, 1.0)
             gate = _gate_info_from_trace(trace)
             if gate is not None:
                 result = result + (gate,)
+            if extras is not None:
+                if gate is None:
+                    result = result + (None,)
+                result = result + (extras,)
             self._result = result
             self.traces.append(trace)
 

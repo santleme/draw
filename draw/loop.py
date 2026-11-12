@@ -32,7 +32,7 @@ from .lk_propagate import (
     ReseededQuadPropagator,
     lk_propagate_enabled,
 )
-from .sheet_track import _SheetTracker, _lk_track_corners
+from .sheet_track import _SheetTracker, _corner_distance, _lk_track_corners
 
 
 # A tinta e lida numa geometria estabilizada: a mediana dos ultimos
@@ -91,6 +91,32 @@ def detect_settled_every():
     except ValueError:
         return 0
     return value if value >= 2 else 0
+
+
+# Destrave da geometria de tinta congelada sem mao (frente do
+# cenario E3, atras de DRAW_INK_FOLLOW_MOVE, default desligado):
+# com clean_hand_present=False o historico de cantos nao recebe o
+# rastreador — decisao correta para a pagina parada (a mediana viva
+# andaria com o jitter e arrastaria a tinta publicada), mas cega
+# para a folha que desliza sem mao na cena: o warp segue na pose
+# velha, passa a ver mesa e a v6 confirma a textura como tinta (a
+# inundacao de borda medida em 2026-11-12). O rastreador so move o
+# quad confirmado depois de filtro de mediana, banda morta e
+# persistencia de salto — um deslocamento sustentado deste quad
+# contra a mediana congelada e movimento real, nao ruido. Acima do
+# limiar, o historico reparte da posicao nova e o registro/ECC/juiz
+# da trabalhadora tratam a migracao, como num salto com mao.
+# 25 px fica bem acima do jitter residual do rastreador (~2 px de
+# banda morta) e abaixo do salto grande de _SHEET_BIG_JUMP_PX, que
+# um deslize continuo nunca dispara.
+_ENV_INK_FOLLOW_MOVE_VAR = "DRAW_INK_FOLLOW_MOVE"
+_FROZEN_SHEET_MOVE_PX = 25.0
+
+
+def ink_follow_move_enabled():
+    """Destrave da geometria congelada: 1/true/yes/on; ausente desliga."""
+    raw = os.environ.get(_ENV_INK_FOLLOW_MOVE_VAR, "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
 
 
 def _small_gray(frame):
@@ -208,6 +234,11 @@ class SheetInkLoop:
         self.sheet_present = False
         self.clean_hand_present = None
         self.hand_presence_seq = 0
+        # Máscara neural da última detecção, em coordenadas de cena
+        # (DRAW_SHEET_COVERAGE). Retificada com a homografia de cada
+        # warp de tinta, vira a cobertura que impede mesa vazada no
+        # retificado de virar voto de tinta nova.
+        self._coverage_mask = None
 
         self.tracker = _SheetTracker()
         self.ink_accumulator = ink_module.InkAccumulator()
@@ -299,17 +330,37 @@ class SheetInkLoop:
         ):
             return False
         if self._det_ref_small is not None:
-            diff = float(
-                np.mean(
-                    cv2.absdiff(_small_gray(frame), self._det_ref_small)
-                )
-            )
+            diff = float(np.mean(cv2.absdiff(_small_gray(frame), self._det_ref_small)))
             if diff >= _SETTLED_TRIGGER_MEAN_ABSDIFF:
                 self._det_skip_left = 0
                 self._det_stable_streak = 0
                 self.detect_settled_triggers += 1
                 return False
         return True
+
+    def _sheet_coverage_page(self, warp_corners):
+        """Cobertura da folha na grade da página, ou None sem evidência.
+
+        A máscara da última detecção é retificada com a mesma
+        homografia do warp de tinta deste quadro: o que a cena
+        mostra fora da folha — mesa que entra por quad largo ou
+        atrasado depois de movimento — só pode votar sobre a tinta
+        que a âncora já tem (gate de re-confirmação na trabalhadora,
+        draw/ink_layers.py). Uma erosão leve desconta a borda da
+        própria máscara. Cobertura toda vazia é devolvida como
+        está: o quad que retifica uma região sem folha nenhuma é
+        exatamente o caso que a cobertura existe para vedar —
+        None seria "sem sinal", que confia.
+        """
+        if self._coverage_mask is None:
+            return None
+        warped = self._warp_sheet(self._coverage_mask, warp_corners)
+        if warped is None:
+            return None
+        coverage = (
+            cv2.erode((warped > 127).astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+        )
+        return coverage
 
     def _warp_and_submit_ink(self, frame, warp_corners):
         """Warp + visibilidade + submissao a trabalhadora de tinta.
@@ -333,12 +384,25 @@ class SheetInkLoop:
             if camera_mask is not None:
                 hand_warped = self._warp_sheet(camera_mask, warp_corners)
                 visible = hand_warped == 0
-        self.ink_worker.submit(
-            ink_warped,
-            self.clean_generation,
-            warp_corners,
-            visible,
-        )
+        coverage = self._sheet_coverage_page(warp_corners)
+        if coverage is not None:
+            # Cobertura só sai quando existe: workers e fakes na
+            # assinatura antiga (sem o quinto argumento) recebem a
+            # chamada de sempre, byte a byte.
+            self.ink_worker.submit(
+                ink_warped,
+                self.clean_generation,
+                warp_corners,
+                visible,
+                coverage,
+            )
+        else:
+            self.ink_worker.submit(
+                ink_warped,
+                self.clean_generation,
+                warp_corners,
+                visible,
+            )
         if self.session_recorder is not None:
             self.session_recorder.note_warp(self.clean_generation, ink_warped)
 
@@ -362,6 +426,14 @@ class SheetInkLoop:
             ) = det_result[:5]
             if len(det_result) > 5:
                 det_gate_info = det_result[5]
+            if len(det_result) > 6:
+                # Extras da detecção (DRAW_SHEET_COVERAGE): a
+                # máscara acompanha o quad que saiu dela — chegou
+                # junto, guarda junto; um resultado sem máscara
+                # (clássico, flag desligada) limpa a evidência
+                # velha em vez de deixar cobertura defasada.
+                det_extras = det_result[6] or {}
+                self._coverage_mask = det_extras.get("coverage_mask")
             ran_detection = True
         else:
             detected_corners, detected_verdict = None, None
@@ -686,6 +758,23 @@ class SheetInkLoop:
             )
             if self.clean_hand_present is not False or (not self.corner_history):
                 self.corner_history.append(self.tracker.corners.copy())
+            elif ink_follow_move_enabled():
+                # Congelado sem mao: so um deslocamento real da folha
+                # destrava — o quad do rastreador ja e posicao
+                # confirmada (mediana + banda morta + persistencia),
+                # entao distancia grande da mediana congelada e
+                # movimento de verdade, nao jitter do detector. O
+                # historico reparte da pose nova para a mediana
+                # convergir ja, sem esperar a janela andar.
+                _frozen_med = np.median(
+                    np.stack(self.corner_history), axis=0
+                ).astype(np.float32)
+                if (
+                    _corner_distance(_frozen_med, self.tracker.corners)
+                    > _FROZEN_SHEET_MOVE_PX
+                ):
+                    self.corner_history.clear()
+                    self.corner_history.append(self.tracker.corners.copy())
             ink_corners = np.median(np.stack(self.corner_history), axis=0).astype(
                 np.float32
             )
@@ -730,6 +819,15 @@ class SheetInkLoop:
                     if camera_mask is not None:
                         hand_warped = self._warp_sheet(camera_mask, warp_corners)
                         visible = hand_warped == 0
+                coverage = self._sheet_coverage_page(warp_corners)
+                if coverage is not None:
+                    # Caminho legado: a regiao fora da folha se
+                    # abstem como sob a mao — mesa vazada no warp
+                    # nao vota, sem fabricar papel limpo que
+                    # retrairia tinta quando a mascara falha.
+                    visible = (
+                        coverage if visible is None else (visible & coverage)
+                    )
                 if self.session_ink is not None:
                     if not self.session_ink.ready:
                         if self.baseline_armed:
@@ -806,9 +904,7 @@ class SheetInkLoop:
                     self._lk_needs_redetect = True
                 else:
                     self._lk_last_output = propagated.copy()
-                    self._warp_and_submit_ink(
-                        frame, propagated.astype(np.float32)
-                    )
+                    self._warp_and_submit_ink(frame, propagated.astype(np.float32))
                     self.lk_propagated_passes += 1
                     lk_pass_done = True
             self._lk_prev_gray = lk_gray_now
@@ -832,9 +928,9 @@ class SheetInkLoop:
             and self.tracker.corners is not None
             and self.corner_history
         ):
-            reuse_corners = np.median(
-                np.stack(self.corner_history), axis=0
-            ).astype(np.float32)
+            reuse_corners = np.median(np.stack(self.corner_history), axis=0).astype(
+                np.float32
+            )
             self._warp_and_submit_ink(frame, reuse_corners)
             self.ink_reuse_passes += 1
 

@@ -120,12 +120,18 @@ class _SynchronousDetector:
     def submit(self, frame, captured_at, frame_index=None):
         from draw.sheet_track import _gate_info_from_trace
 
-        corners, verdict, trace = self.detect(frame)
+        outcome = self.detect(frame)
+        corners, verdict, trace = outcome[0], outcome[1], outcome[2]
+        extras = outcome[3] if len(outcome) > 3 else None
         self.sequence += 1
         self.result = (self.sequence, corners, verdict, captured_at, 0.0)
         gate = _gate_info_from_trace(trace)
         if gate is not None:
             self.result += (gate,)
+        if extras is not None:
+            if gate is None:
+                self.result += (None,)
+            self.result += (extras,)
 
     def poll(self, after_seq):
         if self.result is not None and self.result[0] > after_seq:

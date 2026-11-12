@@ -175,6 +175,24 @@ def first_confirm_gate_enabled():
     return os.environ.get(_ENV_FIRST_CONFIRM_GATE_VAR, "").strip() == "1"
 
 
+def _fill_interior_holes(mask):
+    """Fecha os buracos internos de uma máscara binária 0/1.
+
+    Fundo encerrado por folha — mão, objeto ou traço que o modelo
+    não reconheceu dentro da página — volta para a cobertura; fundo
+    ligado à borda da cena (a mesa de verdade) segue fora. É a
+    diferença entre "o detector não viu papel ali" e "não é folha".
+    """
+    outside = (mask == 0).astype(np.uint8)
+    # A margem de 1 px garante um fundo contíguo para a semente.
+    flood = np.pad(outside, 1, constant_values=1)
+    cv2.floodFill(
+        flood, np.zeros((flood.shape[0] + 2, flood.shape[1] + 2), np.uint8), (0, 0), 0
+    )
+    holes = flood[1:-1, 1:-1]
+    return mask | (holes != 0).astype(np.uint8)
+
+
 def mask_edge_fraction(frame, mask):
     """Fração de píxeis de aresta DENTRO da máscara, na grade 384².
 
@@ -215,6 +233,7 @@ def first_confirm_passes(presence_logit, edge_in):
         float(presence_logit) >= FIRST_CONFIRM_MIN_LOGIT
         and float(edge_in) >= FIRST_CONFIRM_MIN_EDGE_IN
     )
+
 
 # Guarda de plausibilidade do ajuste (medida em 2026-10-30 no
 # laboratório, draw-lab/noite-2026-10-30/block6/): o ajuste neural cru
@@ -798,6 +817,12 @@ class NeuralSheetDetector:
         self._memory_mask = None
         self._memory_geometry = None
         self.last_presence_logit = None
+        # Cobertura de folha da última previsão (0/255, resolução da
+        # máscara devolvida): classes de folha sob qualquer ocupante
+        # — papel, tinta E mão. A mão fica dentro para a cobertura
+        # não virar buraco permanente onde a mão paira; quem segura
+        # o voto sob a mão é a visibilidade, não a cobertura.
+        self.last_coverage_mask = None
         self._timing_enabled = os.environ.get("DRAW_TIMING") == "1"
         self._timing_stats = {
             phase: {"count": 0, "sum_ms": 0.0, "max_ms": 0.0}
@@ -950,6 +975,7 @@ class NeuralSheetDetector:
                 # que existia aqui dava a mesma máscara e custava um
                 # exp sobre 2 x lado x lado por frame.
                 mask_small = (logits[0, 1] > logits[0, 0]).astype(np.uint8)
+                coverage_small = mask_small
             elif channels == 4:
                 # Export híbrido: máscara semântica de quatro classes
                 # com cabeça de presença treinada. Antes, esta forma
@@ -959,6 +985,9 @@ class NeuralSheetDetector:
                 mask_small = (
                     (classes == _PAPER_CLASS) | (classes == _INK_CLASS)
                 ).astype(np.uint8)
+                # Cobertura de voto: tudo que não é fundo — papel,
+                # tinta e mão sobre a folha entram, mesa não entra.
+                coverage_small = (classes != 0).astype(np.uint8)
             else:
                 raise ValueError(
                     "saída 'mask_logits' precisa ter 2 canais "
@@ -977,6 +1006,7 @@ class NeuralSheetDetector:
             page = (classes == _PAPER_CLASS) | (classes == _INK_CLASS)
             page_ratio = float(np.mean(page))
             mask_small = page.astype(np.uint8)
+            coverage_small = (classes != 0).astype(np.uint8)
             self.last_presence_logit = (
                 _SEGMENTATION_PRESENT_LOGIT
                 if page_ratio >= _SEGMENTATION_PRESENCE_MIN_RATIO
@@ -989,8 +1019,17 @@ class NeuralSheetDetector:
                 f"recebi {output_names}"
             )
         mask = mask_small * 255
+        # Cobertura para o voto (DRAW_SHEET_COVERAGE): o que o
+        # modelo diz não ser fundo, com buracos internos fechados —
+        # uma mão que ele não reconheceu pairando sobre a folha não
+        # pode secar a tinta debaixo dela.
+        coverage = _fill_interior_holes(coverage_small) * 255
         if not native:
             mask = cv2.resize(mask, (frame_w, frame_h), interpolation=cv2.INTER_NEAREST)
+            coverage = cv2.resize(
+                coverage, (frame_w, frame_h), interpolation=cv2.INTER_NEAREST
+            )
+        self.last_coverage_mask = coverage
         if self._timing_enabled:
             postprocess_end = time.perf_counter()
             self._record_timing(
@@ -1017,6 +1056,11 @@ class NeuralSheetDetector:
         verdict = "paper" if corners is not None else None
         if return_mask:
             mask = cv2.resize(mask, (frame_w, frame_h), interpolation=cv2.INTER_NEAREST)
+            self.last_coverage_mask = cv2.resize(
+                self.last_coverage_mask,
+                (frame_w, frame_h),
+                interpolation=cv2.INTER_NEAREST,
+            )
         else:
             mask = None
         return corners, verdict, mask

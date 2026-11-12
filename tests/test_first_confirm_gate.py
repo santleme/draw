@@ -145,12 +145,12 @@ def test_combined_traced_computes_edge_in_only_when_gate_on(monkeypatch):
     )
     det = _FakeNeural()
     monkeypatch.delenv("DRAW_FIRST_CONFIRM_GATE", raising=False)
-    _c, _v, trace = app_module._detect_sheet_combined_traced(frame, det)
+    _c, _v, trace, _e = app_module._detect_sheet_combined_traced(frame, det)
     # Sem a flag, o rastro nem ganha o campo: forma idêntica à atual.
     assert "edge_in" not in trace
     assert det.called_with_mask is False
     monkeypatch.setenv("DRAW_FIRST_CONFIRM_GATE", "1")
-    _c, _v, trace = app_module._detect_sheet_combined_traced(frame, det)
+    _c, _v, trace, _e = app_module._detect_sheet_combined_traced(frame, det)
     assert det.called_with_mask is True
     assert trace["edge_in"] is not None and trace["edge_in"] >= 0.005
     assert trace["source"] == "neural"
