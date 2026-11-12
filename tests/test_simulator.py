@@ -277,6 +277,56 @@ def test_headless_uses_real_page_clean_worker(monkeypatch):
         synthetic.release()
 
 
+def test_real_hand_adapters_feed_visibility_and_activity(monkeypatch):
+    from draw import config, hand, hand_presence, page_clean
+
+    monkeypatch.setattr(config, "PAPER_W", 180)
+    monkeypatch.setattr(config, "PAPER_H", 255)
+    masks, samples = [], []
+
+    class Masker:
+        def __init__(self, path):
+            assert path == "test-hand.task"
+
+        def mask(self, image):
+            masks.append(image.shape)
+            # Mão cobre toda a página. Nem o falso modelo de tinta abaixo
+            # pode confirmar seus pixels como tinta enquanto estão ocultos.
+            return np.full(image.shape[:2], 255, np.uint8)
+
+    class Presence:
+        def sample(self, image, timestamp_ms):
+            samples.append(timestamp_ms)
+            return True, True
+
+    class TestModel:
+        threshold = 0.7
+
+        def __init__(self, path):
+            pass
+
+        def load(self):
+            pass
+
+        def ink_prob(self, image):
+            return np.ones(image.shape[:2], np.float32)
+
+    monkeypatch.setattr(hand, "hand_model_available", lambda path: True)
+    monkeypatch.setattr(hand, "HandMasker", Masker)
+    monkeypatch.setattr(hand_presence, "_make_hand_presence", lambda path: Presence())
+    monkeypatch.setattr(page_clean, "PageCleanInk", TestModel)
+    source = SyntheticCapture("Draw", fps=6, settle_seconds=2)
+    try:
+        result = run_pipeline(source, hand_model="test-hand.task")
+        assert masks and samples
+        assert all(shape[:2] == (255, 180) for shape in masks)
+        assert result["mask"] is not None and not result["mask"].any()
+        assert result["hand_visibility_configured"]
+        assert result["hand_presence_available_samples"] == len(samples)
+    finally:
+        source.release()
+
+
 def test_clis_run_as_scripts_outside_repo(tmp_path):
     root = Path(__file__).resolve().parents[1]
     output = tmp_path / "sim.mp4"

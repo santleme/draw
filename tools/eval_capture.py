@@ -8,6 +8,7 @@ real; mede qualidade funcional offline, não latência/throughput de webcam.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -122,6 +123,33 @@ class _SynchronousDetector:
         return []
 
 
+class _SynchronousHandPresence:
+    """Mesmo protocolo da worker de mão, com amostragem real síncrona."""
+
+    def __init__(self, presence):
+        self.presence = presence
+        self.result = None
+        self.sequence = 0
+        self.available_samples = 0
+        self.error = None
+
+    def submit(self, frame, timestamp_ms):
+        try:
+            present, moved = self.presence.sample(frame, timestamp_ms)
+        except Exception as error:
+            # Como a worker do app: o laço degrada para sinal indisponível.
+            self.error = error
+            return
+        self.sequence += 1
+        self.available_samples += int(present is not None)
+        self.result = (self.sequence, present, moved)
+
+    def poll(self, after_seq):
+        if self.result is not None and self.result[0] > after_seq:
+            return self.result
+        return None
+
+
 def run_pipeline(
     capture,
     *,
@@ -129,6 +157,7 @@ def run_pipeline(
     neural_model=None,
     page_clean_model=None,
     legacy_ink=False,
+    hand_model=None,
 ):
     """Consome VideoCapture ou SyntheticCapture via SheetInkLoop real.
 
@@ -136,7 +165,8 @@ def run_pipeline(
     fonte. Sem modelo de tinta, exige --legacy-ink explicitamente. Captura
     continua pertencendo ao chamador, que deve chamar release().
     """
-    from draw import config, ink
+    from draw import config, hand, ink
+    from draw.hand_presence import _make_hand_presence
     from draw.ink_layers import _PageCleanWorker
     from draw.loop import SheetInkLoop
     from draw.neural import NeuralSheetDetector
@@ -150,14 +180,31 @@ def run_pipeline(
     neural = NeuralSheetDetector(neural_model) if neural_model else None
     clock = _VideoClock()
     worker = None
+    hand_presence_worker = None
+    hand_masker = None
+    visibility_configured = False
     if not legacy_ink:
         page_clean = PageCleanInk(page_clean_model)
         page_clean.load()
-        worker = _PageCleanWorker(page_clean, clock=clock)
+        ecc_hand_masker = (
+            hand.HandMasker(hand_model)
+            if hand.hand_model_available(hand_model)
+            else None
+        )
+        visibility_configured = ecc_hand_masker is not None
+        worker = _PageCleanWorker(page_clean, ecc_hand_masker, clock=clock)
+        presence = _make_hand_presence(hand_model)
+        if presence is not None:
+            hand_presence_worker = _SynchronousHandPresence(presence)
+    elif hand_model is not None:
+        hand_masker = hand.HandMasker(hand_model)
+        visibility_configured = True
     detector = _SynchronousDetector(neural)
     loop = SheetInkLoop(
         detection_worker=detector,
         ink_worker=worker,
+        hand_masker=hand_masker,
+        hand_presence_worker=hand_presence_worker,
         ink_source=ink.extract_ink if legacy_ink else None,
         clock=clock,
         log=lambda *_args: None,
@@ -207,6 +254,15 @@ def run_pipeline(
         "sheet_detector": "neural+classic" if neural is not None else "classic",
         "canvas_shape": [config.PAPER_H, config.PAPER_W],
         "scheduler": "synchronous_video_clock",
+        "hand_visibility_configured": visibility_configured,
+        "hand_presence_samples": (
+            hand_presence_worker.sequence if hand_presence_worker is not None else 0
+        ),
+        "hand_presence_available_samples": (
+            hand_presence_worker.available_samples
+            if hand_presence_worker is not None
+            else 0
+        ),
     }
 
 
@@ -340,6 +396,9 @@ def main(argv=None):
     parser.add_argument("--stroke-recall", type=float, default=0.5)
     parser.add_argument("--neural-model", default=os.environ.get("DRAW_NEURAL_MODEL"))
     parser.add_argument("--page-clean-model")
+    parser.add_argument(
+        "--hand-model", help="modelo .task de mão (opcional, como no app)"
+    )
     parser.add_argument("--legacy-ink", action="store_true")
     args = parser.parse_args(argv)
     try:
@@ -358,13 +417,17 @@ def main(argv=None):
                 )
                 if neural_model is None and default_model.is_file():
                     neural_model = str(default_model)
-                pipeline = run_pipeline(
-                    capture,
-                    fps=args.fps,
-                    neural_model=neural_model,
-                    page_clean_model=args.page_clean_model,
-                    legacy_ink=args.legacy_ink,
-                )
+                # Adaptadores opcionais do app podem emitir avisos. Mantém
+                # stdout como JSON, inclusive sem MediaPipe instalado.
+                with contextlib.redirect_stdout(sys.stderr):
+                    pipeline = run_pipeline(
+                        capture,
+                        fps=args.fps,
+                        neural_model=neural_model,
+                        page_clean_model=args.page_clean_model,
+                        legacy_ink=args.legacy_ink,
+                        hand_model=args.hand_model,
+                    )
             finally:
                 capture.release()
             prediction = pipeline.pop("mask")

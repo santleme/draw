@@ -83,6 +83,16 @@ confirmação permanecem ativas. Isso avalia a qualidade funcional offline,
 não a concorrência, latência ou vazão do app com webcam. `--fps` substitui
 o FPS declarado pelo arquivo quando necessário.
 
+No caminho page-clean, os adaptadores reais de mão do app também são
+reutilizados: `HandMasker` na worker (visibilidade) e `_make_hand_presence`
+no laço (presença/movimento e cadência), com amostragem síncrona.
+`--hand-model` ou `DRAW_HAND_MODEL` indicam o arquivo opcional `.task`.
+Sem modelo ou MediaPipe, a mão continua sendo sinal indisponível,
+como no app; o relatório declara a configuração de visibilidade e
+quantas amostras de presença estavam disponíveis. A máscara sintética
+de GT nunca substitui o detector de mão. No legado, uma máscara de mão
+só é solicitada quando `--hand-model` é explícito.
+
 O relatório JSON contém IoU, precisão, recall, TP/FP/FN, alinhamento,
 dimensões, número de frames/detecções/passadas e o resultado por traço:
 
