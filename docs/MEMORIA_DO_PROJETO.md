@@ -366,6 +366,13 @@ Holdout sem referência exige máscara humana feita do zero; a máscara vazia
 é apenas suporte para o editor e `--accept-draft` é recusado. Nenhum
 pseudo-rótulo passa a ser independente por renomeação ou por aceite humano.
 
+Integração real conferida em 2026-11-12: oito fotos de
+`guzzbr/school-notebooks-ru` existentes no WSL passaram pelo detector/warp e
+pelo incumbente, gerando oito propostas em um único lote de treino, nenhuma
+aprovação/rejeição automática. O selo de treino foi conservador, não se
+alega novidade dessa fonte frente aos treinos anteriores. A fila está fora
+do checkout no laboratório local; a revisão humana continua pendente.
+
 Exemplo para imagens já retificadas (para fotos cruas, retirar
 `--images-are-pages` e indicar `--sheet-model` se necessário):
 

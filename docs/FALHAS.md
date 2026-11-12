@@ -45,6 +45,15 @@ rótulo humano independente e recusa aceite automático. O catálogo citado
 descreve um pool privado de capturas, não vários datasets públicos; este
 adaptador permite os demais sem alegar que já foram inventariados/aprovados.
 
+Prova de integração no WSL, depois da criação da PR: oito fotos do
+School Notebooks RU já disponível em arquivo local foram retificadas pelo
+detector de produção e traduzidas pelo incumbente instalado (verificação
+estrita pelo manifesto local). Resultado: oito propostas, um lote de
+treino, zero rejeições `no_page`, zero revisões. Foi reservado só treino,
+conservadoramente, pois a fonte já participa da linhagem de dados do projeto.
+A fila privada ficou no laboratório local, fora do checkout; nenhum dado
+foi enviado à VM nem publicado. Não é aprovação semântica das propostas.
+
 **Validação de código (VM, 2026-11-12; não é teste ao vivo):**
 
 | Execução completa | Passou | Falhou | Skip |
@@ -59,6 +68,8 @@ fundos privados de laboratório ausentes na VM; ela também reprova o CI da
 base. A outra falha da execução-base é a asserção de identidade do teste
 threaded `test_new_sheet_does_not_inherit_the_previous_canvas`; passou na
 execução desta branch, sem alteração desse teste. Não se alega tê-la corrigido.
+Os mesmos 110 casos também passaram no WSL em worktree isolada; o pytest
+foi instalado em diretório próprio de teste, sem alterar o venv do aplicativo.
 
 `ruff check .`, compilação e formato dos fontes tocados passam. O formato
 global já falha em 15 arquivos na base e ainda falha em 13 intocados aqui;
