@@ -219,3 +219,23 @@ def test_stream_counts_missing_tail_even_after_the_cap(tmp_path):
     manifest = json.loads(recorder.finish().read_text())
     assert manifest["ink_passes"]["records"] == 1
     assert manifest["ink_passes"]["dropped"] == 9
+
+
+def test_local_erasure_does_not_reopen_e3_initial_confirmation(monkeypatch):
+    monkeypatch.setenv("DRAW_INK_REMOVAL", "1")
+    monkeypatch.setenv("DRAW_INK_VOTE_E3", "1")
+    acc = layers._LayeredInkAccumulator()
+    prob = ink()
+    confirmed(acc, prob)
+    noisy = prob.copy()
+    noisy[85:88, 85:88] = 0.95  # 9 px: rejected by E3's new-component rule.
+    visible = np.ones(prob.shape, bool)
+    for _ in range(10):
+        acc.add(noisy, visible)
+    assert not acc._confirmed[85:88, 85:88].any()
+    erased = noisy.copy()
+    erased[65:75, 65:85] = 0
+    for _ in range(16):
+        acc.add(erased, visible)
+    assert not acc._confirmed[65:75, 65:85].any()
+    assert not acc._confirmed[85:88, 85:88].any()

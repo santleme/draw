@@ -1295,7 +1295,20 @@ class _LayeredInkAccumulator:
                     item[removed] = 0
                 self._score_buf = self._hits_buf = self._seen_buf = None
                 if self._e3_active:
-                    self._reset_e3_state()
+                    for item in self._e3_phase1_maps:
+                        item[removed] = 0
+                    for mask in (
+                        self._e3_old_union,
+                        self._e3_region_big,
+                        self._e3_region_small,
+                    ):
+                        if mask is not None:
+                            mask[removed] = False
+                    for side in (self._e3_side_big, self._e3_side_small):
+                        if side._confirmed is not None:
+                            side._confirmed[removed] = False
+                        for item in side._maps:
+                            item[removed] = 0
                 seen_as_ink[removed] = False
                 score[removed] = 0
                 hits[removed] = 0
