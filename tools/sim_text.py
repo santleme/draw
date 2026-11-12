@@ -1,4 +1,4 @@
-"""Escrita vetorial para o simulador; não altera a dieta de treino.
+"""Escrita vetorial por texto; complementa o simulador procedural.
 
 Cada spec tem o contrato de gen_synthetic._plan_strokes:
 (kind, cor BGR, espessura, geometria resolvida). Uma spec é um movimento

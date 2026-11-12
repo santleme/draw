@@ -142,9 +142,7 @@ camera = SyntheticCapture("Olá!", seed=42, realtime=True)
 camera.save_ground_truth("sim.gt.npz")
 try:
     result = run_pipeline(camera, legacy_ink=True)
-    report = evaluate_canvas(
-        result["mask"], "sim.gt.npz", corners=result["corners"]
-    )
+    report = evaluate_canvas(result["mask"], "sim.gt.npz", corners=result["corners"])
 finally:
     camera.release()
 ```
@@ -164,3 +162,7 @@ O simulador reutiliza `_paper_base`, `_background`, `_sample_normal_quad`,
 `compose_scene_sequence` materializa uma lista inteira e escolhe suas
 próprias specs aleatórias; por isso a fonte lazy compõe com as mesmas
 primitivas, em vez de chamar essa função ou mudar sua assinatura.
+
+O planejador por texto fica em `tools/sim_text.py`. Ele complementa o
+simulador procedural de corpus em `tools/sim_writer.py`, sem substituir
+seus comandos `generate`/`audit` nem seus cenários de laboratório.

@@ -21,7 +21,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tools import gen_synthetic as gs
-from tools.sim_writer import plan_text_strokes
+from tools.sim_text import plan_text_strokes
 
 
 class SyntheticCapture:
@@ -63,6 +63,16 @@ class SyntheticCapture:
         self._paper, self.pw, self.ph = gs._paper_base(self._rng, "white", size_idx=0)
         self.specs = plan_text_strokes(text, self._rng, self.pw, self.ph, height=height)
         self.quad = gs._sample_normal_quad(self._rng, self.pw, self.ph)
+        # O gerador de treino admite folha cortada. A câmera inicial do
+        # simulador mantém a página inteira visível para permitir aquisição
+        # sem entregar sua geometria ao detector. Pequena perturbação dos
+        # cantos cria perspectiva, além da rotação do gerador original.
+        self.quad += self._rng.uniform(-4, 4, (4, 2)).astype(np.float32)
+        center = self.quad.mean(axis=0)
+        scale = min(1.0, (gs.SIZE - 48) / float(np.ptp(self.quad, axis=0).max()))
+        self.quad = (self.quad - center) * scale + center
+        self.quad += np.maximum(24 - self.quad.min(axis=0), 0)
+        self.quad -= np.maximum(self.quad.max(axis=0) - (gs.SIZE - 24), 0)
         self._ink = np.zeros((self.ph, self.pw), np.uint8)
         page_corners = np.float32(
             [[0, 0], [self.pw, 0], [self.pw, self.ph], [0, self.ph]]

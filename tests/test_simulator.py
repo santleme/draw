@@ -18,7 +18,7 @@ from tools.eval_capture import (
     run_pipeline,
 )
 from tools.sim_source import SyntheticCapture, export_video
-from tools.sim_writer import plan_text_strokes
+from tools.sim_text import plan_text_strokes
 
 
 def raster(specs, shape=(510, 360)):
