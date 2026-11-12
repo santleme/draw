@@ -414,8 +414,9 @@ com padrões preservados. Após revisão, o isolamento mantém `session_id`
 original e sela antes do teacher, mas nunca usa chave de lote como caminho.
 A remoção E3 mantém suporte geométrico para redesenho e limpa só a memória
 dos pixels apagados, sem reabrir a fase global. Os 125 testes focados
-passaram na VM e no WSL; a suíte completa teve 1.080 aprovações, uma falha
-herdada de fundos privados ausentes e quatro skips.
+passaram na VM e no WSL; antes de integrar o merge 66, a suíte completa teve
+1.080 aprovações. No follow-up sobre main após os merges 66/67, houve 1.104
+aprovações, uma falha herdada de fundos privados ausentes e quatro skips.
 
 A tentativa nativa automatizada em `01efd20` não validou mover/apagar:
 com os modelos oficiais verificados, o vídeo sintético teve folha detectada,
@@ -428,8 +429,8 @@ Os traces apontam encerramento da captura; a causa permanece indeterminada.
 Esse crash foi reproduzido na base. A UI não foi repetida nas correções
 posteriores de isolamento/E3; não alegar aprovação delas no papel real.
 
-As flags novas continuam desligadas por padrão,
-default 0; não promovem modelo nem substituem validação ao vivo. A primeira
+As flags novas continuam desligadas por padrão;
+não promovem modelo nem substituem validação ao vivo. A primeira
 evita votar a cópia reprojetada quando o conteúdo favorece identidade e
 reancora só após assentamento. A segunda retira tinta confirmada com
 ausência forte, visível e persistente e testemunho positivo da mesma página;

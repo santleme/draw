@@ -59,7 +59,8 @@ foi enviado à VM nem publicado. Não é aprovação semântica das propostas.
 | Execução completa | Passou | Falhou | Skip |
 |---|---:|---:|---:|
 | Base 3c00e29, worktree separado | 1.031 | 2 | 4 |
-| Esta implementação, após revisão | 1.080 | 1 | 4 |
+| Implementação após revisão, antes de integrar a PR 66 | 1.080 | 1 | 4 |
+| Follow-up sobre main após merges 66/67 | 1.104 | 1 | 4 |
 
 Foram adicionados 48 casos; o subconjunto de self-learning, registro,
 arbitragem, remoção, replay e documentação passou 125/125. A falha comum
@@ -70,6 +71,10 @@ threaded `test_new_sheet_does_not_inherit_the_previous_canvas`; passou na
 execução desta branch, sem alteração desse teste. Não se alega tê-la corrigido.
 Os mesmos 125 casos também passaram no WSL em worktree isolada; o pytest
 foi instalado em diretório próprio de teste, sem alterar o venv do aplicativo.
+Após o merge da PR 67 em `01efd20`, as duas correções posteriores foram
+separadas em follow-up sobre `d69cee6`: 113 casos focados passam nessa base
+e 125 no follow-up. A falta de fundos privados também foi reproduzida nessa
+base atual; os outros casos adicionados pelo merge 66 não são desta frente.
 
 `ruff check .`, compilação e formato dos fontes tocados passam. O formato
 global já falha em 15 arquivos na base e ainda falha em 13 intocados aqui;
