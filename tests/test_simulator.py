@@ -11,6 +11,7 @@ import pytest
 
 from tools import gen_synthetic as gs
 from tools.eval_capture import (
+    _sheet_model_path,
     compare_masks,
     evaluate_canvas,
     load_canvas,
@@ -217,6 +218,21 @@ def test_load_png_ignores_provisional_gray_and_npy_is_positive_mask(tmp_path):
     np.save(tmp_path / "mask.npy", np.array([[0, 1, 255]], np.uint8))
     assert load_canvas(tmp_path / "canvas.png").tolist() == [[False, True, False]]
     assert load_canvas(tmp_path / "mask.npy").tolist() == [[False, True, True]]
+
+
+def test_default_sheet_model_precedence_matches_app(monkeypatch, tmp_path):
+    from tools import eval_capture
+
+    installed = tmp_path / "installed.onnx"
+    monkeypatch.setattr(eval_capture, "_DEFAULT_SHEET_MODEL", installed)
+    monkeypatch.setenv("DRAW_NEURAL_MODEL", "environment.onnx")
+    assert _sheet_model_path() == "environment.onnx"
+    installed.touch()
+    assert _sheet_model_path() == str(installed)
+    assert _sheet_model_path("explicit.onnx") == "explicit.onnx"
+    installed.unlink()
+    monkeypatch.delenv("DRAW_NEURAL_MODEL")
+    assert _sheet_model_path() is None
 
 
 def test_real_loop_accepts_lazy_capture_without_gt_access(monkeypatch):

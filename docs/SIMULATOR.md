@@ -68,6 +68,8 @@ O runner usa `draw.loop.SheetInkLoop`, o detector combinado de `draw.app`
 seu acumulador real. Modelos podem ser indicados por `--neural-model` e
 `--page-clean-model`; os caminhos padrão e as variáveis de ambiente são
 os mesmos do app. Sem ONNX de detecção, usa o detector clássico.
+Para a folha, a precedência é `--neural-model`, modelo instalado em
+`models/draw_seg_v3_dyn.onnx` e, por último, `DRAW_NEURAL_MODEL`.
 Sem ONNX de tinta, falha explicitamente; para exercitar o legado:
 
 ```sh

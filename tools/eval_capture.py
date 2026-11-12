@@ -21,6 +21,19 @@ import numpy as np
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+_DEFAULT_SHEET_MODEL = (
+    Path(__file__).resolve().parents[1] / "models/draw_seg_v3_dyn.onnx"
+)
+
+
+def _sheet_model_path(explicit=None):
+    # Mesma precedência de draw.app.run: argumento > instalado > ambiente.
+    if explicit is not None:
+        return str(explicit)
+    if _DEFAULT_SHEET_MODEL.exists():
+        return str(_DEFAULT_SHEET_MODEL)
+    return os.environ.get("DRAW_NEURAL_MODEL")
+
 
 def pixel_metrics(prediction, truth):
     """Comparação exata, sem dilatação, tolerância ou alinhamento por conteúdo.
@@ -177,6 +190,7 @@ def run_pipeline(
     fps = float(fps if fps is not None else capture.get(cv2.CAP_PROP_FPS))
     if not math.isfinite(fps) or fps <= 0:
         raise ValueError("vídeo sem FPS válido; informe --fps")
+    neural_model = _sheet_model_path(neural_model)
     neural = NeuralSheetDetector(neural_model) if neural_model else None
     clock = _VideoClock()
     worker = None
@@ -394,7 +408,7 @@ def main(argv=None):
     parser.add_argument("--corners", type=Path, help="âncora real (4,2), .npy")
     parser.add_argument("--fps", type=float)
     parser.add_argument("--stroke-recall", type=float, default=0.5)
-    parser.add_argument("--neural-model", default=os.environ.get("DRAW_NEURAL_MODEL"))
+    parser.add_argument("--neural-model")
     parser.add_argument("--page-clean-model")
     parser.add_argument(
         "--hand-model", help="modelo .task de mão (opcional, como no app)"
@@ -411,19 +425,13 @@ def main(argv=None):
                 raise ValueError("--video usa a âncora detectada, em espaço page")
             capture = cv2.VideoCapture(str(args.video))
             try:
-                neural_model = args.neural_model
-                default_model = (
-                    Path(__file__).resolve().parents[1] / "models/draw_seg_v3_dyn.onnx"
-                )
-                if neural_model is None and default_model.is_file():
-                    neural_model = str(default_model)
                 # Adaptadores opcionais do app podem emitir avisos. Mantém
                 # stdout como JSON, inclusive sem MediaPipe instalado.
                 with contextlib.redirect_stdout(sys.stderr):
                     pipeline = run_pipeline(
                         capture,
                         fps=args.fps,
-                        neural_model=neural_model,
+                        neural_model=args.neural_model,
                         page_clean_model=args.page_clean_model,
                         legacy_ink=args.legacy_ink,
                         hand_model=args.hand_model,
