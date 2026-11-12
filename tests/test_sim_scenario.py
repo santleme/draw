@@ -344,3 +344,127 @@ def test_lift_starts_from_post_move_pose():
         moved_quads[capture._position - 1] = capture._quad_now.copy()
     end_move = moved_quads[move_end["end"] - 1]
     np.testing.assert_allclose(lift_out["quad_from"], end_move, atol=1.0)
+
+
+def test_rest_hand_and_sweep_timeline():
+    """Palma apoiada após cada hold + sweep antes da geometria. As
+    fases são neutras de GT: a tinta não muda com a mão por cima."""
+    capture = scenario(
+        move=(40, 20, 0),
+        rest_hand_seconds=0.5,
+        sweep_seconds=0.6,
+    )
+    assert kinds(capture) == [
+        "warmup",
+        "write",
+        "hold",
+        "rest_hand",
+        "erase",
+        "hold",
+        "rest_hand",
+        "write",
+        "hold",
+        "rest_hand",
+        "sweep",
+        "move",
+        "settle",
+    ]
+    ink_at = {}
+    hand_at = {}
+    while True:
+        ok, _ = capture.read()
+        if not ok:
+            break
+        idx = capture._position - 1
+        ink_at[idx] = capture._ink.copy()
+        import tools.gen_synthetic as gs
+
+        hand_at[idx] = (capture.last_scene["mask"] == gs.HAND).sum()
+    rest = next(p for p in capture.phases if p["kind"] == "rest_hand")
+    sweep = next(p for p in capture.phases if p["kind"] == "sweep")
+    # a palma pousa sobre o canvas e o sweep a mantém em cena
+    assert hand_at[rest["end"] - 1] > 0
+    assert hand_at[sweep["start"] + 1] > 0
+    assert hand_at[sweep["end"] - 1] > 0
+    # mão não muda a tinta: GT antes/depois do rest é idêntico
+    np.testing.assert_array_equal(ink_at[rest["start"] - 1], ink_at[rest["end"] - 1])
+
+
+def test_rest_hand_without_erase_still_rests():
+    """Sem borracha não há hold natural: rest_hand_seconds cria o
+    repouso após a escrita — pousar depois de escrever é o gesto mais
+    comum da mesa."""
+    capture = SyntheticCapture(
+        "ab",
+        fps=10,
+        stroke_seconds=0.2,
+        warmup_seconds=0.2,
+        settle_seconds=0.3,
+        rest_hand_seconds=0.4,
+    )
+    assert kinds(capture) == ["warmup", "write", "hold", "rest_hand", "settle"]
+
+
+def test_grab_hand_rides_the_sheet():
+    """A mão que segura a folha acompanha o quad no move/lift/return
+    e some de cena com ela no absent."""
+    capture = scenario(
+        erase_stroke=None,
+        redraw_text=None,
+        move=None,
+        lift=(400, 300),
+        return_pose=(0, 0, 10),
+        absent_seconds=0.4,
+        grab_hand=True,
+    )
+    import tools.gen_synthetic as gs
+
+    hand_at = {}
+    while True:
+        ok, _ = capture.read()
+        if not ok:
+            break
+        hand_at[capture._position - 1] = (capture.last_scene["mask"] == gs.HAND).sum()
+    lift_out = next(p for p in capture.phases if p["kind"] == "lift_out")
+    absent = next(p for p in capture.phases if p["kind"] == "absent")
+    ret = next(p for p in capture.phases if p["kind"] == "return")
+    # pegada na folha no início da saída e no fim do retorno
+    assert hand_at[lift_out["start"]] > 0
+    assert hand_at[ret["end"] - 1] > 0
+    # ausência: nem folha nem mão
+    assert hand_at[absent["end"] - 1] == 0
+
+
+def test_hand_mass_validations():
+    with pytest.raises(ValueError):
+        SyntheticCapture("ab", rest_hand_seconds=-1)
+    with pytest.raises(ValueError):
+        SyntheticCapture("ab", sweep_seconds=-0.5)
+    with pytest.raises(ValueError):
+        SyntheticCapture("ab", hand_scale=0)
+    with pytest.raises(ValueError):
+        SyntheticCapture("ab", hand_scale=99)
+
+
+def test_hand_mass_ground_truth_neutral(tmp_path):
+    """As fases de mão exportam kind/start/end e o GT não muda —
+    palma e sweep não são tinta."""
+    capture = scenario(
+        erase_stroke=None,
+        redraw_text=None,
+        move=None,
+        lift=None,
+        rest_hand_seconds=0.3,
+        sweep_seconds=0.4,
+    )
+    drain(capture)
+    gt = tmp_path / "hand.gt.npz"
+    capture.save_ground_truth(gt)
+    with np.load(gt, allow_pickle=False) as bundle:
+        events = json.loads(str(bundle["events"]))
+        assert [e["kind"] for e in events] == kinds(capture)
+        assert "rest_hand" in [e["kind"] for e in events]
+        assert "sweep" in [e["kind"] for e in events]
+        np.testing.assert_array_equal(
+            bundle["page_ink_final"] > 0, bundle["page_ink_full"] > 0
+        )
