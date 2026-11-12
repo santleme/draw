@@ -669,10 +669,16 @@ def _smooth_background(
 
 
 def _sample_quad(
-    rng: np.random.Generator, w: int, h: int, rotation_max: float
+    rng: np.random.Generator,
+    w: int,
+    h: int,
+    rotation_max: float,
+    rotation_min: float = 0.0,
 ) -> np.ndarray:
     """Quad da folha: centro ±40 px, escala 0,85–1,05, rotação
-    uniforme em ±rotation_max graus. Consumo de RNG idêntico ao
+    uniforme em ±rotation_max graus — ou na faixa
+    rotation_min..rotation_max quando rotation_min > 0 (um único
+    sorteio dá sinal e magnitude). Consumo de RNG idêntico ao
     ramo "normal" histórico de ``_warp_to_scene`` (cx, cy, scale,
     ang — nesta ordem)."""
     cx, cy = (
@@ -681,7 +687,12 @@ def _sample_quad(
     )
     scale = float(rng.uniform(0.85, 1.05))
     pw, ph = int(w * scale * SIZE / 560), int(h * scale * SIZE / 560)
-    ang = math.radians(float(rng.uniform(-rotation_max, rotation_max)))
+    if rotation_min > 0:
+        u = float(rng.uniform(-1.0, 1.0))
+        deg = math.copysign(rotation_min + abs(u) * (rotation_max - rotation_min), u)
+    else:
+        deg = float(rng.uniform(-rotation_max, rotation_max))
+    ang = math.radians(deg)
     ca, sa = math.cos(ang), math.sin(ang)
     corners = np.array(
         [
@@ -702,16 +713,31 @@ def _sample_normal_quad(rng: np.random.Generator, w: int, h: int) -> np.ndarray:
 
 
 def _sample_wide_rotation_quad(
-    rng: np.random.Generator, w: int, h: int, rotation_max: float
+    rng: np.random.Generator,
+    w: int,
+    h: int,
+    rotation_max: float,
+    sheet_scale: str = "legacy",
 ) -> np.ndarray:
-    """Quad com rotação além do teto histórico: o detector medido
+    """Quad com rotação ALÉM do teto histórico: o detector medido
     cruza a cegueira em ~15° — borda exata do uniform(-18, 18) do
-    placement normal (bancada lift & return, 2026-11-12)."""
-    return _sample_quad(rng, w, h, rotation_max)
+    placement normal (bancada lift & return, 2026-11-12). A faixa
+    é (18, rotation_max]: um uniforme em ±rotation_max devolveria
+    ~45% das cenas dentro do envelope legado com o default 40.
+    ``sheet_scale`` decide o amostrador de tamanho da base."""
+    rot_min = 18.0 if rotation_max > 18.0 else 0.0
+    if sheet_scale == "loguniform":
+        return _sample_loguniform_quad(rng, w, h, rot_min, rotation_max)
+    return _sample_quad(rng, w, h, rotation_max, rot_min)
 
 
 def _sample_clipped_quad(
-    rng: np.random.Generator, w: int, h: int
+    rng: np.random.Generator,
+    w: int,
+    h: int,
+    sheet_scale: str = "legacy",
+    rotation_min: float = 0.0,
+    rotation_max: float = 18.0,
 ) -> tuple[np.ndarray, int, float]:
     """Quad da folha deslocado até ``frac`` da sua caixa sair por uma
     borda sorteada — o regime entre "inteira" e ``sheet_out`` (lasca):
@@ -719,9 +745,14 @@ def _sample_clipped_quad(
     em massa (2026-11-12): o detector cega com só ~7-9% da folha fora
     nas laterais/topo, e ~17% embaixo — folha clipada nunca existiu
     no placement normal (centro ±40 px mantém a folha inteira no
-    frame). Devolve (quad, borda, fração) — borda 0=esq 1=dir 2=topo
-    3=baixo — para registro no ``info``."""
-    quad = _sample_normal_quad(rng, w, h)
+    frame). ``sheet_scale`` decide o amostrador de tamanho da base e
+    a faixa de rotação compõe com a dieta (clipe + rotação ampla são
+    sorteios independentes). Devolve (quad, borda, fração) — borda
+    0=esq 1=dir 2=topo 3=baixo — para registro no ``info``."""
+    if sheet_scale == "loguniform":
+        quad = _sample_loguniform_quad(rng, w, h, rotation_min, rotation_max)
+    else:
+        quad = _sample_quad(rng, w, h, rotation_max, rotation_min)
     edge = int(rng.integers(4))
     frac = float(rng.uniform(0.05, 0.40))
     lo, hi = quad.min(axis=0), quad.max(axis=0)
@@ -737,14 +768,22 @@ def _sample_clipped_quad(
     return quad + off, edge, frac
 
 
-def _sample_loguniform_quad(rng: np.random.Generator, w: int, h: int) -> np.ndarray:
+def _sample_loguniform_quad(
+    rng: np.random.Generator,
+    w: int,
+    h: int,
+    rotation_min: float = 0.0,
+    rotation_max: float = 18.0,
+) -> np.ndarray:
     """Quad da folha com ÁREA uniforme em escala log (opt-in).
 
     Amostra a fração de área em [5%, 70%] uniforme no log — metade
     das cenas cai abaixo de ~19% de área. É a correção da escala
     medida em 2026-11-05: o placement histórico concentra 45–70% e a
-    folha do bg05 (13,6% do frame) era OOD de escala. Centro, rotação
-    e aspecto seguem as faixas do placement normal.
+    folha do bg05 (13,6% do frame) era OOD de escala. Centro e
+    aspecto seguem as faixas do placement normal; a rotação aceita
+    a faixa da dieta (rotation_min > 0 amostra fora do envelope
+    histórico, um sorteio para sinal e magnitude).
     """
     frac = float(np.exp(rng.uniform(math.log(0.05), math.log(0.70))))
     area = frac * SIZE * SIZE
@@ -755,7 +794,13 @@ def _sample_loguniform_quad(rng: np.random.Generator, w: int, h: int) -> np.ndar
         SIZE // 2 + int(rng.integers(-40, 41)),
         SIZE // 2 + int(rng.integers(-40, 41)),
     )
-    ang = math.radians(float(rng.uniform(-18, 18)))
+    if rotation_min > 0:
+        u = float(rng.uniform(-1.0, 1.0))
+        ang = math.radians(
+            math.copysign(rotation_min + abs(u) * (rotation_max - rotation_min), u)
+        )
+    else:
+        ang = math.radians(float(rng.uniform(-rotation_max, rotation_max)))
     ca, sa = math.cos(ang), math.sin(ang)
     corners = np.array(
         [
@@ -831,11 +876,14 @@ def _warp_to_scene(
     ink: np.ndarray,
     placement: str,
     rotation_max: float = 40.0,
+    sheet_scale: str = "legacy",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Warp do papel para a cena, com o quad sorteado pelo placement.
 
     Devolve (rgb_warp, paper_mask, ink_warp, quad, paper_cov, ink_cov).
-    ``rotation_max`` só alcança o placement ``wide_rotation``.
+    ``rotation_max`` só alcança os placements ``wide_rotation`` e
+    ``clipped_wide``; ``sheet_scale`` decide o amostrador de tamanho
+    da base nos placements de dieta.
     """
     h, w = paper.shape[:2]
     if placement == "tiny_sheet":
@@ -856,9 +904,11 @@ def _warp_to_scene(
             [[-320, -260], [-40, -280], [-20, 120], [-340, 100]], dtype=np.float32
         )
     elif placement == "clipped":
-        dst, _, _ = _sample_clipped_quad(rng, w, h)
+        dst, _, _ = _sample_clipped_quad(rng, w, h, sheet_scale)
+    elif placement == "clipped_wide":
+        dst, _, _ = _sample_clipped_quad(rng, w, h, sheet_scale, 18.0, rotation_max)
     elif placement == "wide_rotation":
-        dst = _sample_wide_rotation_quad(rng, w, h, rotation_max)
+        dst = _sample_wide_rotation_quad(rng, w, h, rotation_max, sheet_scale)
     elif placement == "loguniform":
         dst = _sample_loguniform_quad(rng, w, h)
     else:
@@ -1189,6 +1239,7 @@ def compose_scene(
     sheet_scale: str = "legacy",
     augment_noise_sigma: float | None = None,
     rotation_max: float = 40.0,
+    clip_wide_rotation: bool = False,
 ) -> dict:
     """Compõe UMA cena. Devolve rgb, mask, ink_full e info.
 
@@ -1274,12 +1325,20 @@ def compose_scene(
                 "sheet_out"
                 if scene_type == "sheet_out"
                 else (
-                    "clipped"
-                    if scene_type == "clipped_sheet"
+                    "clipped_wide"
+                    if scene_type == "clipped_sheet" and clip_wide_rotation
                     else (
-                        "wide_rotation"
-                        if scene_type == "rotated_sheet"
-                        else ("loguniform" if sheet_scale == "loguniform" else "normal")
+                        "clipped"
+                        if scene_type == "clipped_sheet"
+                        else (
+                            "wide_rotation"
+                            if scene_type == "rotated_sheet"
+                            else (
+                                "loguniform"
+                                if sheet_scale == "loguniform"
+                                else "normal"
+                            )
+                        )
                     )
                 )
             )
@@ -1293,7 +1352,7 @@ def compose_scene(
         else:
             paper, ink, _, _ = _paper_canvas(rng, paper_style)
             rgb_w, paper_mask, ink_w, paper_quad, paper_cov, ink_cov = _warp_to_scene(
-                rng, paper, ink, placement, rotation_max
+                rng, paper, ink, placement, rotation_max, sheet_scale
             )
         on_paper = paper_mask > 0
         rgb[on_paper] = rgb_w[on_paper]
@@ -1724,18 +1783,21 @@ def generate_dataset(
                 and float(rng.random()) < notebook_fraction
             ):
                 scene_type = "notebook_spread"
-            if (
-                scene_type == "normal"
-                and clip_fraction > 0
-                and float(rng.random()) < clip_fraction
-            ):
-                scene_type = "clipped_sheet"
-            elif (
-                scene_type == "normal"
-                and rotation_fraction > 0
-                and float(rng.random()) < rotation_fraction
-            ):
-                scene_type = "rotated_sheet"
+            # Clipe e rotação são sorteios INDEPENDENTES: com os dois
+            # ligados, a cena clipada pode vir já na faixa ampla —
+            # o elif fazia a fração de rotação encolher atrás do
+            # clipe (Devin Review, 2026-11-12).
+            clip_wide = False
+            if scene_type == "normal":
+                clip_hit = clip_fraction > 0 and (float(rng.random()) < clip_fraction)
+                rot_hit = rotation_fraction > 0 and (
+                    float(rng.random()) < rotation_fraction
+                )
+                if clip_hit:
+                    scene_type = "clipped_sheet"
+                    clip_wide = rot_hit
+                elif rot_hit:
+                    scene_type = "rotated_sheet"
             second = None
             if two_hands and hand_id and len(hand_pool) > 1:
                 second_id = [h for h in hand_pool if h != hand_id][
@@ -1757,6 +1819,7 @@ def generate_dataset(
                 sheet_scale=sheet_scale,
                 augment_noise_sigma=augment_noise,
                 rotation_max=rotation_max,
+                clip_wide_rotation=clip_wide,
             )
             scene_id = f"scene_{split}_{i:04d}"
             cv2.imwrite(str(split_dir / f"{scene_id}.png"), scene["rgb"])

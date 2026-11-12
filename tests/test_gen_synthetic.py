@@ -311,22 +311,6 @@ def test_clipped_sheet_placement_exits_frame():
     assert len(edges_seen) == 4
 
 
-def test_rotated_sheet_beyond_legacy_ceiling():
-    """rotated_sheet: amostra além do ±18° histórico — cobre o gap
-    >~15° medido no detector (bancada lift & return)."""
-    from tools.gen_synthetic import _sample_wide_rotation_quad
-
-    rng = np.random.default_rng(1)
-    max_seen = 0.0
-    for _ in range(80):
-        quad = _sample_wide_rotation_quad(rng, 500, 700, 40.0)
-        top = quad[1] - quad[0]
-        deg = abs(np.degrees(np.arctan2(top[1], top[0])))
-        max_seen = max(max_seen, deg)
-    # em 80 amostras de U(-40,40), alguma passa do teto histórico
-    assert max_seen > 18
-
-
 def test_clipped_and_rotated_scene_types():
     """Os dois scene_types novos compõem cena normalmente: classes
     válidas, folha presente e sheet_clip registrado no info."""
@@ -371,3 +355,75 @@ def test_generate_dataset_fractions_validation(tmp_path):
         gs.generate_dataset(tmp_path / "b", rotation_fraction=-0.1)
     with pytest.raises(ValueError):
         gs.generate_dataset(tmp_path / "c", rotation_max=120)
+
+
+def test_rotated_sheet_beyond_legacy_ceiling():
+    """rotated_sheet: amostra ALÉM do ±18° histórico — toda a faixa
+    é (18, rotation_max] (bancada lift & return)."""
+    from tools.gen_synthetic import _sample_wide_rotation_quad
+
+    rng = np.random.default_rng(1)
+    for _ in range(80):
+        quad = _sample_wide_rotation_quad(rng, 500, 700, 40.0)
+        top = quad[1] - quad[0]
+        deg = abs(np.degrees(np.arctan2(top[1], top[0])))
+        assert deg > 18, f"{deg:.1f}° dentro do envelope legado"
+        assert deg <= 40.0 + 1e-6
+
+
+def test_rotated_sheet_rotation_max_below_ceiling():
+    """rotation_max <= 18 não tem faixa "além" — cai no uniforme
+    cheio (documentado; validado em (0, 90])."""
+    from tools.gen_synthetic import _sample_wide_rotation_quad
+
+    rng = np.random.default_rng(2)
+    for _ in range(40):
+        quad = _sample_wide_rotation_quad(rng, 500, 700, 15.0)
+        top = quad[1] - quad[0]
+        deg = abs(np.degrees(np.arctan2(top[1], top[0])))
+        assert deg <= 15.0 + 1e-6
+
+
+def test_clipped_quad_composes_scale_and_wide_rotation():
+    """Clipe + rotação ampla são ortogonais: o quad clipado sai pela
+    borda sorteada E vem na faixa além de ±18°, e o amostrador de
+    escala decide o tamanho (loguniform produz folhas pequenas)."""
+    from tools.gen_synthetic import _sample_clipped_quad
+
+    # rotação ampla na base do clipe
+    rng = np.random.default_rng(3)
+    for _ in range(60):
+        quad, edge, frac = _sample_clipped_quad(rng, 500, 700, "legacy", 18.0, 40.0)
+        # o ângulo original pode ser medido na aresta "topo" do quad —
+        # após o deslocamento o ângulo se preserva (translação pura)
+        top = quad[1] - quad[0]
+        deg = abs(np.degrees(np.arctan2(top[1], top[0])))
+        assert deg > 18 or deg > 162, f"{deg:.1f}° fora da faixa ampla"
+
+    # escala loguniforme compõe com o clipe
+    rng = np.random.default_rng(4)
+    small_seen = False
+    for _ in range(80):
+        quad, edge, frac = _sample_clipped_quad(rng, 500, 700, "loguniform")
+        lo, hi = quad.min(axis=0), quad.max(axis=0)
+        if (hi[0] - lo[0]) * (hi[1] - lo[1]) < 0.30 * gs.SIZE * gs.SIZE:
+            small_seen = True
+            break
+    assert small_seen, "loguniform nunca produziu folha pequena clipada"
+
+
+def test_clip_and_rotation_independent_rolls(tmp_path):
+    """clip_fraction=1 e rotation_fraction=1: o sorteio de rotação
+    não encolhe atrás do clipe — o clipe já sai na faixa ampla."""
+    from tools.gen_synthetic import _sample_clipped_quad
+
+    # composição direta: os dois hits viram clipped_wide
+    rng = np.random.default_rng(5)
+    wide_seen = False
+    for _ in range(40):
+        quad, edge, frac = _sample_clipped_quad(rng, 500, 700, "legacy", 18.0, 40.0)
+        top = quad[1] - quad[0]
+        deg = abs(np.degrees(np.arctan2(top[1], top[0])))
+        if deg > 25:
+            wide_seen = True
+    assert wide_seen

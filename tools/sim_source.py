@@ -148,11 +148,12 @@ class SyntheticCapture:
         self.stroke_phase = np.array(
             [0] * len(self.specs) + [1] * len(self.redraw_specs), dtype=np.int32
         )
-        # Âncoras da mão em espaço de página (px), calculadas sobre o
-        # texto escrito: palma pousa no centro da tinta e o sweep a
-        # atravessa — é a tinta confirmada que a oclusão precisa cobrir.
-        if self.specs:
-            all_pts = np.concatenate([s[3] for s in self.specs])
+        # Âncoras da mão em espaço de página (px), calculadas sobre
+        # TODA a tinta — escrita + redesenho: depois do apagar, a
+        # tinta nova é o que a palma e o sweep precisam cobrir
+        # (Devin Review, 2026-11-12).
+        if self.specs_all:
+            all_pts = np.concatenate([s[3] for s in self.specs_all])
             lo, hi = all_pts.min(axis=0), all_pts.max(axis=0)
         else:
             lo = hi = np.float32([self.pw / 2, self.ph / 2])
