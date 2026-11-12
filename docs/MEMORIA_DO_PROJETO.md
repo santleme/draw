@@ -421,8 +421,12 @@ A tentativa nativa automatizada em `01efd20` não validou mover/apagar:
 com os modelos oficiais verificados, o vídeo sintético teve folha detectada,
 mas nenhuma tinta confirmada em 101 passadas. Não se avançou sem esse
 estado inicial. Isso não prova regressão nem resultado ao vivo no papel;
-ainda é necessária uma fonte temporal reconhecida pelo modelo. O app também
-encerrou com falha de segmentação ao sair com Q; comparação-base pendente.
+ainda é necessária uma fonte temporal reconhecida pelo modelo. Ao sair
+com Q, tanto `01efd20` quanto a base `3c00e29` terminaram em falha de
+segmentação (139), sem manifesto final, com o mesmo ambiente/fonte/modelos.
+Os traces apontam encerramento da captura; a causa permanece indeterminada.
+Esse crash foi reproduzido na base. A UI não foi repetida nas correções
+posteriores de isolamento/E3; não alegar aprovação delas no papel real.
 
 As flags novas continuam desligadas por padrão,
 default 0; não promovem modelo nem substituem validação ao vivo. A primeira

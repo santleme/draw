@@ -94,8 +94,14 @@ e de tinta confirmada; salvar o canvas gerou imagem branca. O pré-requisito
 falhou: mover, apagar, redesenhar e casos negativos não foram executados.
 Não atribuir isso à PR nem ao papel real sem evidência independente.
 MediaPipe estava ausente, portanto não houve validação de oclusão por mão.
-Sair com Q terminou em falha de segmentação (139), sem manifesto final;
-a atribuição à base/PR ainda depende da comparação de encerramento.
+Sair com Q terminou em falha de segmentação (139), sem manifesto final.
+A comparação nativa com a base `3c00e29`, mesma fonte/modelos/ambiente/flags,
+reproduziu 139 e ausência de manifesto também na base. Ambos os traces
+apontam o pump da captura durante o encerramento; a causa exata não foi
+determinada. É uma falha herdada neste ambiente, não uma regressão provada
+da PR. A comparação usou `01efd20`; não se repetiu a UI nas correções
+posteriores de isolamento/E3. O subconjunto de código cobre essas correções,
+mas não substitui uma fonte temporal reconhecida para validar mover/apagar.
 
 | ID | Falha | Classe | Severidade | Régua |
 |---|---|---|---|---|
