@@ -134,6 +134,25 @@ com 0,249).
   precisão cheia, a w8 marca 0,40164 — veto que o incumbente também
   falha por poeira lê-se "empate", não reprovação.
 
+**Exercício sintético do simulador por texto (2026-11-12):**
+`tools/sim_source.py` gerou “Olá, Draw! ação 123”, seed 42, 8 FPS,
+0,25 s por traço, aquecimento de 1 s, assentamento de 4 s e mão
+placeholder: 96 frames, 28 movimentos de caneta. `tools/eval_capture.py`
+processou todos os frames no `SheetInkLoop` real, em relógio de vídeo;
+GT projetado pela âncora detectada, comparação exata por pixel,
+captura por traço definida antes da execução como recall ≥0,5.
+Com os modelos oficiais do manifesto (folha e20a89f0…, page-clean
+a470bd28…), houve 20 passadas de tinta: TP=5, FP=599, FN=20.541,
+IoU=0,00023646, precisão=0,00827815, recall=0,00024336;
+0 traços capturados, 2 parciais e 26 perdidos. O modo legado explícito
+no mesmo MP4 deu IoU=0,35923740, precisão=0,5 e recall=0,56064040;
+16 capturados, 11 parciais e 1 perdido. Reavaliar a máscara salva com
+a âncora salva reproduziu exatamente as métricas do modo page-clean.
+Isso exercita a régua e registra uma falha de recuperação nesta cena;
+não isola a causa entre inferência e confirmação temporal, não mede
+desempenho em câmera real e não promove nem recalibra modelos/limiares.
+Fluxo e limitações em `docs/SIMULATOR.md`; vídeos e JSONs não versionados.
+
 ## F-03 — Mão confundida com papel
 
 **Sintoma:** com a mão sobre a mesa/folha, o quadrilátero da folha

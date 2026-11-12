@@ -79,6 +79,7 @@ def test_source_rejects_invalid_timing_and_layout(kwargs):
 def test_source_progressive_cumulative_deterministic_and_finite():
     options = dict(fps=4, stroke_seconds=1, warmup_seconds=0, settle_seconds=0)
     source, twin = SyntheticCapture("ab", **options), SyntheticCapture("ab", **options)
+    assert np.all(source.quad >= 24) and np.all(source.quad <= gs.SIZE - 24)
     previous = np.zeros((512, 512), bool)
     areas = []
     for index in range(source.frame_count):
@@ -237,9 +238,9 @@ def test_real_loop_accepts_lazy_capture_without_gt_access(monkeypatch):
         assert result["detections"] > 0
         assert result["scheduler"] == "synchronous_video_clock"
         assert result["mode"] == "legacy"
-        if result["mask"] is not None:
-            assert result["mask"].shape == (255, 180)
-            assert result["corners"].shape == (4, 2)
+        assert result["mask"] is not None
+        assert result["mask"].shape == (255, 180)
+        assert result["corners"].shape == (4, 2)
     finally:
         synthetic.release()
 
