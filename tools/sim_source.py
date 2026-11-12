@@ -153,6 +153,7 @@ class SyntheticCapture:
         # pegar a folha, virar e repousar — e o que mais estressa a
         # vigia de identidade: mesma página ou página nova?
         lift_off = None
+        quad_at_lift = None
         if lift is not None:
             if len(lift) != 2 or not all(math.isfinite(v) for v in lift):
                 raise ValueError("lift espera (dx, dy) finitos na cena")
@@ -160,9 +161,26 @@ class SyntheticCapture:
             norm = float(np.linalg.norm(direction))
             if norm < 1.0:
                 raise ValueError("lift precisa de direção não trivial")
+            # A pose de saída é a pose APÓS as fases de geometria que
+            # vieram antes na linha do tempo (move): _quad_now em
+            # __init__ ainda é a pose inicial — o move só aplica na
+            # reprodução — então a composição é calculada aqui.
+            quad_at_lift = self._quad_now.copy()
+            if move is not None:
+                mdx, mdy, mdeg = move
+                quad_at_lift = quad_at_lift + np.float32([mdx, mdy])
+                _c = quad_at_lift.mean(axis=0)
+                _rad = math.radians(mdeg)
+                _rot = np.float32(
+                    [
+                        [math.cos(_rad), -math.sin(_rad)],
+                        [math.sin(_rad), math.cos(_rad)],
+                    ]
+                )
+                quad_at_lift = (quad_at_lift - _c) @ _rot.T + _c
             # Deslocamento maior que o lado do frame garante saída
             # completa para qualquer quad.
-            lift_off = self._quad_now + direction / norm * (gs.SIZE + 400)
+            lift_off = quad_at_lift + direction / norm * (gs.SIZE + 400)
         if return_pose is not None:
             if lift is None:
                 raise ValueError("return_pose exige lift")
@@ -206,7 +224,6 @@ class SyntheticCapture:
                 quad_from=self._quad_now.copy(),
             )
         if lift_off is not None:
-            quad_at_lift = self._quad_now.copy()
             push(
                 "lift_out",
                 max(1, math.ceil(lift_seconds * fps)),

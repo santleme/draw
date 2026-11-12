@@ -314,3 +314,33 @@ def test_lift_validations():
         SyntheticCapture("ab", lift=(0, 0))
     with pytest.raises(ValueError):
         SyntheticCapture("ab", lift=(10, 0, 0))
+
+
+def test_lift_starts_from_post_move_pose():
+    """Combinação move+lift: a saída parte da pose DEPOIS do move —
+    o quad_at_lift é composto em __init__, não pode saltar de volta
+    para a pose inicial quando o lift_out começa."""
+    capture = scenario(
+        erase_stroke=None,
+        redraw_text=None,
+        move=(60, 30, 5),
+        lift=(300, 200),
+        return_pose=(0, 0, 0),
+        absent_seconds=0.4,
+        lift_seconds=0.4,
+        return_seconds=0.4,
+    )
+    lift_out = next(p for p in capture.phases if p["kind"] == "lift_out")
+    move_end = next(p for p in capture.phases if p["kind"] == "move")
+    # o quad_from do lift é a pose pós-move: distinto da pose inicial
+    # (que é o quad_from do move) e igual ao quad que o move produz
+    # no seu último frame — sem salto na transição
+    assert not np.allclose(lift_out["quad_from"], move_end["quad_from"])
+    moved_quads = {}
+    while True:
+        ok, _ = capture.read()
+        if not ok:
+            break
+        moved_quads[capture._position - 1] = capture._quad_now.copy()
+    end_move = moved_quads[move_end["end"] - 1]
+    np.testing.assert_allclose(lift_out["quad_from"], end_move, atol=1.0)
