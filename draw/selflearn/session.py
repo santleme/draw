@@ -145,6 +145,10 @@ class SessionRecorder:
         self._acq_max_records = int(acq_max_records)
         self._acq_queued = 0
         self._acq_dropped = 0
+        self._ink_last_sequence = 0
+        self._ink_records = 0
+        self._ink_dropped = 0
+        self._ink_handle = None
         self._acq_written = 0
         self._acq_truncated = None
         self._acq_handle = None
@@ -262,6 +266,22 @@ class SessionRecorder:
         self._queue.put(("acq", {"t_s": t_s, **record}))
         return True
 
+    def note_ink_telemetry(self, snapshot):
+        """Persiste a régua por passada, sem perder o início no deque de 256."""
+        for record in snapshot.get("records", []):
+            sequence = record["sequence"]
+            with self._lock:
+                if self._finished or sequence <= self._ink_last_sequence:
+                    continue
+                if self._ink_records >= self._acq_max_records:
+                    self._ink_dropped += sequence - self._ink_last_sequence
+                    self._ink_last_sequence = sequence
+                    continue
+                self._ink_dropped += max(0, sequence - self._ink_last_sequence - 1)
+                self._ink_last_sequence = sequence
+                self._ink_records += 1
+            self._queue.put(("ink", dict(record)))
+
     # -- fechamento --
 
     def finish(self, telemetry=None):
@@ -339,8 +359,19 @@ class SessionRecorder:
                     self._write_raw(item[1], item[2])
                 elif item[0] == "acq":
                     self._write_acquisition(item[1])
+                elif item[0] == "ink":
+                    if self._ink_handle is None:
+                        ensure_private_dir(self.session_dir)
+                        self._ink_handle = open(
+                            self.session_dir / "ink_passes.jsonl", "a", encoding="utf-8"
+                        )
+                    self._ink_handle.write(json.dumps(item[1], sort_keys=True) + "\n")
+                    self._ink_handle.flush()
                 elif item[0] == "manifest":
                     self._close_acquisitions()
+                    if self._ink_handle is not None:
+                        self._ink_handle.close()
+                        self._ink_handle = None
                     self._write_manifest(item[1])
             except Exception as error:  # noqa: BLE001 - vai ao manifesto
                 with self._lock:
@@ -412,6 +443,14 @@ class SessionRecorder:
             entry["files"] = files
             generations.append(entry)
         manifest["generations"] = generations
+        ink_path = self.session_dir / "ink_passes.jsonl"
+        manifest["ink_passes"] = {
+            "file": "ink_passes.jsonl" if ink_path.exists() else None,
+            "records": self._ink_records,
+            "dropped": self._ink_dropped,
+            "max_records": self._acq_max_records,
+            "sha256": sha256_file(ink_path),
+        }
         acq_path = self.session_dir / "acquisitions.jsonl"
         with self._lock:
             manifest["raw_frames"] = {

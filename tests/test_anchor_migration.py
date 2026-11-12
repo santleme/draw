@@ -328,7 +328,12 @@ def test_flag_off_canvas_is_byte_identical_to_baseline(fast, scenario, flag_valu
     digest, snapshot = discipline._parity_canvas(scenario)
     assert digest == discipline.GOLDEN[scenario]
     assert "anchor_migrations" not in snapshot
-    assert not any(k.startswith("anchor_") for r in snapshot["records"] for k in r)
+    assert not any(
+        k.startswith("anchor_") and k != "anchor_arbitration_enabled"
+        for r in snapshot["records"]
+        for k in r
+    )
+    assert all(r["anchor_arbitration_enabled"] is False for r in snapshot["records"])
 
 
 @pytest.mark.lento

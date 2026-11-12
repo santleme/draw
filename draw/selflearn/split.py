@@ -177,7 +177,10 @@ def guard_holdout_example(example):
             f"holdout: origem {example['origin']!r} nao e rotulo "
             f"independente; aceito: {sorted(HOLDOUT_ALLOWED_ORIGINS)}"
         )
-    if example.get("label_source") != "final_minus_reference":
+    if example.get("label_source") not in (
+        "final_minus_reference",
+        "human_from_scratch",
+    ):
         raise LeakageError(
             "holdout: o rotulo precisa nascer de final - referencia "
             f"(label_source), nao da predicao: {example!r}"

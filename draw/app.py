@@ -421,9 +421,7 @@ def _detect_sheet_combined_traced(frame, neural_detector):
             # combinada é a mesma; só o rastro ganha o campo.
             corners, verdict, mask = neural_detector(frame, return_mask=True)
             if corners is not None and mask is not None:
-                trace["edge_in"] = float(
-                    neural_module.mask_edge_fraction(frame, mask)
-                )
+                trace["edge_in"] = float(neural_module.mask_edge_fraction(frame, mask))
         else:
             corners, verdict = neural_detector.detect_sheet_with_confidence(frame)
         logit = neural_detector.last_presence_logit
@@ -803,6 +801,7 @@ def run(
         save_page_snapshot=save_page_snapshot,
     )
     tracker = loop.tracker
+    last_recorded_ink_pass = 0
     # Buffer dos canvas transitorios de exibicao (o acumulado mora
     # no buffer do laco: nenhum outro uso pode escrever nele).
     view_canvas_buffer = np.empty(
@@ -854,6 +853,13 @@ def run(
             tel_fields.update(frame_source.stats())
             if ink_worker is not None:
                 tel_fields.update(ink_worker.stats())
+                if (
+                    session_recorder is not None
+                    and tel_fields["passes_total"] != last_recorded_ink_pass
+                ):
+                    snapshot = ink_worker.telemetry_snapshot()
+                    session_recorder.note_ink_telemetry(snapshot)
+                    last_recorded_ink_pass = snapshot["passes"]
             if detection_worker is not None:
                 tel_fields.update(detection_worker.stats())
             telemetry.update(**tel_fields)
@@ -1046,6 +1052,8 @@ def run(
                 worker_telemetry = (
                     ink_worker.telemetry_snapshot() if ink_worker is not None else None
                 )
+                if worker_telemetry is not None:
+                    session_recorder.note_ink_telemetry(worker_telemetry)
                 manifest_path = session_recorder.finish(telemetry=worker_telemetry)
                 print(f"Sessao gravada para o loop em {manifest_path}")
             except Exception as error:  # noqa: BLE001 - aviso, nao queda
