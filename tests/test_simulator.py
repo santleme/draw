@@ -261,6 +261,32 @@ def test_real_loop_accepts_lazy_capture_without_gt_access(monkeypatch):
         synthetic.release()
 
 
+def test_one_frame_does_not_fabricate_temporal_sheet_confirmation(monkeypatch):
+    from tools import eval_capture
+
+    monkeypatch.setattr(eval_capture, "_sheet_model_path", lambda path: None)
+    source = SyntheticCapture("a", fps=6)
+    frame = source.read()[1]
+    source.release()
+    # A folha é detectável, mas uma observação não satisfaz o rastreador.
+    detector = eval_capture._SynchronousDetector(None)
+    detector.submit(frame, 0)
+    assert detector.poll(0)[1] is not None
+
+    class OneFrame:
+        def get(self, prop):
+            return 6 if prop == cv2.CAP_PROP_FPS else 0
+
+        def read(self):
+            nonlocal frame
+            current, frame = frame, None
+            return current is not None, current
+
+    result = run_pipeline(OneFrame(), legacy_ink=True)
+    assert result["frames"] == result["detector_results"] == 1
+    assert result["mask"] is None and result["corners"] is None
+
+
 def test_headless_uses_real_page_clean_worker(monkeypatch):
     from draw import config, page_clean
 

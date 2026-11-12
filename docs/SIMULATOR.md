@@ -85,6 +85,12 @@ confirmação permanecem ativas. Isso avalia a qualidade funcional offline,
 não a concorrência, latência ou vazão do app com webcam. `--fps` substitui
 o FPS declarado pelo arquivo quando necessário.
 
+O EOF encerra a entrada sem repetir o último frame nem criar evidência.
+A detecção é consumida com o atraso de um quadro do laço real, e folha
+e tinta exigem persistência temporal. Vídeos muito curtos (inclusive um
+único quadro) podem resultar em `no_canvas`; mantenha os frames de
+aquecimento e assentamento da fonte para avaliação.
+
 No caminho page-clean, os adaptadores reais de mão do app também são
 reutilizados: `HandMasker` na worker (visibilidade) e `_make_hand_presence`
 no laço (presença/movimento e cadência), com amostragem síncrona.
