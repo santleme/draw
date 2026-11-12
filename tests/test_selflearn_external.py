@@ -254,3 +254,41 @@ def test_auto_split_is_sealed_per_group_and_audit_respects_split(tmp_path):
     audit = review.audit_pool(pool, split="train")
     assert len(audit["pages"]) == len(review.review_pages(pool, "train"))
     assert not audit["status"]["gate"]["n_reached"]
+
+
+def test_original_session_identity_survives_translation_and_training_guard(tmp_path):
+    root = catalog(tmp_path, groups=("recorded-holdout",))
+    pool = tmp_path / "pool"
+    external.translate(
+        root,
+        pool,
+        "capture-pool",
+        split="train",
+        model=Teacher(),
+        images_are_pages=True,
+    )
+    row = review.review_pages(pool, "train")[0]
+    with pytest.raises(split.LeakageError):
+        split.guard_train_example(row, ["recorded-holdout"])
+
+
+def test_existing_seal_blocks_teacher_before_labeling(tmp_path):
+    root = catalog(tmp_path, groups=("recorded-holdout",))
+    seal = root / "split.json"
+    seal.write_text(json.dumps({"assignments": {"recorded-holdout": "holdout"}}))
+    teacher = Teacher()
+    with pytest.raises(split.LeakageError):
+        external.translate(
+            root,
+            tmp_path / "bad",
+            "capture-pool",
+            split="train",
+            model=teacher,
+            images_are_pages=True,
+        )
+    assert teacher.calls == 0
+    external.translate(
+        root, tmp_path / "ok", "capture-pool", model=teacher, images_are_pages=True
+    )
+    assert teacher.calls == 0
+    assert review.holdout_pages(tmp_path / "ok")[0]["session_id"] == "recorded-holdout"

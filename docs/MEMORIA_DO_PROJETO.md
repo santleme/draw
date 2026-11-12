@@ -389,6 +389,11 @@ grupos identificáveis, usar um único `--batch` conservador para a pasta,
 nunca inventar autor/sessão por imagem. No pool catalogado o CSV também
 informa `session_used_for_prior_training`; para novos dados, é responsabilidade
 do operador auditar treino anterior antes de reservá-los. O resumo informa
+Original `session_id` nunca é renomeado: continua comparável ao holdout
+dos checkpoints/rodadas anteriores. Para reutilizar sessões já divididas,
+passar `--sealed-split /pool/anterior/split.json` (se estiver na raiz bruta,
+é lido automaticamente); o selo anterior tem precedência e proíbe
+pseudo-rotular holdout até com `--split train` explícito. O resumo informa
 páginas em cada lado e rejeições `no_page`, sem certificar a qualidade da
 retificação. `mark SESSAO GERACAO --label mascara.png` registra a revisão;
 `export --out /dados/revisado` só leva sessões inteiramente revisadas do

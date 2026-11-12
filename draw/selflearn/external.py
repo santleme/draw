@@ -69,6 +69,13 @@ def load_catalog(root, manifest=None, batch=None):
             raise ValueError(
                 "cada imagem exige session_id ou batch_id, nunca split por frame"
             )
+        session_id = row.get("session_id")
+        if session_id and (
+            Path(session_id).name != session_id
+            or session_id in (".", "..")
+            or any(c in session_id for c in "\\:")
+        ):
+            raise ValueError("session_id deve ser um nome simples, sem caminho")
         relative = row.get("image_path_in_archive") or row.get("image_path")
         # O pool Kaggle também admite o prefixo images/ (sem busca ambígua por basename).
         if (
@@ -81,6 +88,7 @@ def load_catalog(root, manifest=None, batch=None):
         result.append(
             {
                 "group": str(group),
+                "session_id": session_id,
                 "relative": str(path.relative_to(root)),
                 "sha256": sha256_file(path),
                 "prior_training": _true(
@@ -108,6 +116,7 @@ def translate(
     prepare_page=None,
     images_are_pages=False,
     preparation_id=None,
+    sealed_split=None,
 ):
     """Gera input.png + label_draft.png e linhagem; não aprova rótulo algum.
 
@@ -125,9 +134,20 @@ def translate(
     if Path(out_root).resolve().is_relative_to(root):
         raise ValueError("pool de saída deve ficar fora da raiz dos dados brutos")
     catalog = load_catalog(root, manifest, batch)
+    seal_path = Path(sealed_split) if sealed_split is not None else root / "split.json"
+    seals = read_json(seal_path)["assignments"] if seal_path.exists() else {}
+    if sealed_split is not None and not seal_path.is_file():
+        raise FileNotFoundError(seal_path)
+    if not isinstance(seals, dict) or any(
+        v not in ("train", "holdout") for v in seals.values()
+    ):
+        raise ValueError("selo existente exige assignments train/holdout")
     groups = sorted({r["group"] for r in catalog})
+    original_sessions = {r["group"] for r in catalog if r["session_id"]}
     ids = {
-        g: "external-" + hashlib.sha256(f"{dataset}:{g}".encode()).hexdigest()[:24]
+        g: g
+        if g in original_sessions or g in seals
+        else "external-" + hashlib.sha256(f"{dataset}:{g}".encode()).hexdigest()[:24]
         for g in groups
     }
     assignments = {}
@@ -138,8 +158,14 @@ def translate(
             if split == "auto"
             else split
         )
+        if ids[group] in seals:
+            if split != "auto" and side != seals[ids[group]]:
+                raise splits.LeakageError(
+                    f"sessão já selada como {seals[ids[group]]}: {group}"
+                )
+            side = seals[ids[group]]
         if prior:
-            if split == "holdout":
+            if split == "holdout" or seals.get(ids[group]) == "holdout":
                 raise splits.LeakageError(f"sessão já usada em treino: {group}")
             side = "train"
         assignments[ids[group]] = side
@@ -156,6 +182,7 @@ def translate(
         "dataset": dataset,
         "catalog": catalog,
         "assignments": assignments,
+        "sealed_assignments": seals,
         "images_are_pages": images_are_pages,
         "preparation_id": preparation_id,
         "model_sha256": sha256_file(model_path) if model_path else None,

@@ -25,6 +25,10 @@ def main(argv=None):
     parser.add_argument("--out", required=True)
     parser.add_argument("--manifest")
     parser.add_argument("--batch")
+    parser.add_argument(
+        "--sealed-split",
+        help="split.json anterior; junto à raiz é lido automaticamente",
+    )
     parser.add_argument("--split", choices=("auto", "train", "holdout"), default="auto")
     parser.add_argument("--holdout-fraction", type=float, default=0.25)
     parser.add_argument("--images-are-pages", action="store_true")
@@ -73,6 +77,7 @@ def main(argv=None):
                 prepare_page=prepare,
                 images_are_pages=args.images_are_pages,
                 preparation_id=preparation_id,
+                sealed_split=args.sealed_split,
             ),
             indent=2,
         )
