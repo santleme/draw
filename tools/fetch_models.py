@@ -35,7 +35,7 @@ from draw.manifest import load_manifest  # noqa: E402
 
 MODELS_DIR = REPO_ROOT / "models"
 MANIFEST_PATH = MODELS_DIR / "MANIFEST.json"
-RELEASE_TAG = "models-2026-11-06"
+RELEASE_TAG = "models-2026-11-14"
 DEFAULT_BASE_URL = "https://github.com/santleme/draw/releases/download/" + RELEASE_TAG
 _ENV_BASE_URL = "DRAW_MODELS_BASE_URL"
 _CHUNK = 1 << 20
