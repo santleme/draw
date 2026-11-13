@@ -1583,6 +1583,7 @@ def generate_dataset(
     clip_fraction: float = 0.0,
     rotation_fraction: float = 0.0,
     rotation_max: float = 40.0,
+    index_offset: int = 0,
 ) -> dict:
     """Gera o dataset completo com split por fonte + manifest.json.
 
@@ -1649,6 +1650,7 @@ def generate_dataset(
     hand_by_id = {h.source_id: h for h in hands}
     manifest: dict = {
         "seed": seed,
+        "index_offset": index_offset,
         "image_size": SIZE,
         "classes": {str(k): v for k, v in CLASSES.items()},
         "ignore_index": IGNORE,
@@ -1715,10 +1717,15 @@ def generate_dataset(
         }
         manifest["sequences"] = []
     negative_cycle = NEGATIVE_TYPES
+    if index_offset < 0:
+        raise ValueError(f"index_offset precisa ser >= 0: {index_offset}")
     for split, count in counts.items():
         split_dir = out / split
         split_dir.mkdir(parents=True, exist_ok=True)
-        for i in range(count):
+        # index_offset desloca o índice global da cena (rng + nome):
+        # shards [a, b) fundidos reproduzem a geração unificada byte a
+        # byte — paralelização determinística da dieta (2026-11-13).
+        for i in range(index_offset, index_offset + count):
             rng = _scene_rng(seed, split, i)
             hand_pool = splits["hands"][split]
             paper_pool = splits["papers"][split]
@@ -1840,7 +1847,7 @@ def generate_dataset(
         # Sequências temporais (opt-in): MESMAS pools do split, índice
         # próprio — nunca vazam fontes entre splits.
         n_seq = int((temporal_counts or {}).get(split, 0))
-        for j in range(n_seq):
+        for j in range(index_offset, index_offset + n_seq):
             rng = _scene_rng(seed, split, 500_000 + j)
             hand_pool = splits["hands"][split]
             paper_pool = splits["papers"][split]
@@ -1973,6 +1980,14 @@ def main() -> int:
         default=40.0,
         help="Teto da rotação em graus para --rotation-fraction (0, 90]; default 40)",
     )
+    parser.add_argument(
+        "--index-offset",
+        type=int,
+        default=0,
+        help="Desloca o índice global de cena/sequência (rng + nome): "
+        "shards [a,b) fundidos reproduzem a geração unificada byte a byte "
+        "— paralelização determinística",
+    )
     args = parser.parse_args()
     temporal_counts = None
     if args.temporal_train > 0 or args.temporal_val > 0:
@@ -1994,6 +2009,7 @@ def main() -> int:
         clip_fraction=args.clip_fraction,
         rotation_fraction=args.rotation_fraction,
         rotation_max=args.rotation_max,
+        index_offset=args.index_offset,
     )
     n = len(manifest["scenes"])
     print(f"{n} cenas em {args.out} (seed {args.seed})")
