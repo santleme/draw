@@ -962,24 +962,6 @@ def _anchor_follow_enabled():
     return value in {"1", "true", "yes", "on"}
 
 
-# Abstenção por folha em movimento (mesma família das abstenções
-# de arbitragem/follow/vigia): quad divergindo da âncora além de
-# _ANCHOR_MIGRATION_DISPLACEMENT_PX significa a folha deslizando
-# sob a câmera — votar ali registra a tinta na grade errada e
-# deposita a cópia deslocada medida no move do sim-hand (~11k px
-# confirmados em falso). A passada se abstém como nos outros
-# eventos: mede, mas não vota. Os streaks de migração/arbitragem/
-# follow continuam formando — leem corners, não visible — e
-# re-ancoram quando o movimento assenta; aí o voto retoma na
-# grade certa. Atras de DRAW_ANCHOR_MOTION_ABSTAIN (padrao 0).
-_ANCHOR_MOTION_ABSTAIN_ENV = "DRAW_ANCHOR_MOTION_ABSTAIN"
-
-
-def _anchor_motion_abstain_enabled():
-    value = os.environ.get(_ANCHOR_MOTION_ABSTAIN_ENV, "0").strip().lower()
-    return value in {"1", "true", "yes", "on"}
-
-
 def _matrix_grid_displacement(matrix, shape):
     """Deslocamento medio (px) de uma grade densa da pagina sob matrix."""
     height, width = shape
@@ -3582,18 +3564,6 @@ class _PageCleanWorker:
             )
             arbitration_abstain = False
             arb_event = None
-            # A abstenção de movimento consulta o deslocamento que o
-            # registro desta passada já mediu (âncora vs. quad vivo).
-            # Os streaks de migração/arbitragem/follow formam em cima
-            # dos corners e seguem vivos com a passada abstida.
-            motion_abstain = (
-                _anchor_motion_abstain_enabled()
-                and corners is not None
-                and reg_info.get("registration_displacement_px", 0.0)
-                > _ANCHOR_MIGRATION_DISPLACEMENT_PX
-            )
-            if motion_abstain:
-                reg_info["motion_abstained"] = True
             if anchor_arbitration:
                 arb_status, arb_event = self._anchor_arbitration_step(
                     generation,
@@ -3798,11 +3768,6 @@ class _PageCleanWorker:
                 # vota, para a tinta da pagina nova nao
                 # confirmar no canvas da antiga antes do
                 # veredito de identidade.
-                visible = np.zeros(prob.shape, dtype=bool)
-            if motion_abstain:
-                # Folha deslizando sob a camera (DRAW_ANCHOR_MOTION_
-                # ABSTAIN): votar registra a tinta na grade errada —
-                # a copia deslocada. A passada mede, mas nao vota.
                 visible = np.zeros(prob.shape, dtype=bool)
             result = self._accumulator.add(
                 prob,

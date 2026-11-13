@@ -332,12 +332,3 @@ def test_absence_streak_survives_unwitnessed_and_occlusion(monkeypatch):
         acc.add(stale, visible)  # completa as 6 testemunhadas
     assert not acc._confirmed[10:190, 10:60].any()
     assert np.all(acc._confirmed[10:190, 60:200] == 255)
-
-
-def test_motion_abstain_flag_parsing(monkeypatch):
-    for value, expected in (("1", True), ("on", True), ("0", False), (None, False)):
-        if value is None:
-            monkeypatch.delenv("DRAW_ANCHOR_MOTION_ABSTAIN", raising=False)
-        else:
-            monkeypatch.setenv("DRAW_ANCHOR_MOTION_ABSTAIN", value)
-        assert layers._anchor_motion_abstain_enabled() is expected
