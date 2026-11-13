@@ -427,3 +427,85 @@ def test_clip_and_rotation_independent_rolls(tmp_path):
         if deg > 25:
             wide_seen = True
     assert wide_seen
+
+
+def test_index_offset_shards_byte_identical(tmp_path):
+    """--index-offset: shards [a,b) + [b,c) fundidos reproduzem a
+    geração unificada byte a byte — paralelização determinística.
+    Contrato: offset só ao shardar UM split; shards multi-split
+    rodam com offset 0 (o offset vale para todos os splits que o
+    processo gera)."""
+    full = gs.generate_dataset(
+        tmp_path / "full",
+        seed=7,
+        counts={"train": 10, "val": 2, "test": 2},
+        temporal_counts={"train": 4, "val": 2},
+        temporal_frames=3,
+        clip_fraction=0.3,
+        rotation_fraction=0.3,
+        rotation_max=45,
+    )
+    gs.generate_dataset(
+        tmp_path / "t1",
+        seed=7,
+        counts={"train": 5},
+        clip_fraction=0.3,
+        rotation_fraction=0.3,
+        rotation_max=45,
+    )
+    gs.generate_dataset(
+        tmp_path / "t2",
+        seed=7,
+        counts={"train": 5},
+        index_offset=5,
+        clip_fraction=0.3,
+        rotation_fraction=0.3,
+        rotation_max=45,
+    )
+    gs.generate_dataset(
+        tmp_path / "vt",
+        seed=7,
+        counts={"val": 2, "test": 2},
+        temporal_counts={"val": 2},
+        temporal_frames=3,
+        clip_fraction=0.3,
+        rotation_fraction=0.3,
+        rotation_max=45,
+    )
+    gs.generate_dataset(
+        tmp_path / "q1",
+        seed=7,
+        counts={"train": 0},
+        temporal_counts={"train": 2},
+        temporal_frames=3,
+    )
+    gs.generate_dataset(
+        tmp_path / "q2",
+        seed=7,
+        counts={"train": 0},
+        index_offset=2,
+        temporal_counts={"train": 2},
+        temporal_frames=3,
+    )
+
+    comb = tmp_path / "comb"
+    for sh in ("t1", "t2", "vt", "q1", "q2"):
+        for f in (tmp_path / sh).rglob("*.png"):
+            dest = comb / f.relative_to(tmp_path / sh)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(f.read_bytes())
+
+    f1 = sorted(
+        str(f.relative_to(tmp_path / "full"))
+        for f in (tmp_path / "full").rglob("*.png")
+    )
+    f2 = sorted(str(f.relative_to(comb)) for f in comb.rglob("*.png"))
+    assert f1 == f2
+    assert all(
+        (tmp_path / "full" / f).read_bytes() == (comb / f).read_bytes() for f in f1
+    )
+
+
+def test_index_offset_validation(tmp_path):
+    with pytest.raises(ValueError):
+        gs.generate_dataset(tmp_path / "a", index_offset=-1)
