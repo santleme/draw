@@ -242,20 +242,58 @@ DRAW_INK_REMOVAL=1
 DRAW_SEG_HAND_OCCLUSION=1   # classe mão do seg vira 2º sinal de oclusão
 DRAW_ANCHOR_ARBITRATION=1   # veredito por conteúdo no assentamento
 DRAW_ANCHOR_FOLLOW=1        # re-âncora por divergência assentada
+DRAW_INK_MOTION_GATE=1      # deslocamento >8px não confirma tinta nova
+DRAW_ANCHOR_VOTE_RESET=1    # re-âncora zera janela de voto e E3/E4
+DRAW_ANCHOR_FAST_CLEAN=1    # streak de remoção 6→3 nas 12 pós-pouso
 ```
 
 Medições do mesmo conjunto: `sim-hand` IoU 0,495 (era `no_canvas`
-no modelo anterior), `sim-e3` 0,501, `sim-e3-nomove` 0,853,
+no modelo anterior), `sim-e3` 0,848, `sim-e3-nomove` 0,853,
 lift/return 0,86-0,87, `sim`/`sim-long` 0,85-0,87, redraw recall
-0,98-0,99. Reprovado e revertido: `DRAW_ANCHOR_MOTION_ABSTAIN`
-(abster durante divergência quad/âncora mata o voto do retorno —
-lift conf 4,9k → 0).
+0,98-0,99, QuickDraw ×5 IoU médio 0,85 (40/40 traços). Reprovado e
+revertido: `DRAW_ANCHOR_MOTION_ABSTAIN` (abster durante divergência
+quad/âncora mata o voto do retorno — lift conf 4,9k → 0).
+
+As três flags finais são da rodada do gargalo de registro instável:
+o portão de movimento só barra confirmação nova (a passada segue
+votando — diferente da abstenção revertida); o reset de voto impede
+que evidência da grade velha confirme na nova; e o fast-clean
+converge o detrito pós-pouso ~5s mais rápido (fp limpo em f579 vs
+f659 no sim-hand estendido), sempre com testemunha exigida.
 
 A auditoria por fase trata `return` como o `move`: checkpoints após o
 retorno pontuam contra `page_to_scene_final`. Checkpoints de `absent`
 sem âncora/canvas registram status em vez de métrica — e o veredito
 final ancora no último evento declarado (sem IoU emprestado de fases
 anteriores).
+
+## Bancada QuickDraw (qualidade de captura)
+
+`tools/quickdraw_sessions.py` converte desenhos reconhecidos do
+corpus QuickDraw (`~/draw-lab/ink-data/quickdraw/*.ndjson`) em specs
+`curve` do simulador e exporta MP4 + GT pronto para
+`tools/eval_capture.py` — traços vetoriais reais de humanos, não
+texto renderizado. Mede qualidade de captura (todo traço desenhado
+vira tinta confirmada?), é complementar aos cenários adversos e não
+substitui mesa real (pose fixa, mão placeholder):
+
+```sh
+PYTHON=.venv/bin/python tools/quickdraw_sessions.py \
+  --spec cat:0 --label qd-cat --hand \
+  --out captures/quickdraw-sessions/qd-cat.mp4
+PYTHON=.venv/bin/python tools/quickdraw_eval.sh          # todas
+PYTHON=.venv/bin/python tools/quickdraw_eval.sh qd-cat   # uma só
+PYTHON=.venv/bin/python tools/quickdraw_report.py        # tabela
+PYTHON=.venv/bin/python tools/quickdraw_overlay.py       # overlays
+```
+
+`--spec categoria:pick[@fx,fy,fw,fh]` é repetível (vários desenhos
+por folha, cada um numa fração da página). O eval roda com o conjunto
+de flags validado acima já exportado; `PYTHON` aponta o intérprete
+quando o checkout não tem `.venv` próprio. Bancada de referência
+(t16, 2026-11-13): 5 sessões, 40/40 traços capturados, recall
+0,97-0,99, IoU médio 0,85 com flags (0,79 sem) — fp residual é halo
+de ~1px (GT de 2px vs traço confirmado ~3px) mais specks de borda.
 
 ## Capturar e avaliar sem interface
 
