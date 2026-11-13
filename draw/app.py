@@ -453,6 +453,20 @@ def _detect_sheet_combined_traced(frame, neural_detector):
                             interpolation=cv2.INTER_NEAREST,
                         )
                     extras["coverage_mask"] = coverage_mask
+                # Máscara semântica de mão (mesma remessa, mesmo
+                # frame): segundo sinal de oclusão para o canal
+                # visible do voto de tinta, consumido no laço sob
+                # DRAW_SEG_HAND_OCCLUSION.
+                hand_mask = getattr(neural_detector, "last_hand_mask", None)
+                if coverage_on and hand_mask is not None:
+                    frame_h, frame_w = frame.shape[:2]
+                    if hand_mask.shape != (frame_h, frame_w):
+                        hand_mask = cv2.resize(
+                            hand_mask,
+                            (frame_w, frame_h),
+                            interpolation=cv2.INTER_NEAREST,
+                        )
+                    extras["hand_mask"] = hand_mask
         else:
             corners, verdict = neural_detector.detect_sheet_with_confidence(frame)
         logit = neural_detector.last_presence_logit

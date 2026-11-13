@@ -131,6 +131,14 @@ def _ink_skip_stale_enabled():
     return raw in ("1", "true", "yes", "on")
 
 
+_ENV_SEG_HAND_OCCLUSION_VAR = "DRAW_SEG_HAND_OCCLUSION"
+
+
+def _seg_hand_occlusion_enabled():
+    raw = os.environ.get(_ENV_SEG_HAND_OCCLUSION_VAR, "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 _ENV_INK_FOLLOW_MOVE_VAR = "DRAW_INK_FOLLOW_MOVE"
 _FROZEN_SHEET_MOVE_PX = 25.0
 
@@ -261,6 +269,7 @@ class SheetInkLoop:
         # warp de tinta, vira a cobertura que impede mesa vazada no
         # retificado de virar voto de tinta nova.
         self._coverage_mask = None
+        self._hand_mask_det = None
 
         self.tracker = _SheetTracker()
         self.ink_accumulator = ink_module.InkAccumulator()
@@ -418,6 +427,17 @@ class SheetInkLoop:
             if camera_mask is not None:
                 hand_warped = self._warp_sheet(camera_mask, warp_corners)
                 visible = hand_warped == 0
+        if _seg_hand_occlusion_enabled() and self._hand_mask_det is not None:
+            # DRAW_SEG_HAND_OCCLUSION: a classe mão do segmentador
+            # vira segundo sinal de oclusão. Sem ela, a mão sobre a
+            # folha conta como cobertura (classes != 0) e, quando o
+            # masker falha, a textura da mão vota como tinta nova —
+            # mancha medida no e3 com o t16 (~50k px confirmados na
+            # silhueta da mão). Os dois sinais se somam: basta um
+            # dizer "mão" para a passada não enxergar a folha ali.
+            seg_hand_warped = self._warp_sheet(self._hand_mask_det, warp_corners)
+            seg_clear = seg_hand_warped == 0
+            visible = seg_clear if visible is None else (visible & seg_clear)
         coverage = self._sheet_coverage_page(warp_corners)
         if coverage is not None:
             # Cobertura só sai quando existe: workers e fakes na
@@ -468,6 +488,7 @@ class SheetInkLoop:
                 # velha em vez de deixar cobertura defasada.
                 det_extras = det_result[6] or {}
                 self._coverage_mask = det_extras.get("coverage_mask")
+                self._hand_mask_det = det_extras.get("hand_mask")
             ran_detection = True
         else:
             detected_corners, detected_verdict = None, None
