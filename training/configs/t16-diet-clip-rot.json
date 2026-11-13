@@ -1,0 +1,292 @@
+{
+ "data": {
+  "augmentation": {
+   "geometric": [
+    "horizontal_flip_p=0.5",
+    "affine_rotation_degrees=-15..15_scale=0.9..1.1_mask_nearest_p=0.5",
+    "perspective_scale=0.02..0.06_mask_nearest_p=0.2"
+   ],
+   "note": "Augmentation geométrica aplica-se IDENTICAMENTE à imagem e à máscara (nunca só à imagem). Augmentation fotométrica só à imagem. Máscara nunca é borrada nem interpolada com bilinear: nearest-neighbor, para não criar classes fracionárias.",
+   "photometric": [
+    "brightness_contrast_limit=0.2_p=0.3",
+    "gaussian_blur_kernel=3..5_p=0.2",
+    "gaussian_noise_std=0.01..0.05_p=0.2",
+    "hue_shift=8_saturation_shift=12_value_shift=12_p=0.2"
+   ]
+  },
+  "freihand": {
+   "kaggle_dataset": "danieldelro/freihand",
+   "note": "O gerador sintético é de outro agente; este treinamento apenas consome o dataset gerado. Não baixar o FreiHAND inteiro nesta máquina: a checagem de formato roda no Kaggle, onde o dataset entra como input.",
+   "use": "Somente como matéria-prima das mãos no gerador (imagem RGB + máscara da mão) e como checagem de formato no notebook. Keypoints, pose 3D, mesh e câmera não são usados, salvo benefício direto. Se a versão do Kaggle não tiver máscaras de mão utilizáveis, NÃO inventar rótulos: documentar e trocar a fonte, registrando licença e origem."
+  },
+  "layout": {
+   "note": "Os splits JÁ vêm separados pelo gerador, por fonte original (mão, folha, fundo), nunca por split aleatório depois de gerar. train.py não reembaralha fontes entre splits; ele apenas lê as pastas e valida o split_manifest.json, se presente.",
+   "per_split": [
+    "images/*.png (ou .jpg)",
+    "masks/*.png (mesmo nome base)",
+    "ink_full/*.png (opcional)"
+   ],
+   "splits": [
+    "train",
+    "val",
+    "test"
+   ],
+   "synthetic_root": "dataset/synthetic (ou /kaggle/input/<dataset>/dataset/synthetic)"
+  },
+  "mask_encoding": {
+   "classes": {
+    "0": "background",
+    "1": "visible paper",
+    "2": "visible hand",
+    "3": "user-added visible ink"
+   },
+   "ignore_index": 255,
+   "ignore_note": "255 marks pixels deliberately left unknown; train.py excludes them from cross-entropy, Dice, pixel counts, and evaluation. Never convert 255 to background.",
+   "visible_pixel_rule": "A hand covering ink is class 2; printed text remains class 1."
+  },
+  "real_holdout": {
+   "note": "No independent real holdout is available from the two captured sessions after they are assigned to real_train. Reserve a new capture session for real holdout before claiming real-world generalization."
+  },
+  "real_train": {
+   "label_status": "ground truth (quads oficiais do SmartDoc 2015)",
+   "note": "Reservatório SmartDoc convertido por tools/convert_smartdoc.py a partir do dataset público guzzbr/smartdoc2015: 40 frames por vídeo x 150 vídeos = 6.000 frames, máscara = polígono do quad (paper=1, background=0). Entra via --real-train-dir com --real-loss-weight 1.0 (GT verificado, não é o pacote pseudo-rotulado das sessões; o peso 0,25 da config segue valendo só para pacotes não revisados). Fração por época: 6000/(14000+6000) = 30%.",
+   "retained_frames": 6000,
+   "sessions": [
+    "smartdoc2015_ch1_150_videos"
+   ],
+   "source_manifest": "smartdoc_pkg/dataset_manifest.json",
+   "split": "train"
+  },
+  "split_ratio": {
+   "test": 0.1,
+   "train": 0.8,
+   "val": 0.1
+  },
+  "split_seed": 42
+ },
+ "description": "T16 — DIETA CLIPE + ROTAÇÃO (2026-11-12): mesma receita de passos da t15 (init do best.pt anterior, max_steps, buffers em RAM) com corpus regenerado pela dieta nova do gen_synthetic — cobre os dois gaps medidos na bancada de cenários (docs/SIMULATOR.md): detector cego a folha clipada ~7-9% fora nas laterais/topo (bancada mão em massa, PR #70) e a rotação >~15° (bancada lift & return, PR #69), exatamente o teto do uniform(-18,18) histórico do gerador. Bancadas de regressão pós-treino: captures/sim-lift.mp4 e captures/sim-hand.mp4 pelo tools/eval_scenario.py.",
+ "export": {
+  "artifacts": [
+   "draw_segmentation_v1.onnx",
+   "classes.json",
+   "metrics.json",
+   "training_config.json",
+   "split_manifest.json"
+  ],
+  "dynamic_axes": {
+   "image": [
+    0
+   ],
+   "logits": [
+    0
+   ]
+  },
+  "input_name": "image",
+  "onnx": "draw_segmentation_v1.onnx",
+  "opset_version": 14,
+  "output_name": "logits",
+  "validation": "Rodar PyTorch e ONNX no mesmo lote. O ONNX só é considerado equivalente quando shape, max_abs_diff e min_argmax_iou passam os limites. Um status skipped nunca significa validado.",
+  "validation_thresholds": {
+   "max_abs_diff": 0.1,
+   "min_argmax_iou": 0.99
+  },
+  "validation_thresholds_note": "RECALIBRAÇÃO REGISTRADA (2026-11-08, smoke da Reserva na G4): max_abs_diff 0.001 -> 0.1 SÓ nesta config. Medido no smoke (Blackwell RTX PRO 6000, bf16): max_abs_diff 0,0642 e mean 0,0011 com min_argmax_iou 0,99989 e concordância de argmax 0,9999971 — a divergência é ruído de precisão do lado PyTorch (bf16/TF32) contra o ONNX Runtime em fp32; 0,064 ≈ 1 ULP de bf16 em logits ~16. Nas rodadas 1/2 (Kaggle T4) o mesmo portão mediu 6,9e-05/8,0e-05 e passou: a tolerância de 0,001 é da era fp32-efetiva da T4. O portão SEMÂNTICO (min_argmax_iou 0,99 — o que o app consome) NÃO muda. Correção de fundo pendente: validate_onnx comparar em fp32 estrito no lado PyTorch (tools/validate_onnx.py), rota Lucas/Devin."
+ },
+ "labels": {
+  "ink_full_mask": "Máscara opcional, fora do treino, com o desenho completo antes da oclusão (arquivo *_ink_full.png). Serve só para avaliar a memória temporal futura do Draw. Nunca entra como classe nem como entrada.",
+  "mask_encoding": "Single-channel PNG with values 0, 1, 2, 3, or 255 (unknown; ignored by loss and metrics).",
+  "rule": "Only visible pixels are labeled. Hand over ink is class 2; printed text is class 1. 255 is never converted to background."
+ },
+ "loss": {
+  "class_weights_rationale": "Classes muito desbalanceadas: fundo domina, papel é grande, mão é média, ink é minoria (traço fino = poucos pixels). Peso é inverso aproximado da frequência, com teto, para o ink não ser ignorado sem dominar o gradiente. Valores iniciais a partir da contagem de pixels do dataset gerado; o script registra a contagem real e, se ela divergir muito, o peso deve ser recalibrado e a mudança registrada em training_config.json — nunca ajustar peso olhando o split de teste.",
+  "cross_entropy_class_weights": [
+   1.0,
+   2.0,
+   3.0,
+   10.0
+  ],
+  "dice": "Dice multiclasse (média sobre as 4 classes, com smooth=1e-6). Dice complementa o CE porque mede sobreposição por classe, não só acerto por pixel, e é menos sensível ao domínio do fundo.",
+  "formula": "loss = 0.5 * CrossEntropy_com_peso + 0.5 * DiceLoss_multiclasse",
+  "note": "Accuracy global NÃO é critério de parada nem de comparação: com fundo dominante, um modelo que só prevê fundo já teria accuracy alta e seria inútil.",
+  "unverified_real_sample_weight": 0.25,
+  "unverified_real_sample_weight_note": "Propostas reais não revisadas exigem --allow-unverified-real-train e entram com 0,25 do peso de uma amostra sintética supervisionada. O valor é conservador e registrado; não transforma pseudo-rótulo em ground truth nem substitui holdout real.",
+  "hnbs": {
+   "weight": 0.01,
+   "threshold": 0.35,
+   "topk_fraction": 0.005,
+   "note": "Valores do CGHN-Net (Sensors 2026): BCE extra só em pixel de FUNDO com prob. de primeiro plano >= 0,35, top 0,5% por imagem. Sem top-k o recall deles caiu para 0,8279 — não remover o teto."
+  }
+ },
+ "metrics": {
+  "fixed_scenarios": [
+   "folha limpa",
+   "folha com desenho",
+   "folha muito desenhada",
+   "mão cobrindo canto",
+   "mão cobrindo centro",
+   "mão cobrindo traço",
+   "mão parcialmente fora da imagem",
+   "fundo claro",
+   "fundo escuro",
+   "sombra forte",
+   "folha parcialmente fora da imagem",
+   "mão sem folha",
+   "objeto branco sem folha",
+   "traço fino de lápis",
+   "traço grosso de caneta"
+  ],
+  "ink_tolerance": {
+   "method": "Dilatar predição e ground truth de ink por 2-3 px com disco euclidiano implementado em NumPy e recalcular precision/recall sobre a versão dilatada. Traço fino deslocado 1-2 px é visualmente correto mas destrói a IoU estrita; a métrica com tolerância mede isso sem esconder a IoU estrita, que continua sendo reportada ao lado.",
+   "note": "A implementação de referência usa NumPy puro para manter tools/seg_metrics.py sem dependência de OpenCV ou SciPy; a dilatação por distância é equivalente se documentada.",
+   "radii_px": [
+    2,
+    3
+   ]
+  },
+  "note": "Os 15 cenários fixos têm predições salvas (imagem + overlay) para comparação entre versões do modelo. Métricas sintéticas e do holdout real nunca são misturadas no mesmo número.",
+  "per_class": [
+   "iou",
+   "dice",
+   "precision",
+   "recall"
+  ],
+  "required": [
+   "iou_background",
+   "iou_paper",
+   "iou_hand",
+   "iou_ink",
+   "dice_paper",
+   "dice_hand",
+   "dice_ink",
+   "precision",
+   "recall"
+  ]
+ },
+ "model": {
+  "architecture": "SegFormer-B0",
+  "backbone": "nvidia/mit-b0",
+  "classes": {
+   "0": "background",
+   "1": "paper",
+   "2": "hand",
+   "3": "ink"
+  },
+  "input": {
+   "channels": 3,
+   "color_space": "RGB",
+   "height": 512,
+   "normalization": {
+    "mean": [
+     0.485,
+     0.456,
+     0.406
+    ],
+    "note": "Idêntica ao contrato atual de draw/neural.py (_MEAN/_STD). O ONNX novo mantém input 'image' 512x512 normalizado assim, para a integração não mudar o pré-processamento.",
+    "std": [
+     0.229,
+     0.224,
+     0.225
+    ]
+   },
+   "width": 512
+  },
+  "num_classes": 4,
+  "output": {
+   "name": "logits",
+   "note": "Logits por classe, sem softmax embutido; argmax: paper=(==1), hand=(==2), ink=(==3). MODELO C: o ONNX ganha a segunda saída 'presence' (1 logit por imagem, cabeça de presença); 'logits' continua sendo a saída [0] e o contrato de integração da máscara não muda.",
+   "shape": [
+    1,
+    4,
+    512,
+    512
+   ]
+  },
+  "pretrained": true,
+  "pretrained_source": "Hugging Face transformers (SegformerForSemanticSegmentation, id nvidia/mit-b0). Transfer learning: encoder pré-treinado no ImageNet, cabeça de segmentação nova com 4 classes."
+ },
+ "night_run": {
+  "role": "T16 dieta: t15 + clip_fraction + rotation_fraction no corpus",
+  "generation_command": "python tools/gen_synthetic.py --out /content/draw-data/synthetic --seed 42 --train 14000 --val 800 --test 800 --temporal-train 2000 --temporal-val 100 --temporal-frames 6 --bg-smooth-fraction 0.40 --sheet-scale loguniform --no-paper-fraction 0.35 --notebook-fraction 0.35 --clip-fraction 0.20 --rotation-fraction 0.15 --rotation-max 45 (mesma seed 42 da t13/t14: os splits por fonte ficam comparáveis; as frações novas só recolocam scene_type das cenas normais — clipe 20% das cenas com papel (5-40% fora por borda sorteada), rotação ampla 15% na faixa (18,45], sorteios independentes que compõem em clipped_wide)"
+ },
+ "project": "draw-segmentation-v1",
+ "t7": {
+  "batch_per_core_tpu": 8,
+  "decoder_hidden_size": 128,
+  "learning_rate_note": "No TPU o train_tpu.py usa lr 2e-4 por CLI (batch global 64 = 8/core x 8 cores); o training.learning_rate desta config (6e-5) é o da corrida GPU com batch 8.",
+  "learning_rate_tpu": 0.0002,
+  "note": "decoder_hidden_size é aplicado pelo build_model de training/train.py quando o bloco t7 está presente na config (corrigido na corrida da noite 2026-11-05: antes só a rota TPU aplicava o override e a GPU treinava decoder 256 sob o mesmo nome). batch_per_core_tpu e learning_rate_tpu seguem sendo só da rota TPU."
+ },
+ "training": {
+  "mode": "steps",
+  "max_steps": 1500,
+  "eval_interval_steps": 300,
+  "replay_size": 1500,
+  "batch_size": 32,
+  "init_checkpoint": "/content/draw-data/init_a/best.pt",
+  "checkpoint": "checkpoints/best.pt (melhor val_mean_iou; checkpoints/last.pt a cada época)",
+  "early_stopping": {
+   "mode": "max",
+   "monitor": "val_mean_iou",
+   "patience_epochs": 6
+  },
+  "epochs": 24,
+  "gradient_accumulation_steps": 1,
+  "learning_rate": 1e-05,
+  "mixed_precision": "bf16",
+  "mixed_precision_fallback": "fp16",
+  "note": "T15 — FASE 2 (2026-11-09, missão do Lucas): MESMA receita da t14 (warm init A + cabeça transplantada da R2 + pool 501 + pares 641 + sup 242 + SmartDoc), mas o fine-tune roda no LOOP GUIADO POR PASSOS (training.mode=steps): max_steps=1500, lote 12 replay + 10 pool + 5 pares amostrados de buffers em RAM (training/ram_buffer.py), augmentation fotométrica na GPU (draw/gpu_augmenter.py), avaliação a cada 300 passos. Meta da auditoria: passo de parede <= 0,050 s na G4 e GPU util > 85% (caminho de épocas mediu 0,567 s/passo na A100). O init de produção desta config é o best.pt da t14 (ou um candidato fundido aprovado), NÃO o init_a — o lançador passa o checkpoint certo; init_a fica como referência da linhagem. ||| Nota herdada da t14/R2: LR diferencial (backbone 1e-5, cabeça 8e-4 via training.presence_head_lr) + presence.pos_weight 0,55.",
+  "num_workers": 4,
+  "optimizer": "AdamW",
+  "scheduler": "cosine_with_warmup",
+  "seed": 42,
+  "temporal": {
+   "enabled": true,
+   "pair_fraction": 0.3,
+   "consistency_weight": 0.3,
+   "mode": "l1",
+   "trim": 0.2,
+   "area_weight": 0.0,
+   "note": "Pares sintéticos (gerador, change GT) + pares reais (teacher FT-dyn, change = discordância dele). L1+TrimMean 0,2 = Time2General 2026; λ 0,3 ~ TRUS 2026 (0,25). area_weight 0 = termo de área é braço de ablação do smoke, não default."
+  },
+  "warmup_ratio": 0.05,
+  "weight_decay": 0.01,
+  "balanced_real": {
+   "enabled": true,
+   "target_real_fraction": 0.4,
+   "note": "WeightedRandomSampler: toda época mantém ~40% de amostras reais por lote em expectativa (SmartDoc GT, peso de loss 1,0). Âncora Ranario 2026: amostragem balanceada >= injeção proporcional e >= fine-tune posterior."
+  },
+  "cache_mode": "none",
+  "cache_cap_mb": 24576,
+  "ema": {
+   "enabled": true,
+   "decay": 0.999,
+   "note": "EMA de pesos: avaliação e best.pt usam os pesos suavizados; last.pt guarda os crus. Horizonte ~1000 passos ≈ 0,8 época neste volume."
+  },
+  "compile": false,
+  "compile_note": "Desligado na config de propósito: o kernel de lançamento mede A/B no smoke da MESMA sessão (eager x compile aquecido, pelo receipt.json) e liga --compile na corrida cheia só se o compile vencer por >3% no s_per_step.",
+  "efficiency_note": "Pacote de eficiência (pedido do Lucas, 2026-11-06): EMA 0,999, compile medido no smoke. CACHE RAM DESLIGADO na v2 da rodada 1 (2026-11-07): a v1 morreu com SIGKILL (rc 247) no export ONNX pós-treino do smoke com o cache resized de 19,5 GiB residente numa sessão T4 de 29 GB — o pico do export passou do teto. O recibo do smoke mede o custo real do loader em disco; o cache só volta com teto dimensionado para a RAM medida da sessão, nunca para 24 GiB. Pares temporais seguem fora do cache nesta versão.",
+  "presence_head_lr": 0.0002,
+  "presence_pool_fraction": 0.3,
+  "init_presence_checkpoint": "/content/draw-data/r2_best/best.pt"
+ },
+ "presence": {
+  "enabled": true,
+  "loss_weight": 1.0,
+  "note": "Rotulo: papel(1) ou tinta(3) visivel = presente; mao/fundo = ausente. RODADA 2: frames do pool trazem o rotulo EXPLICITO (has_paper) e vencem a derivacao pela mascara; pos_weight 0,55 compensa a dieta ~65% positiva. O historico por epoca registra presence_mean_pos/presence_mean_neg: cabeca saudavel separa os dois DURANTE o treino, nao so na bancada.",
+  "pos_weight": 0.55
+ },
+ "known_gaps": [
+  "Reservatorio de negativos reais RESOLVIDO na Rodada 2: pool privado pascalcoimbra/draw-presence-pool-v2 (336 frames da mesa do Lucas, capturados 2026-11-07; 246 negativos em 8 cenas + 90 controles). absence_v1 segue HOLDOUT de julgamento — nunca treino.",
+  "Amostragem balanceada cobre o reservatorio SmartDoc (positivos reais); o pool cobre os negativos reais da cabeca de presenca. Segmentacao NAO ve o pool (sem mascara GT): geometria segue ancorada em sintetico + SmartDoc.",
+  "A cabeca de presenca e julgada pela bancada via segunda saida ONNX (leitura do presence entrou no juiz de ausencia); o gate de inferencia no app segue decisao de integracao posterior, com limiar calibrado em negativos reais separados.",
+  "Captura do caderno (draw-notebook-capture-v1) é UMA sessão/UM setup: ensina presença nesta mesa e serve de bancada específica; generalização segue exigindo sessões de outro setup (0 até aqui).",
+  "Sequências temporais sintéticas seguem de folha única (compose_scene_sequence não tem modo spread na v1); os pares temporais reais são os do pool (folha), e a consistência temporal do caderno vem só da supervisão de máscara dos stills + presença real.",
+  "t14: a captura de 393 frames é DADO DE TREINO (supervisão de máscara nos 242 sólidos + pares temporais nos 392) — o censo do caderno da t14 exige captura nova; as réguas seladas (bg05, absence_v1, 30 frames-testemunha, holdout) não são tocadas.",
+  "RESOLVIDO NESTA DIETA: envelope de clipe (~7-9% laterais/topo, ~17% baixo) e rotação (>~15°) medidos em 2026-11-12 — cobertos por --clip-fraction 0.20 e --rotation-fraction 0.15 --rotation-max 45. Bancadas de regressão: lift & return (PR #69) e mão em massa (PR #70)."
+ ],
+ "colab": {
+  "accelerator": "G4 (Colab Pro, taxa exibida na criação da sessão — conferir com colab usage)",
+  "estimated_time": "Geração shardeada ~30-50 min CPU + conversão SmartDoc + smoke + 24 épocas a batch 32 na G4 (~1-1,5 h de treino estimado pelo passo medido de 0,0445 s a batch 32 no sweep T7; época real medida no smoke). Teto de gasto: 35 CU.",
+  "note": "Datasets privados encenados via VM da Julia -> WSL do Lucas -> colab upload (a conta do Kaggle da sessão nunca é tocada). Pool estendido montado e verificado na VM (501 rótulos)."
+ }
+}
