@@ -37,6 +37,7 @@ from .sheet_track import (
     _SheetTracker,
     _corner_distance,
     _lk_track_corners,
+    anchor_coverage_guard_enabled,
 )
 
 
@@ -147,6 +148,53 @@ def ink_follow_move_enabled():
     """Destrave da geometria congelada: 1/true/yes/on; ausente desliga."""
     raw = os.environ.get(_ENV_INK_FOLLOW_MOVE_VAR, "").strip().lower()
     return raw in ("1", "true", "yes", "on")
+
+
+# Guarda de cobertura da âncora (medida na mesa real, 2026-11-14):
+# folha sai de cena e a detecção continua emitindo quads/"paper" em
+# cima da textura da mesa (madeira, mouse, objetos) — cada resultado
+# renova o seen do rastreador e a âncora nunca cai, projetando a
+# região vazia como tinta nova para sempre. O sinal contínuo é a
+# fração do quad rastreado ainda coberta pela máscara binária de
+# folha do seg: abaixo do piso por _ANCHOR_GUARD_MISS_ROUNDS
+# rodadas seguidas, o refresh é vetado — quad próximo vira "none",
+# evento de só-presença também — e a queda acontece pelo caminho
+# natural do rastreador. Reivindicação distante (detecção longe da
+# âncora) passa intacta: salto de folha é julgamento da arbitragem.
+_ANCHOR_GUARD_MIN_COVERAGE = 0.25
+_ANCHOR_GUARD_MISS_ROUNDS = 5
+_ANCHOR_GUARD_MIN_DET_COVERAGE = 0.85
+_ANCHOR_GUARD_MIN_LUMA = 140.0
+
+
+def _quad_coverage_fraction(mask, corners):
+    """Fração do interior do quad coberta por região-folha.
+
+    Quad totalmente fora do frame devolve 1.0: sem evidência não
+    há julgamento — a guarda não veta o que não enxerga.
+    """
+    h, w = mask.shape[:2]
+    fill = np.zeros((h, w), np.uint8)
+    cv2.fillPoly(
+        fill, [np.asarray(corners, np.int32).reshape(-1, 1, 2)], 255
+    )
+    area = int((fill > 0).sum())
+    if area <= 0:
+        return 1.0
+    inside = int(((np.asarray(mask) > 0) & (fill > 0)).sum())
+    return inside / area
+
+
+def _quad_luma_mean(frame, corners):
+    """Luma média dentro do quad; quad fora do frame devolve 255."""
+    fill = np.zeros(frame.shape[:2], np.uint8)
+    cv2.fillPoly(
+        fill, [np.asarray(corners, np.int32).reshape(-1, 1, 2)], 255
+    )
+    if not fill.any():
+        return 255.0
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return float(gray[fill > 0].mean())
 
 
 def _small_gray(frame):
@@ -270,6 +318,7 @@ class SheetInkLoop:
         # retificado de virar voto de tinta nova.
         self._coverage_mask = None
         self._hand_mask_det = None
+        self._sheet_mask_det = None
 
         self.tracker = _SheetTracker()
         self.ink_accumulator = ink_module.InkAccumulator()
@@ -337,6 +386,8 @@ class SheetInkLoop:
         self.lk_deaths = 0
         self.lk_redetect_requests = 0
         self.lk_forced_updates = 0
+        self.anchor_guard_vetoes = 0
+        self._anchor_guard_streak = 0
         self.lk_last_gate_event = None
 
     def _settled_skip_applies(self, frame, settled_every):
@@ -495,6 +546,7 @@ class SheetInkLoop:
         """
         det_result = self.detection_worker.poll(self.last_det_seq)
         det_gate_info = None
+        det_extras = {}
         if det_result is not None:
             (
                 self.last_det_seq,
@@ -514,6 +566,7 @@ class SheetInkLoop:
                 det_extras = det_result[6] or {}
                 self._coverage_mask = det_extras.get("coverage_mask")
                 self._hand_mask_det = det_extras.get("hand_mask")
+                self._sheet_mask_det = det_extras.get("sheet_mask")
             ran_detection = True
         else:
             detected_corners, detected_verdict = None, None
@@ -612,6 +665,52 @@ class SheetInkLoop:
             if not gate_passed:
                 self.first_confirm_gate_blocked += 1
                 detected_corners, detected_verdict = None, "none"
+        # Guarda de cobertura da âncora (medida na mesa real):
+        # ancorada, a fração do quad rastreado coberta pela máscara
+        # binária de folha é o sinal — folha em cena ≈0,99, mesa sob
+        # a âncora velha ≈0,03. Embaixo do piso por MISS_ROUNDS
+        # seguidas, TODO refresh é vetado — quad perto, longe ou
+        # só-presença: reivindicação distante também morre aqui e a
+        # folha cai pelo caminho natural do rastreador. Sem âncora,
+        # a mesma guarda vira portão de aquisição: quad neural só
+        # confirma se o interior dele mesmo for folha (fração alta)
+        # E claro e uniforme de papel (luma média) — o falso quad
+        # da mesa (fração ~0,7-0,9 mas luma ~110 contra ~237 da
+        # folha real) não volta a subir âncora depois da queda.
+        if anchor_coverage_guard_enabled() and ran_detection and (
+            self._sheet_mask_det is not None
+        ):
+            if self.tracker.corners is not None:
+                inside = _quad_coverage_fraction(
+                    self._sheet_mask_det, self.tracker.corners
+                )
+                if inside < _ANCHOR_GUARD_MIN_COVERAGE:
+                    self._anchor_guard_streak += 1
+                else:
+                    self._anchor_guard_streak = 0
+                if self._anchor_guard_streak >= _ANCHOR_GUARD_MISS_ROUNDS:
+                    self.anchor_guard_vetoes += 1
+                    detected_corners, detected_verdict = None, "none"
+            elif (
+                detected_corners is not None
+                and detected_verdict == "paper"
+            ):
+                # Aquisição: a luma vale para qualquer fonte (o
+                # falso quad da mesa mede ~110 contra ~237 da
+                # folha real); a fração só julga o neural, que
+                # carrega a máscara da mesma rodada — clássico
+                # aterrissando onde o modelo não viu folha não
+                # pode ser derrubado por ela.
+                det_luma = _quad_luma_mean(frame, detected_corners)
+                vetoed = det_luma < _ANCHOR_GUARD_MIN_LUMA
+                if not vetoed and det_extras.get("source") == "neural":
+                    det_frac = _quad_coverage_fraction(
+                        self._sheet_mask_det, detected_corners
+                    )
+                    vetoed = det_frac < _ANCHOR_GUARD_MIN_DET_COVERAGE
+                if vetoed:
+                    self.anchor_guard_vetoes += 1
+                    detected_corners, detected_verdict = None, "none"
         tracker_before = (
             self.tracker.diagnostic_state()
             if self.trace_acquisitions and ran_detection

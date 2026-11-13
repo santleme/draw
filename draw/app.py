@@ -91,6 +91,7 @@ from .sheet_track import (
     _DETECTION_STOP_TIMEOUT_SECONDS as _DETECTION_STOP_TIMEOUT_SECONDS,
     _SheetDetectionWorker as _SheetDetectionWorker,
     sheet_coverage_enabled as sheet_coverage_enabled,
+    anchor_coverage_guard_enabled as anchor_coverage_guard_enabled,
 )
 from .capture import (
     _CAPTURE_MAX_FAILURES as _CAPTURE_MAX_FAILURES,
@@ -396,6 +397,7 @@ def _detect_sheet_combined_traced(frame, neural_detector):
     }
 
     coverage_on = sheet_coverage_enabled()
+    guard_on = anchor_coverage_guard_enabled()
     extras = {}
 
     def _done(corners, verdict, source):
@@ -407,7 +409,16 @@ def _detect_sheet_combined_traced(frame, neural_detector):
         # cobertura anterior no laço, em vez de deixá-la defasada.
         # Sem a flag, extras vazio volta a ser None — a tupla de
         # sempre, byte a byte.
-        return corners, verdict, trace, extras if coverage_on else (extras or None)
+        masks_on = coverage_on or guard_on
+        if masks_on:
+            # A guarda da âncora julga aquisição com o source do
+            # desfecho — quad neural responde fração E luma, quad
+            # clássico (fallback sem máscara própria) responde só
+            # luma. O rastro já carrega source, mas o laço só o
+            # recebe dentro do pacote do portão de primeira
+            # confirmação, que exige edge_in — flag diferente.
+            extras["source"] = source
+        return corners, verdict, trace, extras if masks_on else (extras or None)
 
     def _classic():
         corners, verdict = paper_module.detect_sheet_with_confidence(frame)
@@ -422,14 +433,34 @@ def _detect_sheet_combined_traced(frame, neural_detector):
 
     if neural_detector is not None:
         trace["veto_logit"] = float(neural_module.PRESENCE_VETO_LOGIT)
-        if neural_module.first_confirm_gate_enabled() or coverage_on:
-            # Portão de primeira confirmação (frente 88) e cobertura
-            # de folha (DRAW_SHEET_COVERAGE): com qualquer uma ligada,
+        if (
+            neural_module.first_confirm_gate_enabled()
+            or coverage_on
+            or guard_on
+        ):
+            # Portão de primeira confirmação (frente 88), cobertura
+            # de folha (DRAW_SHEET_COVERAGE) e guarda da âncora
+            # (DRAW_ANCHOR_COVERAGE_GUARD): com qualquer uma ligada,
             # a detecção pede a máscara — o portão lê o edge_in que o
             # laço julga antes da primeira folha; a cobertura vai no
             # extras para o laço retificar com a homografia do warp
-            # de tinta. A decisão combinada é a mesma.
+            # de tinta; a binária de folha alimenta a guarda. A
+            # decisão combinada é a mesma.
             corners, verdict, mask = neural_detector(frame, return_mask=True)
+            if guard_on and mask is not None:
+                # A guarda mede a fração do quad rastreado ainda
+                # coberta por região-folha — vale também nas rodadas
+                # sem quad (só-presença), por isso sai fora do
+                # bloco de corners.
+                frame_h, frame_w = frame.shape[:2]
+                if mask.shape != (frame_h, frame_w):
+                    extras["sheet_mask"] = cv2.resize(
+                        mask,
+                        (frame_w, frame_h),
+                        interpolation=cv2.INTER_NEAREST,
+                    )
+                else:
+                    extras["sheet_mask"] = mask
             if corners is not None and mask is not None:
                 if neural_module.first_confirm_gate_enabled():
                     trace["edge_in"] = float(

@@ -634,13 +634,14 @@ def _eraser_sprite():
 
 def _apply_ruled(paper, pw, ph):
     """Pauta de caderno na textura da página (RGB, nunca GT de tinta):
-    linhas horizontais azul-acinzentadas + margem esquerda, como a
-    folha real que a mesa mostrou."""
+    linhas horizontais azul-claras + margem esquerda rosada, como a
+    folha real que a mesa mostrou — a pauta de caderno de verdade
+    fica ~20-40 pontos de luma abaixo do papel, não ~85."""
     spacing = max(20, ph // 46)
     for y in range(spacing * 2, ph - spacing // 2, spacing):
-        cv2.line(paper, (0, y), (pw, y), (170, 160, 150), 1, cv2.LINE_AA)
+        cv2.line(paper, (0, y), (pw, y), (215, 200, 190), 1, cv2.LINE_AA)
     cv2.line(
-        paper, (pw // 16, 0), (pw // 16, ph), (150, 110, 110), 2, cv2.LINE_AA
+        paper, (pw // 16, 0), (pw // 16, ph), (205, 180, 180), 1, cv2.LINE_AA
     )
 
 
