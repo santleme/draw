@@ -260,3 +260,84 @@ def test_e3_lateral_tracks_allow_erasure_then_redraw(monkeypatch, height, width,
     assert not acc._confirmed[region].any()
     confirmed(acc, with_side)
     assert np.all(acc._confirmed[region] == 255)
+
+
+def _big_ink():
+    prob = np.zeros((260, 400), np.float32)
+    prob[10:190, 10:200] = 0.95  # ~34k px confirmados
+    return prob
+
+
+def test_witness_floor_unblocks_stale_canvas(monkeypatch):
+    """retained < 65% mas >= piso: a testemunha existe e a remocao corre.
+
+    O catch-22 medido no sim-hand: mais de ~35% do canvas velho e os
+    proprios pixels errados impediam a fracao de existir — retained
+    0,33% e a saida congelava com a folha limpa a vista. Com o piso,
+    4k px de re-testemunho comprovam o modelo vivo e a evidencia
+    negativa dele conta.
+    """
+    monkeypatch.setenv("DRAW_INK_REMOVAL", "1")
+    acc = layers._LayeredInkAccumulator()
+    prob = _big_ink()
+    confirmed(acc, prob)
+    canvas = int((acc._confirmed > 0).sum())
+    # Copia defasada: metade da tinta "some" (stale), metade segue.
+    stale = prob.copy()
+    stale[10:190, 10:110] = 0.0
+    visible = np.ones(prob.shape, bool)
+    # retained ~17k de ~34k = ~50% < 65% mas >= 4k -> testemunhada.
+    for _ in range(layers._REMOVAL_PASSES):
+        acc.add(stale, visible)
+    assert not acc._confirmed[10:190, 10:110].any()
+    assert np.all(acc._confirmed[10:190, 110:200] == 255)
+
+
+def test_witness_floor_keeps_total_darkness_closed(monkeypatch):
+    """Modelo escurecendo por inteiro segue vedado: nada de varredura."""
+    monkeypatch.setenv("DRAW_INK_REMOVAL", "1")
+    acc = layers._LayeredInkAccumulator()
+    prob = _big_ink()
+    original = confirmed(acc, prob)
+    dark = np.zeros_like(prob)
+    visible = np.ones(prob.shape, bool)
+    for _ in range(2 * layers._REMOVAL_PASSES):
+        acc.add(dark, visible)
+    np.testing.assert_array_equal(acc._confirmed > 0, original > 0)
+
+
+def test_absence_streak_survives_unwitnessed_and_occlusion(monkeypatch):
+    """Passada sem testemunha ou pixel ocluido seguram o streak.
+
+    A ausencia do F-10 precisa ser persistente, nao consecutiva:
+    em cena real a testemunha oscila e a mao cobre a regiao —
+    interromper a contagem a cada buraco congelava a copia
+    defasada para sempre.
+    """
+    monkeypatch.setenv("DRAW_INK_REMOVAL", "1")
+    acc = layers._LayeredInkAccumulator()
+    prob = _big_ink()
+    confirmed(acc, prob)
+    stale = prob.copy()
+    stale[10:190, 10:60] = 0.0  # regiao que vai ser removida
+    visible = np.ones(prob.shape, bool)
+    occluded = visible.copy()
+    occluded[10:190, 10:60] = False
+    for _ in range(3):
+        acc.add(stale, visible)  # 3 testemunhadas ausentes
+    acc.add(stale, visible, removal_allowed=False)  # sem info: segura
+    acc.add(stale, occluded)  # regiao ocluida: segura tambem
+    assert (acc._confirmed > 0)[10:190, 10:60].any()
+    for _ in range(layers._REMOVAL_PASSES - 3):
+        acc.add(stale, visible)  # completa as 6 testemunhadas
+    assert not acc._confirmed[10:190, 10:60].any()
+    assert np.all(acc._confirmed[10:190, 60:200] == 255)
+
+
+def test_motion_abstain_flag_parsing(monkeypatch):
+    for value, expected in (("1", True), ("on", True), ("0", False), (None, False)):
+        if value is None:
+            monkeypatch.delenv("DRAW_ANCHOR_MOTION_ABSTAIN", raising=False)
+        else:
+            monkeypatch.setenv("DRAW_ANCHOR_MOTION_ABSTAIN", value)
+        assert layers._anchor_motion_abstain_enabled() is expected
