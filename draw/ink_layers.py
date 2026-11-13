@@ -14,7 +14,6 @@ e descanso sao lidas deste modulo em tempo de execucao: quem
 precisa muda-las (os testes) patcheia aqui, onde a leitura mora.
 """
 
-import json
 import os
 import threading
 import time
@@ -836,6 +835,25 @@ _REMOVAL_RETAINED_FRACTION = 0.65
 # imunes pela máscara `visible` dentro de `missing`.
 _REMOVAL_WITNESS_FLOOR_PX = 4000
 
+# Limpeza acelerada pos-re-ancoragem (DRAW_ANCHOR_FAST_CLEAN): o
+# pouso da folha e um veredito de conteudo — a tinta que ficou na
+# grade velha e detrito esperado, nao candidato a reaparecer. Sem
+# a janela rapida ela so sai pelo protocolo cheio (6 passadas
+# testemunhadas ~= 15-20 s de mesa parada, medido): a metade do
+# streak basta porque a testemunha continua exigida — modelo que
+# re-testemunha o piso esta comprovadamente lendo tinta na grade
+# nova; se a ancora nova estiver errada nada retem e a remocao
+# nem abre (fail-closed como sempre). A janela cobre o tempo de
+# assentamento tipico; fora dela vale o protocolo cheio.
+_REMOVAL_FAST_PASSES = 3
+_REMOVAL_FAST_WINDOW = 12
+_ANCHOR_FAST_CLEAN_ENV = "DRAW_ANCHOR_FAST_CLEAN"
+
+
+def _anchor_fast_clean_enabled():
+    value = os.environ.get(_ANCHOR_FAST_CLEAN_ENV, "0").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
 
 # Disciplina de registro (M1, auditoria de 2026-11-10, draw-lab/
 # live-audit-2026-11-10/, provas P2/P3a/P3b): o voto de tinta e
@@ -959,6 +977,43 @@ _FOLLOW_SETTLE_PX = 6.0
 
 def _anchor_follow_enabled():
     value = os.environ.get(_ANCHOR_FOLLOW_ENV, "0").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+# Portao de confirmacao em registro instavel (frente medida no
+# sim-hand, 2026-11-13): passada com deslocamento de registro
+# acima do limiar da migracao vota normal — a evidencia entra na
+# janela, a provisoria pinta, a identidade mede — mas nenhum pixel
+# novo materializa confirmacao enquanto a geometria esta correndo.
+# A copia deslocada do sim-hand nasceu ai: quads degradados no
+# meio do move confirmando o mesmo traco uma segunda vez longe da
+# posicao real. Diferente da abstencao reprovada (visible=0
+# envenenava a janela e derrubava o recall de identidade — FALHAS),
+# aqui so a materializacao e segurada: o ja-confirmado segue
+# confirmado, e na primeira passada assentada a tinta legitima
+# confirma. Canvas vazio nao fecha o portao: sem traco para
+# proteger, a tinta inicial confirma mesmo em movimento.
+_MOTION_CONFIRM_GATE_ENV = "DRAW_INK_MOTION_GATE"
+
+
+def _motion_confirm_gate_enabled():
+    value = os.environ.get(_MOTION_CONFIRM_GATE_ENV, "0").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+# Reset da memoria de voto na re-ancoragem (DRAW_ANCHOR_VOTE_RESET):
+# quando FOLLOW ou arbitragem trocam a ancora no meio da geracao,
+# toda evidencia acumulada — janela, trilhas E3/E4, streaks por
+# pixel — esta escrita na grade anterior. Sem o reset, a primeira
+# passada sob a ancora nova soma essa evidencia desalinhada e
+# confirma a copia deslocada de uma vez (medido: 10,7k px numa so
+# passada no sim-hand). O confirmado nao participa do reset — o
+# canvas ja e da folha.
+_ANCHOR_VOTE_RESET_ENV = "DRAW_ANCHOR_VOTE_RESET"
+
+
+def _anchor_vote_reset_enabled():
+    value = os.environ.get(_ANCHOR_VOTE_RESET_ENV, "0").strip().lower()
     return value in {"1", "true", "yes", "on"}
 
 
@@ -1151,6 +1206,11 @@ class _LayeredInkAccumulator:
     def reset(self):
         self._window = deque(maxlen=_INK_VOTE_WINDOW)
         self._removal_streak = None
+        # Janela de limpeza acelerada pos-re-ancoragem: passadas
+        # testemunhadas restantes com o streak curto (ver
+        # _REMOVAL_FAST_PASSES). Zerada por geracao — o detrito de
+        # grade dela e a troca de ancora que a dispara.
+        self._removal_fast_left = 0
         self._confirmed = None
         self._provisional = None
         self._provisional_ever = None
@@ -1591,7 +1651,44 @@ class _LayeredInkAccumulator:
             np.logical_or(seen, item > self.threshold, out=seen)
         return score, hits, seen
 
-    def add(self, prob, visible=None, *, removal_allowed=True):
+    def reset_vote_memory(self):
+        """Ancora trocou: a memoria de voto escrita na grade velha zera.
+
+        O confirmado fica — o canvas ja e o da folha e a re-ancoragem
+        nao o move (o carry deformado e a migracao v1, reprovada). O
+        que recomeca e toda memoria posicional de voto: janela,
+        streak de remocao por pixel, provisoria, ever-masks e as
+        trilhas E3/E4, todas escritas sob o registro anterior. Sem o
+        reset a primeira passada na ancora nova soma a evidencia
+        velha desalinhada e confirma a copia de uma vez — medido:
+        10,7k px numa unica passada logo apos o re-ancora do FOLLOW
+        no sim-hand (a "segunda borda" de cada traco).
+        """
+        self._window.clear()
+        self._removal_streak = None
+        for name in ("_provisional", "_provisional_ever", "_retracted_ever"):
+            mask = getattr(self, name)
+            if mask is not None:
+                setattr(self, name, np.zeros_like(mask))
+        self._low_overlap_streak = 0
+        self._score_buf = self._hits_buf = self._seen_buf = None
+        self._reset_e3_state()
+        self._reset_e4_state()
+
+    def note_reanchor(self):
+        """Re-ancoragem: abre a janela de limpeza acelerada.
+
+        Chamada pela trabalhadora nas trocas de ancora do FOLLOW e
+        da arbitragem, atras de DRAW_ANCHOR_FAST_CLEAN. As proximas
+        _REMOVAL_FAST_WINDOW passadas testemunhadas removem com
+        _REMOVAL_FAST_PASSES em vez do protocolo cheio — o detrito
+        da grade velha some em ~3s em vez de ~15-20s de mesa.
+        """
+        self._removal_fast_left = _REMOVAL_FAST_WINDOW
+
+    def add(
+        self, prob, visible=None, *, removal_allowed=True, confirm_allowed=True
+    ):
         prob = np.asarray(prob, dtype=np.float32)
         if visible is not None:
             visible = np.asarray(visible, dtype=bool)
@@ -1698,8 +1795,20 @@ class _LayeredInkAccumulator:
                 confirmed_rule &= seen_as_ink | ~near_anchor
             new_confirmed = confirmed_rule & ~confirmed_before
         new_confirmed_px = int(np.count_nonzero(new_confirmed))
+        confirm_blocked_px = 0
         if new_confirmed_px:
-            self._confirmed[new_confirmed] = 255
+            if confirm_allowed or not canvas_before:
+                self._confirmed[new_confirmed] = 255
+            else:
+                # Portao de movimento (DRAW_INK_MOTION_GATE): a
+                # passada votou e a provisoria reflete a evidencia,
+                # mas nada cristaliza enquanto o registro corre —
+                # a copia deslocada que nasceria aqui e exatamente
+                # o fantasma do sim-hand. Sem canvas confirmado o
+                # portao nao fecha: a primeira tinta nao tem copia
+                # para duplicar.
+                confirm_blocked_px = new_confirmed_px
+                new_confirmed_px = 0
         removed_px = 0
         if _experimental_enabled("DRAW_INK_REMOVAL"):
             if self._removal_streak is None:
@@ -1721,6 +1830,16 @@ class _LayeredInkAccumulator:
                 else np.zeros(prob.shape, dtype=bool)
             )
             if witnessed:
+                if self._removal_fast_left > 0:
+                    # Janela pos-re-ancoragem (DRAW_ANCHOR_FAST_CLEAN,
+                    # aberta por note_reanchor): o detrito da grade
+                    # velha sai com metade do streak — a testemunha
+                    # segue exigida, entao a protecao fail-closed e a
+                    # mesma. Passada sem testemunha nao gasta janela.
+                    self._removal_fast_left -= 1
+                    removal_limit = _REMOVAL_FAST_PASSES
+                else:
+                    removal_limit = _REMOVAL_PASSES
                 # Com testemunha: pixel à vista e não ausente vê o
                 # streak zerar (evidência positiva ou prova
                 # inconclusiva); pixel ausente conta. Ocluído ou sem
@@ -1735,9 +1854,11 @@ class _LayeredInkAccumulator:
                 self._removal_streak[resettable] = 0
                 self._removal_streak[missing] = np.minimum(
                     self._removal_streak[missing].astype(np.uint16) + 1,
-                    _REMOVAL_PASSES,
+                    removal_limit,
                 ).astype(np.uint8)
-            removed = self._removal_streak >= _REMOVAL_PASSES
+            else:
+                removal_limit = _REMOVAL_PASSES
+            removed = self._removal_streak >= removal_limit
             removed_px = int(np.count_nonzero(removed))
             if removed_px:
                 self._confirmed[removed] = 0
@@ -1820,6 +1941,7 @@ class _LayeredInkAccumulator:
             "confirmed_changed": new_confirmed_px > 0 or removed_px > 0,
             "provisional_changed": provisional_changed,
             "new_confirmed_px": new_confirmed_px,
+            "confirm_blocked_px": confirm_blocked_px,
             "confirmed_px": int(np.count_nonzero(self._confirmed)),
             "provisional_px": int(np.count_nonzero(self._provisional)),
             "provisional_ever_px": int(np.count_nonzero(self._provisional_ever)),
@@ -2619,6 +2741,14 @@ class _PageCleanWorker:
                 # voto e do gatilho quebra.
                 new_anchor = np.roll(new_anchor, self._anchor_roll, axis=0)
             self._anchor_corners = new_anchor
+            if _anchor_vote_reset_enabled():
+                # A evidencia guardada votava na grade velha —
+                # ver _LayeredInkAccumulator.reset_vote_memory.
+                self._accumulator.reset_vote_memory()
+            if _anchor_fast_clean_enabled():
+                # O pouso e veredito de conteudo: a tinta da grade
+                # velha e detrito — janela de limpeza acelerada.
+                self._accumulator.note_reanchor()
             # So o pouso rodado muda a rotulacao; nos demais
             # vereditos o roll parado se preserva.
             if verdict == "landing_rotated":
@@ -2716,6 +2846,15 @@ class _PageCleanWorker:
             # pela geometria; ela recomeca contra a ancora nova.
             self._arb_close_event()
         self._anchor_corners = new_anchor
+        if _anchor_vote_reset_enabled():
+            # Idem arbitragem: janela/trilhas/streaks votavam na
+            # grade velha — sem o reset a passada seguinte
+            # confirma a copia deslocada inteira de uma vez.
+            self._accumulator.reset_vote_memory()
+        if _anchor_fast_clean_enabled():
+            # Janela de limpeza acelerada sobre o detrito da
+            # grade velha — ver note_reanchor.
+            self._accumulator.note_reanchor()
         if reg_anchor_median:
             self._anchor_samples = [quad.copy() for quad in self._follow_streak_quads]
         if reg_deadband:
@@ -3769,6 +3908,14 @@ class _PageCleanWorker:
                 # confirmar no canvas da antiga antes do
                 # veredito de identidade.
                 visible = np.zeros(prob.shape, dtype=bool)
+            _reg_disp_px = reg_info.get("registration_displacement_px")
+            motion_gate_blocked = (
+                _motion_confirm_gate_enabled()
+                and _reg_disp_px is not None
+                and _reg_disp_px > _ANCHOR_MIGRATION_DISPLACEMENT_PX
+            )
+            if motion_gate_blocked:
+                reg_info["motion_confirm_blocked"] = True
             result = self._accumulator.add(
                 prob,
                 visible,
@@ -3785,7 +3932,12 @@ class _PageCleanWorker:
                     and reg_info.get("registration_displacement_px", float("inf"))
                     <= _ANCHOR_MIGRATION_DISPLACEMENT_PX
                 ),
+                confirm_allowed=not motion_gate_blocked,
             )
+            if result.get("confirm_blocked_px"):
+                reg_info["motion_confirm_blocked_px"] = result[
+                    "confirm_blocked_px"
+                ]
             if result.get("ink_vote_e3"):
                 # Telemetria da regra E3 (so com DRAW_INK_VOTE_E3
                 # ligada): fase da geracao e trilhas abertas.
