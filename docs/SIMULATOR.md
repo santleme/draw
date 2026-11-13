@@ -245,6 +245,7 @@ DRAW_ANCHOR_FOLLOW=1        # re-âncora por divergência assentada
 DRAW_INK_MOTION_GATE=1      # deslocamento >8px não confirma tinta nova
 DRAW_ANCHOR_VOTE_RESET=1    # re-âncora zera janela de voto e E3/E4
 DRAW_ANCHOR_FAST_CLEAN=1    # streak de remoção 6→3 nas 12 pós-pouso
+DRAW_ANCHOR_COVERAGE_GUARD=1 # âncora sem folha embaixo perde o seen
 ```
 
 Medições do mesmo conjunto: `sim-hand` IoU 0,495 (era `no_canvas`
@@ -254,7 +255,25 @@ lift/return 0,86-0,87, `sim`/`sim-long` 0,85-0,87, redraw recall
 revertido: `DRAW_ANCHOR_MOTION_ABSTAIN` (abster durante divergência
 quad/âncora mata o voto do retorno — lift conf 4,9k → 0).
 
-As três flags finais são da rodada do gargalo de registro instável:
+`DRAW_ANCHOR_COVERAGE_GUARD` é da rodada da mesa real (2026-11-14):
+a folha sai de cena e o seg continua achando "papel" na textura da
+mesa — cada detecção renovava o seen do tracker e a âncora nunca
+caía, projetando mesa vazia como tinta (+17k px confirmados com a
+folha fora de cena no `desk-ghost`). A guarda mede a fração do quad
+rastreado coberta pela máscara binária de folha (≈0,99 com folha,
+≈0,03 sem); abaixo do piso por 5 rodadas, todo refresh é vetado e
+a folha cai. Sem âncora, vira portão de aquisição: quad precisa de
+fração alta (neural) E luma de papel — o falso quad da mesa mede
+~110 contra ~237 da folha real. Medido: âncora cai ~f75, 91 falsas
+aquisições vetadas, crescimento de tinta pós-saída = zero; retorno
+realista (`desk-return`, mesma pose) re-registra normal (17/17
+traços, recall 0,98). Caso-borda em aberto: retorno com rotação
+forte/parte fora do frame (`sim-lift`) — a âncora re-adquirida
+mapeia a página com escala+translação diferentes e o juiz de
+identidade decide `new_page`; precisa de comparação registrada
+por conteúdo (próxima frente).
+
+As três flags do meio são da rodada do gargalo de registro instável:
 o portão de movimento só barra confirmação nova (a passada segue
 votando — diferente da abstenção revertida); o reset de voto impede
 que evidência da grade velha confirme na nova; e o fast-clean

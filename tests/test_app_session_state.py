@@ -79,6 +79,7 @@ def _run_headless(plan, fake_ink_factory, period_s=0.006):
     real_open = app_module._open_capture
     real_page_clean = app_module.page_clean_module.PageCleanInk
     real_neural_detector = app_module.neural_module.NeuralSheetDetector
+    real_hand_available = app_module.hand_module.hand_model_available
     real_imshow, real_wait = cv2.imshow, cv2.waitKey
     real_destroy = cv2.destroyAllWindows
     errors = []
@@ -105,6 +106,15 @@ def _run_headless(plan, fake_ink_factory, period_s=0.006):
             return None, None
 
     app_module.neural_module.NeuralSheetDetector = _NoNeuralDetector
+    # O hand masker tambem vaza modelo real: com
+    # models/hand_landmarker.task presente na maquina, o
+    # _PageCleanWorker roda MediaPipe de verdade e a cadencia do
+    # replay (periodo de 6 ms) nao comporta inferencia real — a
+    # geracao de retorno nunca publica canvas e o teste falha por
+    # ambiente, nao por regressao.
+    app_module.hand_module.hand_model_available = (
+        lambda *_args, **_kwargs: False
+    )
     cv2.imshow, cv2.waitKey = spy.imshow, spy.waitKey
     cv2.destroyAllWindows = spy.destroyAllWindows
     try:
@@ -116,6 +126,7 @@ def _run_headless(plan, fake_ink_factory, period_s=0.006):
         app_module._open_capture = real_open
         app_module.page_clean_module.PageCleanInk = real_page_clean
         app_module.neural_module.NeuralSheetDetector = real_neural_detector
+        app_module.hand_module.hand_model_available = real_hand_available
         cv2.imshow, cv2.waitKey = real_imshow, real_wait
         cv2.destroyAllWindows = real_destroy
     return spy, capture, errors, finished

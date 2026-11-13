@@ -3573,6 +3573,53 @@ class _PageCleanWorker:
                 ):
                     identity_deferred = True
                     quarantine_reason = "ecc_rejected"
+                # Pose ainda convergindo (drop->retorno): o quad
+                # re-adquirido chega no meio do pouso e a mascara
+                # comparada em coordenadas transientes condena a
+                # pagina por geometria — medido no sim-lift com a
+                # guarda de cobertura: recall 0,21 -> new_page e
+                # canvas de 4.978 px descartado. A quarentena so faz
+                # sentido quando a pose retornada esta deslocada da
+                # ancora de referencia — a comparacao direta de
+                # mascara nao vale noutra geometria. Pose alinhada a
+                # referencia (retorno realistico, medido no
+                # desk-return) julga na hora, mesmo que tenha se
+                # movido entre passadas: a mascara da passada foi
+                # registrada pelo quad atual e a comparacao segue
+                # valida. Deslocada, adia-se enquanto falta prova de
+                # assentamento (primeira passada da geracao, step
+                # ainda nao medido) ou enquanto a pose ainda se
+                # move — o teto de quarentena garante decisao se
+                # nunca assentar.
+                pose_displaced = False
+                if corners is not None and identity_corners is not None:
+                    pose_displaced = (
+                        float(
+                            np.max(
+                                np.linalg.norm(
+                                    corners - identity_corners, axis=1
+                                )
+                            )
+                        )
+                        > _IDENTITY_WATCH_MAX_STEP_PX
+                    )
+                if (
+                    identity_recovery_requested
+                    and identity_reference is not None
+                    and corners is not None
+                    and pose_displaced
+                    and (
+                        watch_step_px is None
+                        or watch_step_px > _IDENTITY_WATCH_MAX_STEP_PX
+                    )
+                ):
+                    identity_deferred = True
+                    # Razoes mais especificas (oclusao, ECC
+                    # rejeitado) ja registradas vencem: pose_unstable
+                    # preenche so quando a passada nao tinha outro
+                    # motivo de quarentena.
+                    if quarantine_reason is None:
+                        quarantine_reason = "pose_unstable"
                 if identity_deferred:
                     self._identity_defer_count += 1
                     quarantine_frames = self._identity_defer_count
@@ -3594,6 +3641,8 @@ class _PageCleanWorker:
                         identity_decision = "quarantine_timeout"
                     elif quarantine_reason == "ecc_rejected":
                         identity_decision = "deferred_ecc_rejected"
+                    elif quarantine_reason == "pose_unstable":
+                        identity_decision = "deferred_pose_unstable"
                     elif identity_deferred:
                         identity_decision = "deferred_occlusion"
                     elif identity_switch_pending:
