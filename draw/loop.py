@@ -436,15 +436,40 @@ class SheetInkLoop:
             # silhueta da mão). Os dois sinais se somam: basta um
             # dizer "mão" para a passada não enxergar a folha ali.
             seg_hand_warped = self._warp_sheet(self._hand_mask_det, warp_corners)
-            seg_clear = seg_hand_warped == 0
-            visible = seg_clear if visible is None else (visible & seg_clear)
+            if seg_hand_warped is not None:
+                # Margem de ~1,2% da largura da página: o contorno da
+                # mão é uma zona de transição que o segmentador
+                # reparte entre classes — sem ela a aresta da mão vota
+                # como traço (medido: ~15k px de tinta fantasma na
+                # silhueta da borda no sim-hand).
+                margin = max(5, int(round(0.012 * seg_hand_warped.shape[1])))
+                kernel = cv2.getStructuringElement(
+                    cv2.MORPH_ELLIPSE, (2 * margin + 1, 2 * margin + 1)
+                )
+                seg_hand_dil = (
+                    cv2.dilate((seg_hand_warped > 127).astype(np.uint8), kernel) > 0
+                )
+                seg_clear = ~seg_hand_dil
+                visible = seg_clear if visible is None else (visible & seg_clear)
         coverage = self._sheet_coverage_page(warp_corners)
         if coverage is not None:
+            # Fora da folha o warp é preto: a transição
+            # folha->preto é uma aresta artificial que o page_clean
+            # lê como tinta (faixa brilhante medida no warp do
+            # settle). A cor média da própria página preenche o
+            # entorno — o modelo deixa de ver a aresta sintética e
+            # a borda da folha para de votar como traço.
+            ink_submit = ink_warped
+            if coverage.any():
+                ink_submit = ink_warped.copy()
+                ink_submit[~coverage] = (
+                    ink_warped[coverage].mean(axis=0).astype(np.uint8)
+                )
             # Cobertura só sai quando existe: workers e fakes na
             # assinatura antiga (sem o quinto argumento) recebem a
             # chamada de sempre, byte a byte.
             self.ink_worker.submit(
-                ink_warped,
+                ink_submit,
                 self.clean_generation,
                 warp_corners,
                 visible,

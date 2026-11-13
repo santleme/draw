@@ -823,6 +823,17 @@ def _experimental_enabled(name):
 _REMOVAL_LOW_PROB = 0.1
 _REMOVAL_PASSES = 6
 _REMOVAL_RETAINED_FRACTION = 0.65
+# Piso absoluto de testemunho: a fração de 65% veda a remoção quando
+# mais de ~35% do canvas confirmado está velho (cópia defasada após
+# migração de âncora, contorno de mão confirmado) — os próprios pixels
+# errados impedem a testemunha de existir, trava de catch-22 medida no
+# sim-hand (retained 0,33%, canvas congelado com folha limpa à vista).
+# Um modelo que re-testemunha >= piso px do canvas está comprovadamente
+# vendo tinta: a evidência negativa dele é real. O caso que a fração
+# protege (saída do modelo escurecendo por inteiro) continua vedado:
+# modelo escuro não retém piso nenhum. Os pixels fora de vista seguem
+# imunes pela máscara `visible` dentro de `missing`.
+_REMOVAL_WITNESS_FLOOR_PX = 4000
 
 
 # Disciplina de registro (M1, auditoria de 2026-11-10, draw-lab/
@@ -1696,7 +1707,10 @@ class _LayeredInkAccumulator:
             witnessed = False
             if removal_allowed and visible is not None and canvas_before:
                 retained = np.count_nonzero(confirmed_before & visible & mask_now)
-                witnessed = retained >= _REMOVAL_RETAINED_FRACTION * canvas_before
+                witnessed = (
+                    retained >= _REMOVAL_RETAINED_FRACTION * canvas_before
+                    or retained >= _REMOVAL_WITNESS_FLOOR_PX
+                )
             missing = (
                 confirmed_before
                 & visible
