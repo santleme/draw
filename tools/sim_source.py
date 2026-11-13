@@ -67,6 +67,10 @@ class SyntheticCapture:
         sweep_seconds: float = 0,
         grab_hand: bool = False,
         hand_scale: float = 1.0,
+        desk_photo: str | None = None,
+        paper_style: str = "plain",
+        resting_pen: bool = False,
+        stay_out: bool = False,
     ):
         if not math.isfinite(fps) or not 0 < fps <= 120:
             raise ValueError("fps deve estar entre 0 e 120")
@@ -103,8 +107,19 @@ class SyntheticCapture:
         self._completed = 0
         self._rng = gs._scene_rng(seed, "simulator", 0)
         self._background = gs._background(self._rng, "table_wood")
+        if desk_photo is not None:
+            photo = cv2.imread(str(desk_photo))
+            if photo is None:
+                raise ValueError(f"desk_photo ilegível: {desk_photo}")
+            self._background = cv2.resize(photo, (gs.SIZE, gs.SIZE))
         self._paper, self.pw, self.ph = gs._paper_base(self._rng, "white", size_idx=0)
         self._paper_pristine = self._paper.copy()
+        if paper_style == "ruled":
+            _apply_ruled(self._paper, self.pw, self.ph)
+            _apply_ruled(self._paper_pristine, self.pw, self.ph)
+        if resting_pen:
+            _apply_resting_pen(self._paper, self.pw, self.ph)
+            _apply_resting_pen(self._paper_pristine, self.pw, self.ph)
         self.specs = plan_text_strokes(text, self._rng, self.pw, self.ph, height=height)
         self.quad = gs._sample_normal_quad(self._rng, self.pw, self.ph)
         # O gerador de treino admite folha cortada. A câmera inicial do
@@ -208,6 +223,8 @@ class SyntheticCapture:
                 raise ValueError("return_pose exige lift")
             if len(return_pose) != 3 or not all(math.isfinite(v) for v in return_pose):
                 raise ValueError("return_pose espera (dx, dy, graus) finitos na cena")
+        if stay_out and (lift is None or return_pose is not None):
+            raise ValueError("stay_out exige lift sem return_pose")
 
         # Linha do tempo em fases; sem cenário é exatamente
         # warmup → escrita → settle, como sempre foi.
@@ -287,13 +304,14 @@ class SyntheticCapture:
                     [[math.cos(rad), -math.sin(rad)], [math.sin(rad), math.cos(rad)]]
                 )
                 quad_return = (target - center) @ rot.T + center
-            push(
-                "return",
-                max(1, math.ceil(return_seconds * fps)),
-                quad_from=lift_off,
-                quad_to=quad_return,
-                grab_at=grab,
-            )
+            if not stay_out:
+                push(
+                    "return",
+                    max(1, math.ceil(return_seconds * fps)),
+                    quad_from=lift_off,
+                    quad_to=quad_return,
+                    grab_at=grab,
+                )
         push("settle", max(1, math.ceil(settle_seconds * fps)))
         self.frame_count = start
         self._phase_ends = np.array([p["end"] for p in self.phases])
@@ -614,6 +632,39 @@ def _eraser_sprite():
     return rgb, mask, cov
 
 
+def _apply_ruled(paper, pw, ph):
+    """Pauta de caderno na textura da página (RGB, nunca GT de tinta):
+    linhas horizontais azul-acinzentadas + margem esquerda, como a
+    folha real que a mesa mostrou."""
+    spacing = max(20, ph // 46)
+    for y in range(spacing * 2, ph - spacing // 2, spacing):
+        cv2.line(paper, (0, y), (pw, y), (170, 160, 150), 1, cv2.LINE_AA)
+    cv2.line(
+        paper, (pw // 16, 0), (pw // 16, ph), (150, 110, 110), 2, cv2.LINE_AA
+    )
+
+
+def _apply_resting_pen(paper, pw, ph):
+    """Caneta esferográfica deitada em diagonal sobre a página —
+    o falso positivo medido na mesa real: objeto em cima da folha
+    que não é tinta nem mão."""
+    cx, cy = int(pw * 0.58), int(ph * 0.35)
+    length, radius = int(ph * 0.28), max(4, pw // 130)
+    a, b = (cx - length // 3, cy + length // 2), (cx + length // 2, cy - length // 3)
+    cv2.line(paper, a, b, (60, 60, 70), radius * 2 + 2, cv2.LINE_AA)
+    cv2.line(paper, a, b, (175, 180, 195), radius * 2, cv2.LINE_AA)
+    tip = (a[0] - radius, a[1] + radius)
+    cv2.line(paper, a, tip, (40, 40, 45), radius, cv2.LINE_AA)
+    cv2.line(
+        paper,
+        (b[0] - radius, b[1] + radius),
+        (b[0] + radius // 2, b[1] - radius // 2),
+        (90, 90, 200),
+        radius,
+        cv2.LINE_AA,
+    )
+
+
 def export_video(capture: SyntheticCapture, output: str | Path) -> dict:
     """Grava a fonte do início ao EOF, mais GT e manifesto ao lado do MP4."""
     output = Path(output)
@@ -739,6 +790,28 @@ def main(argv=None):
         help="mão segura a folha durante move/lift/return",
     )
     parser.add_argument(
+        "--desk-photo",
+        type=Path,
+        default=None,
+        help="foto real de mesa como fundo (substitui o procedural)",
+    )
+    parser.add_argument(
+        "--paper-style",
+        choices=("plain", "ruled"),
+        default="plain",
+        help="ruled = pauta de caderno na textura da página",
+    )
+    parser.add_argument(
+        "--resting-pen",
+        action="store_true",
+        help="caneta deitada sobre a folha (prop, não tinta)",
+    )
+    parser.add_argument(
+        "--stay-out",
+        action="store_true",
+        help="lift sem return: a folha sai e não volta (mesa fica)",
+    )
+    parser.add_argument(
         "--hand-scale",
         type=float,
         default=1.0,
@@ -785,6 +858,10 @@ def main(argv=None):
             sweep_seconds=args.sweep_seconds,
             grab_hand=args.grab_hand,
             hand_scale=args.hand_scale,
+            desk_photo=args.desk_photo,
+            paper_style=args.paper_style,
+            resting_pen=args.resting_pen,
+            stay_out=args.stay_out,
         )
         manifest = export_video(capture, args.out)
     except (ValueError, RuntimeError, OSError, cv2.error) as error:
