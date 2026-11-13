@@ -278,3 +278,152 @@ def test_freihand_variants_stay_in_the_same_split():
             source_id = f"{base + variant * gs.FREIHAND_BASE_HAND_COUNT:08d}"
             assert source_id in variant_splits[next(iter(destinations))]
         assert base_id in base_splits[next(iter(destinations))]
+
+
+def test_clipped_sheet_placement_exits_frame():
+    """clipped_sheet: o quad sai do frame por exatamente uma borda,
+    5-40% da caixa fora — o regime ausente entre "inteira" e a lasca
+    de sheet_out (gap medido do detector, 2026-11-12)."""
+    from tools.gen_synthetic import _sample_clipped_quad
+
+    rng = np.random.default_rng(0)
+    edges_seen = set()
+    for _ in range(60):
+        quad, edge, frac = _sample_clipped_quad(rng, 500, 700)
+        assert edge in (0, 1, 2, 3)
+        assert 0.05 <= frac <= 0.40
+        edges_seen.add(edge)
+        lo, hi = quad.min(axis=0), quad.max(axis=0)
+        # sai pela borda sorteada (bordas adjacentes podem clipar
+        # junto — canto de folha fora do quadro é caso real)
+        if edge == 0:
+            assert lo[0] < 0
+        elif edge == 1:
+            assert hi[0] > gs.SIZE
+        elif edge == 2:
+            assert lo[1] < 0
+        else:
+            assert hi[1] > gs.SIZE
+        # e continua majoritariamente visível (não é lasca)
+        inside = np.minimum(hi, gs.SIZE) - np.maximum(lo, 0)
+        visible = np.clip(inside / np.maximum(hi - lo, 1), 0, 1).prod()
+        assert visible > 0.35
+    assert len(edges_seen) == 4
+
+
+def test_clipped_and_rotated_scene_types():
+    """Os dois scene_types novos compõem cena normalmente: classes
+    válidas, folha presente e sheet_clip registrado no info."""
+    clipped = gs.compose_scene(5, "train", 0, "clipped_sheet", hand=_hand())
+    assert set(np.unique(clipped["mask"]).tolist()) <= {0, 1, 2, 3, 255}
+    assert clipped["info"]["sheet_clip"] is not None
+    rotated = gs.compose_scene(6, "train", 0, "rotated_sheet", hand=_hand())
+    assert set(np.unique(rotated["mask"]).tolist()) <= {0, 1, 2, 3, 255}
+    # determinismo dos tipos novos
+    b = gs.compose_scene(6, "train", 0, "rotated_sheet", hand=_hand())
+    assert np.array_equal(rotated["rgb"], b["rgb"])
+
+
+def test_generate_dataset_clip_rotation_fractions(tmp_path):
+    """Frações ligadas produzem os scene_types novos no manifesto e
+    registram a dieta; desligadas, o comportamento é o histórico."""
+    manifest = gs.generate_dataset(
+        tmp_path / "ds",
+        seed=1,
+        counts={"train": 40, "val": 4, "test": 4},
+        clip_fraction=0.5,
+        rotation_fraction=0.5,
+    )
+    kinds = [s["scene_type"] for s in manifest["scenes"]]
+    assert "clipped_sheet" in kinds
+    assert "rotated_sheet" in kinds
+    assert manifest["diet"]["clip_fraction"] == 0.5
+    assert manifest["diet"]["rotation_fraction"] == 0.5
+    assert manifest["diet"]["rotation_max_deg"] == 40.0
+    clips = [
+        s["sheet_clip"]
+        for s in manifest["scenes"]
+        if s["scene_type"] == "clipped_sheet"
+    ]
+    assert all(c["edges"] and 0 < c["clip_fraction"] for c in clips)
+
+
+def test_generate_dataset_fractions_validation(tmp_path):
+    with pytest.raises(ValueError):
+        gs.generate_dataset(tmp_path / "a", clip_fraction=1.5)
+    with pytest.raises(ValueError):
+        gs.generate_dataset(tmp_path / "b", rotation_fraction=-0.1)
+    with pytest.raises(ValueError):
+        gs.generate_dataset(tmp_path / "c", rotation_max=120)
+
+
+def test_rotated_sheet_beyond_legacy_ceiling():
+    """rotated_sheet: amostra ALÉM do ±18° histórico — toda a faixa
+    é (18, rotation_max] (bancada lift & return)."""
+    from tools.gen_synthetic import _sample_wide_rotation_quad
+
+    rng = np.random.default_rng(1)
+    for _ in range(80):
+        quad = _sample_wide_rotation_quad(rng, 500, 700, 40.0)
+        top = quad[1] - quad[0]
+        deg = abs(np.degrees(np.arctan2(top[1], top[0])))
+        assert deg > 18, f"{deg:.1f}° dentro do envelope legado"
+        assert deg <= 40.0 + 1e-6
+
+
+def test_rotated_sheet_rotation_max_below_ceiling():
+    """rotation_max <= 18 não tem faixa "além" — cai no uniforme
+    cheio (documentado; validado em (0, 90])."""
+    from tools.gen_synthetic import _sample_wide_rotation_quad
+
+    rng = np.random.default_rng(2)
+    for _ in range(40):
+        quad = _sample_wide_rotation_quad(rng, 500, 700, 15.0)
+        top = quad[1] - quad[0]
+        deg = abs(np.degrees(np.arctan2(top[1], top[0])))
+        assert deg <= 15.0 + 1e-6
+
+
+def test_clipped_quad_composes_scale_and_wide_rotation():
+    """Clipe + rotação ampla são ortogonais: o quad clipado sai pela
+    borda sorteada E vem na faixa além de ±18°, e o amostrador de
+    escala decide o tamanho (loguniform produz folhas pequenas)."""
+    from tools.gen_synthetic import _sample_clipped_quad
+
+    # rotação ampla na base do clipe
+    rng = np.random.default_rng(3)
+    for _ in range(60):
+        quad, edge, frac = _sample_clipped_quad(rng, 500, 700, "legacy", 18.0, 40.0)
+        # o ângulo original pode ser medido na aresta "topo" do quad —
+        # após o deslocamento o ângulo se preserva (translação pura)
+        top = quad[1] - quad[0]
+        deg = abs(np.degrees(np.arctan2(top[1], top[0])))
+        assert deg > 18 or deg > 162, f"{deg:.1f}° fora da faixa ampla"
+
+    # escala loguniforme compõe com o clipe
+    rng = np.random.default_rng(4)
+    small_seen = False
+    for _ in range(80):
+        quad, edge, frac = _sample_clipped_quad(rng, 500, 700, "loguniform")
+        lo, hi = quad.min(axis=0), quad.max(axis=0)
+        if (hi[0] - lo[0]) * (hi[1] - lo[1]) < 0.30 * gs.SIZE * gs.SIZE:
+            small_seen = True
+            break
+    assert small_seen, "loguniform nunca produziu folha pequena clipada"
+
+
+def test_clip_and_rotation_independent_rolls(tmp_path):
+    """clip_fraction=1 e rotation_fraction=1: o sorteio de rotação
+    não encolhe atrás do clipe — o clipe já sai na faixa ampla."""
+    from tools.gen_synthetic import _sample_clipped_quad
+
+    # composição direta: os dois hits viram clipped_wide
+    rng = np.random.default_rng(5)
+    wide_seen = False
+    for _ in range(40):
+        quad, edge, frac = _sample_clipped_quad(rng, 500, 700, "legacy", 18.0, 40.0)
+        top = quad[1] - quad[0]
+        deg = abs(np.degrees(np.arctan2(top[1], top[0])))
+        if deg > 25:
+            wide_seen = True
+    assert wide_seen

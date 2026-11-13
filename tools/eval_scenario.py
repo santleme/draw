@@ -189,7 +189,9 @@ def audit(video, gt_path, *, fps=None, models=(), save_masks=None):
                 str(save_masks / f"confirmed_{phase['kind']}_{frame}.png"),
                 (np.asarray(snap["confirmed"]) > 0).astype(np.uint8) * 255,
             )
-        moved = any(p["kind"] == "move" and p["end"] <= phase["end"] for p in events)
+        moved = any(
+            p["kind"] in ("move", "return") and p["end"] <= phase["end"] for p in events
+        )
         page_to_scene = (
             bundle["page_to_scene_final"] if moved else bundle["page_to_scene"]
         )
