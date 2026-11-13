@@ -645,6 +645,24 @@ def _ecc_refinement_enabled():
     return value in {"1", "true", "yes", "on"}
 
 
+_IDENTITY_ECC_ALIGN_ENV = "DRAW_IDENTITY_ECC_ALIGN"
+# Resgate de identidade por conteúdo (medido no sim-lift,
+# 2026-11-14): a folha volta numa pose em que o detector erra um
+# canto (fora do frame) — o quad detectado mapeia a página com uma
+# distorção projetiva de ~90-120 px na grade 850x1200 e a
+# comparação direta de máscara mede recall ~0,21 sobre o MESMO
+# texto. O ECC entre a referência e a candidata recupera a
+# homografia residual: sem teto de 55 px do refine de tinta, mas
+# com margem própria — quad projetado fora da página ou homografia
+# degenerada não convence.
+_IDENTITY_ECC_ALIGN_MIN_PX = 64
+
+
+def _identity_ecc_align_enabled():
+    value = os.environ.get(_IDENTITY_ECC_ALIGN_ENV, "0").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
 _IDENTITY_CHAMFER_ENV = "DRAW_IDENTITY_CHAMFER"
 _IDENTITY_CHAMFER_RADII = (2, 4, 8, 16)
 
@@ -1137,6 +1155,252 @@ def _refine_ink_ecc(reference, observed, hand_mask=None):
         borderValue=0.0,
     )
     return finish(aligned, align)
+
+
+def _mask_moments(mask):
+    """Centroide e eixo principal dos pixels de tinta (PCA mod 180)."""
+    ys, xs = np.nonzero(mask)
+    if len(xs) < _IDENTITY_ECC_ALIGN_MIN_PX:
+        return None
+    pts = np.stack((xs, ys), axis=1).astype(np.float64)
+    centroid = pts.mean(axis=0)
+    cov = (pts - centroid).T @ (pts - centroid) / len(pts)
+    _eigvals, eigvecs = np.linalg.eigh(cov)
+    principal = eigvecs[:, 1]
+    angle = float(np.arctan2(principal[1], principal[0]))
+    return centroid, angle
+
+
+def _largest_component_mask(mask):
+    """Binaria do maior componente conexo, ou None sem massa minima."""
+    n, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+        mask.astype(np.uint8), 8
+    )
+    if n < 2:
+        return None
+    largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    if stats[largest, cv2.CC_STAT_AREA] < _IDENTITY_ECC_ALIGN_MIN_PX:
+        return None
+    return labels == largest
+
+
+def _align_identity_masks(reference, candidate):
+    """Alinha a candidata à referência por conteúdo.
+
+    Uso exclusivo do juiz de identidade: a referência vive na grade
+    da âncora antiga e a candidata na da nova — quando o quad
+    re-adquirido distorce o mapeamento (canto fora do frame), a
+    mesma tinta cai deslocada e a comparação direta condena a
+    página. Medido no sim-lift: o resíduo é projetivo — escala
+    ~1,4x, rotação ~29° e keystone num lado — e o ECC sem semente
+    dobra ou para em mínimo local. A similaridade de momentos
+    (escala pela raiz da razão de área, ângulo pelo eixo
+    principal, translação pelo centroide) aproxima o bastante para
+    o ECC homografia polir sem divergir. Sementes competem pelo
+    recall dilatado: a máscara inteira e o maior componente, cada
+    uma nas quatro rotações do eixo (PCA é mod 180° e o sinal do
+    autovetor é arbitrário); grade grossa cobre o caso sem eixo
+    confiável. Retorna (prob alinhada, info); `align_converged`
+    False mantém a candidata original — nunca piora a comparação.
+    """
+    info = {
+        "align_converged": False,
+        "align_mode": "bypass",
+        "align_cc": 0.0,
+        "align_displacement": 0.0,
+    }
+    ref = np.asarray(reference, dtype=np.float32)
+    cand = np.asarray(candidate, dtype=np.float32)
+    if (
+        ref.shape != cand.shape
+        or not np.isfinite(ref).all()
+        or not np.isfinite(cand).all()
+    ):
+        return candidate, info
+    ref_bin = ref > 0.5
+    cand_bin = cand > 0.5
+    m_ref = _mask_moments(ref_bin)
+    m_cand = _mask_moments(cand_bin)
+    if m_ref is None or m_cand is None:
+        return candidate, info
+    height, width = ref.shape
+    (c_ref, a_ref), (c_cand, a_cand) = m_ref, m_cand
+    scale = float(np.sqrt(ref_bin.sum() / cand_bin.sum()))
+    if not np.isfinite(scale) or not 0.2 <= scale <= 5.0:
+        return candidate, info
+    kernel = np.ones((_IDENTITY_DILATION_KERNEL,) * 2, np.uint8)
+
+    # O eixo principal tem ambiguidade de sinal (o autovetor do
+    # eigh sai com sinal arbitrario — muda entre processos) e de
+    # perpendicular (covariancia quase isotropica troca os eixos):
+    # as quatro rotacoes do eixo cobrem os dois casos. Duas
+    # familias de semente: a mascara inteira e o componente
+    # dominante — no sim-lift a referencia carrega marcas
+    # espalhadas que deslocam o centroide global e so o
+    # componente (o texto) mede a pose certa. Se nenhuma pontua,
+    # a grade grossa varre o circulo — cada hipotese e so
+    # warp+contagem.
+    seeds = []  # (theta, scale, c_ref, c_cand, tag)
+    for step in (0.0, np.pi / 2, np.pi, -np.pi / 2):
+        seeds.append(
+            (
+                a_ref - a_cand + step,
+                scale,
+                c_ref,
+                c_cand,
+                f"moments:{int(np.degrees(step))}",
+            )
+        )
+    comp_ref = _largest_component_mask(ref_bin)
+    comp_cand = _largest_component_mask(cand_bin)
+    if comp_ref is not None and comp_cand is not None:
+        m2_ref = _mask_moments(comp_ref)
+        m2_cand = _mask_moments(comp_cand)
+        if m2_ref is not None and m2_cand is not None:
+            (c2_ref, a2_ref), (c2_cand, a2_cand) = m2_ref, m2_cand
+            scale2 = float(np.sqrt(comp_ref.sum() / comp_cand.sum()))
+            if np.isfinite(scale2) and 0.2 <= scale2 <= 5.0:
+                for step in (0.0, np.pi / 2, np.pi, -np.pi / 2):
+                    seeds.append(
+                        (
+                            a2_ref - a2_cand + step,
+                            scale2,
+                            c2_ref,
+                            c2_cand,
+                            f"comp:{int(np.degrees(step))}",
+                        )
+                    )
+    coarse = [
+        (np.radians(step), f"grid:{step}")
+        for step in range(0, 360, 15)
+    ]
+
+    def score(theta, scl, ctr_ref, ctr_cand):
+        # O warpAffine interpreta M como mapa DIRETO src->dst
+        # (inverte internamente para amostrar): passa-se o
+        # cand->ref forward, x_ref = s * R(theta) * x_cand + t.
+        cos_t, sin_t = np.cos(theta), np.sin(theta)
+        warp_linear = scl * np.array(
+            [[cos_t, -sin_t], [sin_t, cos_t]], dtype=np.float64
+        )
+        warp_t = ctr_ref - warp_linear @ ctr_cand
+        warp = np.hstack((warp_linear, warp_t.reshape(2, 1)))
+        if not np.isfinite(warp).all():
+            return None, None, 0.0
+        aligned = cv2.warpAffine(
+            cand, warp, (width, height), flags=cv2.INTER_LINEAR,
+            borderValue=0.0,
+        )
+        seen_d = (
+            cv2.dilate((aligned > 0.5).astype(np.uint8), kernel) > 0
+        )
+        return aligned, warp, float(
+            np.count_nonzero(ref_bin & seen_d) / ref_bin.sum()
+        )
+
+    # A distorcao real e projetiva (keystone num lado — canto do
+    # quad errado): a similaridade para no teto dela (~0,53
+    # medido) e cada hipotese precisa do polimento ECC pra chegar
+    # no teto da homografia. O ECC tambem e sensivel a semente —
+    # as quatro sementes de momento cobrem o circulo a cada 90°,
+    # dentro da bacia que ele alcanca (~±40°).
+    half = (width // 2, height // 2)
+    if min(half) >= 2:
+        ref_half = cv2.GaussianBlur(
+            cv2.resize(ref, half, interpolation=cv2.INTER_AREA),
+            (5, 5), 0,
+        )
+        cand_half = cv2.GaussianBlur(
+            cv2.resize(cand, half, interpolation=cv2.INTER_AREA),
+            (5, 5), 0,
+        )
+        down = np.diag((half[0] / width, half[1] / height, 1.0))
+        inv_down = np.linalg.inv(down)
+
+        def polish(warp, tag):
+            # O ECC estima W: template(ref) -> input(cand). A
+            # semente e a inversa do forward cand->ref, reescalada
+            # para meia resolucao; a volta entra invertida no
+            # warpPerspective, que espera o forward.
+            try:
+                seed = (
+                    down
+                    @ np.linalg.inv(
+                        np.vstack((warp, [0.0, 0.0, 1.0]))
+                    )
+                    @ inv_down
+                ).astype(np.float32)
+                _cc, refined = cv2.findTransformECC(
+                    ref_half, cand_half, seed, cv2.MOTION_HOMOGRAPHY,
+                    (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+                     200, 1e-6),
+                    None, 5,
+                )
+                warp_p = np.linalg.inv(
+                    inv_down @ np.asarray(refined, np.float64) @ down
+                )
+            except (cv2.error, np.linalg.LinAlgError):
+                return None
+            if (
+                not np.isfinite(warp_p).all()
+                or np.linalg.det(warp_p[:2, :2]) <= 1e-4
+                or abs(warp_p[2, 2]) <= 1e-9
+            ):
+                return None
+            aligned_p = cv2.warpPerspective(
+                cand, warp_p, (width, height),
+                flags=cv2.INTER_LINEAR, borderValue=0.0,
+            )
+            seen_p = (
+                cv2.dilate((aligned_p > 0.5).astype(np.uint8), kernel)
+                > 0
+            )
+            recall_p = float(
+                np.count_nonzero(ref_bin & seen_p) / ref_bin.sum()
+            )
+            return recall_p, f"{tag}+ecc", aligned_p
+
+    scored = []  # (recall, mode, aligned, warp)
+    for theta, scl, ctr_ref, ctr_cand, tag in seeds:
+        aligned, warp, recall = score(theta, scl, ctr_ref, ctr_cand)
+        if aligned is not None:
+            scored.append((recall, tag, aligned, warp))
+    scored.sort(key=lambda entry: entry[0], reverse=True)
+    best = None  # (recall, mode, aligned)
+    for recall, tag, aligned, _warp in scored:
+        if best is None or recall > best[0]:
+            best = (recall, tag, aligned)
+    # Polimento so nas melhores sementes: cada ECC e o trecho
+    # caro do resgate e a bacia certa ja aparece na pontuacao da
+    # similaridade.
+    for recall, tag, _aligned, warp in scored[:3]:
+        if min(half) >= 2:
+            polished = polish(warp, tag)
+            if polished is not None and polished[0] > best[0]:
+                best = polished
+    if best is None or best[0] < 0.35:
+        grid_best = None  # (recall, mode, aligned, warp)
+        for theta, tag in coarse:
+            aligned, warp, recall = score(
+                theta, scale, c_ref, c_cand
+            )
+            if aligned is None:
+                continue
+            if best is None or recall > best[0]:
+                best = (recall, tag, aligned)
+            if grid_best is None or recall > grid_best[0]:
+                grid_best = (recall, tag, aligned, warp)
+        if grid_best is not None and min(half) >= 2:
+            polished = polish(grid_best[3], grid_best[1])
+            if polished is not None and polished[0] > best[0]:
+                best = polished
+    if best is None:
+        info["align_mode"] = "rejected"
+        return candidate, info
+    info["align_converged"] = True
+    info["align_mode"] = best[1]
+    info["align_cc"] = best[0]
+    return best[2], info
 
 
 def _register_ink_probability(prob, anchor, corners, reference, visible=None):
@@ -3268,6 +3532,7 @@ class _PageCleanWorker:
         identity_deferred = False
         identity_timed_out = False
         identity_switch_pending = False
+        identity_align_info = None
         quarantine_reason = None
         quarantine_frames = 0
         ecc_refine_enabled = int(_ecc_refinement_enabled())
@@ -3566,6 +3831,70 @@ class _PageCleanWorker:
                                 and identity_containment
                                 >= _PAGE_IDENTITY_MIN_CONTAINMENT
                             )
+                # Resgate por conteúdo (DRAW_IDENTITY_ECC_ALIGN):
+                # a comparação direta falhou mas a distorção pode
+                # ser só a geometria do quad re-adquirido — medido
+                # no sim-lift: mesmo texto, canto fora do frame,
+                # recall 0,21. O ECC alinha a candidata à grade da
+                # referência e os mesmos limiares rejulgam; página
+                # nova de verdade não alinha o suficiente para
+                # passar. Só socorre: nunca rebaixa uma decisão que
+                # já era keep.
+                if (
+                    not keep_page
+                    and not identity_deferred
+                    and identity_reference is not None
+                    and prior is not None
+                    and prior_px is not None
+                    and prior_px > 0
+                    and _identity_ecc_align_enabled()
+                ):
+                    # O alvo do registro e a referencia que o juiz
+                    # mede: com mascara de visibilidade, so a parte
+                    # visivel; sem ela, a referencia inteira.
+                    if identity_visible is not None:
+                        align_target = np.where(
+                            prior_visible, prior, 0.0
+                        )
+                    else:
+                        align_target = prior
+                    candidate_aligned, identity_align_info = (
+                        _align_identity_masks(align_target, candidate)
+                    )
+                    if identity_align_info["align_converged"]:
+                        seen_a = (
+                            candidate_aligned > self._accumulator.threshold
+                        )
+                        seen_ad = (
+                            cv2.dilate(seen_a.astype(np.uint8), kernel)
+                            > 0
+                        )
+                        seen_a_px = int(np.count_nonzero(seen_a))
+                        if identity_visible is not None:
+                            recall_a = (
+                                np.count_nonzero(prior_visible & seen_ad)
+                                / prior_visible_px
+                            )
+                        else:
+                            recall_a = (
+                                np.count_nonzero(prior & seen_ad) / prior_px
+                            )
+                        contain_a = (
+                            0.0
+                            if seen_a_px == 0
+                            else np.count_nonzero(seen_a & prior_d)
+                            / seen_a_px
+                        )
+                        if (
+                            recall_a >= _PAGE_IDENTITY_MIN_RECALL
+                            and contain_a >= _PAGE_IDENTITY_MIN_CONTAINMENT
+                        ):
+                            candidate = candidate_aligned
+                            seen = seen_a
+                            seen_d = seen_ad
+                            identity_recall = recall_a
+                            identity_containment = contain_a
+                            keep_page = True
                 if (
                     identity_reference is not None
                     and ecc_refine_enabled
@@ -3677,6 +4006,7 @@ class _PageCleanWorker:
                             "containment_threshold": (_PAGE_IDENTITY_MIN_CONTAINMENT),
                             **ecc_info,
                             **identity_chamfer,
+                            **(identity_align_info or {}),
                             "ecc_refine_enabled": ecc_refine_enabled,
                             "quarantine_reason": quarantine_reason,
                             "quarantine_frames": quarantine_frames,

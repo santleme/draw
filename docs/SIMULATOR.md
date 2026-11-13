@@ -267,11 +267,18 @@ fração alta (neural) E luma de papel — o falso quad da mesa mede
 ~110 contra ~237 da folha real. Medido: âncora cai ~f75, 91 falsas
 aquisições vetadas, crescimento de tinta pós-saída = zero; retorno
 realista (`desk-return`, mesma pose) re-registra normal (17/17
-traços, recall 0,98). Caso-borda em aberto: retorno com rotação
-forte/parte fora do frame (`sim-lift`) — a âncora re-adquirida
-mapeia a página com escala+translação diferentes e o juiz de
-identidade decide `new_page`; precisa de comparação registrada
-por conteúdo (próxima frente).
+traços, recall 0,98). O retorno extremo (`sim-lift`, rotação
+forte + canto fora do frame) expôs a lacuna seguinte: a âncora
+re-adquirida mapeia a página com escala+translação+keystone
+diferentes — mesmo texto, recall direto 0,21 → `new_page` e
+canvas descartado. O resgate `DRAW_IDENTITY_ECC_ALIGN` alinha a
+candidata à referência por conteúdo antes dos mesmos limiares:
+sementes de similaridade por momentos (máscara inteira e maior
+componente, quatro rotações do eixo PCA) polidas por ECC
+homografia; medido no `sim-lift` — `deferred_pose_unstable` na
+primeira passada e `same_page` na seguinte (recall 0,78 /
+containment 0,52), canvas preservado. Flag opt-in como a guarda:
+o caminho default segue sem registro por conteúdo.
 
 As três flags do meio são da rodada do gargalo de registro instável:
 o portão de movimento só barra confirmação nova (a passada segue

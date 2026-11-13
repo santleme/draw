@@ -442,3 +442,84 @@ def test_new_generation_resets_quarantine_count(worker, preserve):
     assert worker._identity_defer_count == 0
     if preserve:
         assert last_event(worker)["decision"] == "same_page"
+
+
+def _strokes(shape):
+    import cv2
+
+    prob = np.zeros(shape, np.float32)
+    h, w = shape
+    for (y0, x0, y1, x1) in (
+        (0.15, 0.10, 0.45, 0.13),
+        (0.20, 0.18, 0.50, 0.22),
+        (0.18, 0.30, 0.46, 0.34),
+        (0.25, 0.40, 0.52, 0.45),
+        (0.14, 0.52, 0.48, 0.58),
+        (0.30, 0.62, 0.55, 0.70),
+    ):
+        cv2.line(
+            prob,
+            (int(x0 * w), int(y0 * h)),
+            (int(x1 * w), int(y1 * h)),
+            1.0,
+            3,
+        )
+    return prob
+
+
+def test_align_identity_masks_recovers_page_space_warp():
+    """Mesma tinta noutra grade de pagina volta a casar com a referencia."""
+    cv2 = pytest.importorskip("cv2")
+
+    shape = (400, 300)
+    ref = _strokes(shape)
+    # A tinta re-registrada pelo quad re-adquirido: mesma escrita
+    # sob escala + rotacao + translacao + keystone leve — o caso
+    # medido no sim-lift, em que a comparacao direta mede ~0,2.
+    src = np.float32(
+        [[0, 0], [300, 0], [300, 400], [0, 400]]
+    )
+    angle = np.radians(20)
+    rot = np.array(
+        [[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]],
+        np.float32,
+    )
+    center = np.float32([150, 200])
+    dst = (src - center) @ rot.T * 0.7 + center + np.float32([35, -20])
+    dst += np.float32([[0, 0], [8, -4], [-6, 10], [0, 0]])  # keystone
+    cand = cv2.warpPerspective(
+        ref,
+        cv2.getPerspectiveTransform(src, dst),
+        (shape[1], shape[0]),
+        flags=cv2.INTER_LINEAR,
+        borderValue=0.0,
+    )
+    prior = ref > 0.5
+    direct = np.count_nonzero(prior & (cand > 0.5)) / prior.sum()
+    assert direct < 0.55
+
+    aligned, info = ink._align_identity_masks(ref, cand)
+    assert info["align_converged"]
+    kernel = np.ones((ink._IDENTITY_DILATION_KERNEL,) * 2, np.uint8)
+    seen = aligned > 0.5
+    seen_d = cv2.dilate(seen.astype(np.uint8), kernel) > 0
+    recall = np.count_nonzero(prior & seen_d) / prior.sum()
+    assert recall >= ink._PAGE_IDENTITY_MIN_RECALL
+
+
+def test_align_identity_masks_does_not_forge_other_page():
+    """Conteudo sem correspondencia nao cruza o limiar do juiz."""
+    cv2 = pytest.importorskip("cv2")
+
+    shape = (400, 300)
+    ref = _strokes(shape)
+    other = np.zeros(shape, np.float32)
+    cv2.circle(other, (220, 250), 60, 1.0, 4)
+    cv2.line(other, (40, 320), (260, 60), 1.0, 3)
+
+    aligned, _info = ink._align_identity_masks(ref, other)
+    kernel = np.ones((ink._IDENTITY_DILATION_KERNEL,) * 2, np.uint8)
+    seen = aligned > 0.5
+    seen_d = cv2.dilate(seen.astype(np.uint8), kernel) > 0
+    recall = np.count_nonzero((ref > 0.5) & seen_d) / (ref > 0.5).sum()
+    assert recall < ink._PAGE_IDENTITY_MIN_RECALL
