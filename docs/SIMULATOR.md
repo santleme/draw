@@ -226,6 +226,31 @@ python tools/sim_source.py --text "draw hand" --fps 15 \
   detector: clipe ~7-9% nas laterais/topo e cego acima de ~15°.
   A fração zero preserva o comportamento histórico byte a byte.
 
+### Conjunto de flags validado na bancada do t16 (2026-11-13)
+
+Com o modelo t16 (`5e2c611f`) instalado no slot padrão, a rodada
+completa dos 8 cenários mediu o conjunto abaixo — as duas últimas
+são da maquinaria de âncora (fretes 19/34) e destravam o realinh-
+mento no pouso; sem elas a cópia deslocada confirmava no move:
+
+```sh
+DRAW_INK_FOLLOW_MOVE=1
+DRAW_SHEET_COVERAGE=1
+DRAW_CANVAS_PERSIST=1
+DRAW_INK_SKIP_STALE=1
+DRAW_INK_REMOVAL=1
+DRAW_SEG_HAND_OCCLUSION=1   # classe mão do seg vira 2º sinal de oclusão
+DRAW_ANCHOR_ARBITRATION=1   # veredito por conteúdo no assentamento
+DRAW_ANCHOR_FOLLOW=1        # re-âncora por divergência assentada
+```
+
+Medições do mesmo conjunto: `sim-hand` IoU 0,495 (era `no_canvas`
+no modelo anterior), `sim-e3` 0,501, `sim-e3-nomove` 0,853,
+lift/return 0,86-0,87, `sim`/`sim-long` 0,85-0,87, redraw recall
+0,98-0,99. Reprovado e revertido: `DRAW_ANCHOR_MOTION_ABSTAIN`
+(abster durante divergência quad/âncora mata o voto do retorno —
+lift conf 4,9k → 0).
+
 A auditoria por fase trata `return` como o `move`: checkpoints após o
 retorno pontuam contra `page_to_scene_final`. Checkpoints de `absent`
 sem âncora/canvas registram status em vez de métrica — e o veredito
