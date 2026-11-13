@@ -63,6 +63,10 @@ class SyntheticCapture:
         absent_seconds: float = 2.0,
         lift_seconds: float = 0.5,
         return_seconds: float = 0.5,
+        rest_hand_seconds: float = 0,
+        sweep_seconds: float = 0,
+        grab_hand: bool = False,
+        hand_scale: float = 1.0,
     ):
         if not math.isfinite(fps) or not 0 < fps <= 120:
             raise ValueError("fps deve estar entre 0 e 120")
@@ -83,9 +87,13 @@ class SyntheticCapture:
             ("absent_seconds", absent_seconds),
             ("lift_seconds", lift_seconds),
             ("return_seconds", return_seconds),
+            ("rest_hand_seconds", rest_hand_seconds),
+            ("sweep_seconds", sweep_seconds),
         ):
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} deve ser finito e não negativo")
+        if not math.isfinite(hand_scale) or not 0 < hand_scale <= 4:
+            raise ValueError("hand_scale deve ser positivo, finito e <= 4")
         self.fps = float(fps)
         self.seed, self.text = seed, text
         self.realtime = realtime
@@ -140,6 +148,20 @@ class SyntheticCapture:
         self.stroke_phase = np.array(
             [0] * len(self.specs) + [1] * len(self.redraw_specs), dtype=np.int32
         )
+        # Âncoras da mão em espaço de página (px), calculadas sobre
+        # TODA a tinta — escrita + redesenho: depois do apagar, a
+        # tinta nova é o que a palma e o sweep precisam cobrir
+        # (Devin Review, 2026-11-12).
+        if self.specs_all:
+            all_pts = np.concatenate([s[3] for s in self.specs_all])
+            lo, hi = all_pts.min(axis=0), all_pts.max(axis=0)
+        else:
+            lo = hi = np.float32([self.pw / 2, self.ph / 2])
+        self._palm_at = ((lo + hi) / 2).astype(np.float32)
+        self._sweep_from = np.float32([lo[0] - 80, self._palm_at[1]])
+        self._sweep_to = np.float32([hi[0] + 80, self._palm_at[1]])
+        self._grab_at = np.float32([self.pw * 0.5, self.ph * 0.8])
+        self._grab_hand = bool(grab_hand)
         move = tuple(move) if move is not None else None
         if move is not None and (
             len(move) != 3 or not all(math.isfinite(v) for v in move)
@@ -202,12 +224,26 @@ class SyntheticCapture:
             )
             start += frames
 
+        # rest_hand: palma apoiada na folha entre gestos — a condição
+        # dominante do uso real (ninguém suspende a mão ao pausar).
+        # sweep: a mão atravessa o canvas confirmado de ponta a ponta —
+        # estressa a fronteira de abstenção do juiz de virada, que só
+        # decide com >=50% da tinta confirmada visível.
+        rest_frames = max(0, math.ceil(rest_hand_seconds * fps))
+
+        def push_hold():
+            push("hold", hold_frames)
+            push("rest_hand", rest_frames, palm_at=self._palm_at)
+
         push("warmup", self.warmup_frames)
         push("write", self.writing_frames, specs=self.specs, applied=0)
+        if self.erase_rect is not None or rest_frames:
+            # sem borracha não há hold natural: o repouso cria um, a
+            # palma precisa de frames para pousar sobre tinta já vista
+            push_hold()
         if self.erase_rect is not None:
-            push("hold", hold_frames)
             push("erase", max(1, math.ceil(erase_seconds * fps)), rect=self.erase_rect)
-            push("hold", hold_frames)
+            push_hold()
         if self.redraw_specs:
             push(
                 "write",
@@ -215,20 +251,29 @@ class SyntheticCapture:
                 specs=self.redraw_specs,
                 applied=0,
             )
-            push("hold", hold_frames)
+            push_hold()
+        push(
+            "sweep",
+            max(0, math.ceil(sweep_seconds * fps)),
+            sweep_from=self._sweep_from,
+            sweep_to=self._sweep_to,
+        )
         if move is not None:
             push(
                 "move",
                 max(1, math.ceil(move_seconds * fps)),
                 delta=move,
                 quad_from=self._quad_now.copy(),
+                grab_at=self._grab_at if self._grab_hand else None,
             )
         if lift_off is not None:
+            grab = self._grab_at if self._grab_hand else None
             push(
                 "lift_out",
                 max(1, math.ceil(lift_seconds * fps)),
                 quad_from=quad_at_lift,
                 quad_to=lift_off,
+                grab_at=grab,
             )
             push("absent", max(1, math.ceil(absent_seconds * fps)))
             if return_pose is None:
@@ -247,6 +292,7 @@ class SyntheticCapture:
                 max(1, math.ceil(return_seconds * fps)),
                 quad_from=lift_off,
                 quad_to=quad_return,
+                grab_at=grab,
             )
         push("settle", max(1, math.ceil(settle_seconds * fps)))
         self.frame_count = start
@@ -266,6 +312,12 @@ class SyntheticCapture:
         if hand:
             source = gs.synthetic_hand_sources(1)[0]
             self._hand = gs._transform_hand(self._rng, source, 0.6)
+        # Palma/pegada: sprite maior e transformação independente —
+        # rest/sweep/grab implicam mão na cena mesmo sem ``hand``.
+        self._palm = None
+        if rest_hand_seconds > 0 or sweep_seconds > 0 or grab_hand:
+            source = gs.synthetic_hand_sources(1)[0]
+            self._palm = gs._transform_hand(self._rng, source, hand_scale)
         self._eraser = None
         if self.erase_rect is not None:
             self._eraser = _eraser_sprite()
@@ -379,6 +431,7 @@ class SyntheticCapture:
         paper, ink = self._paper.copy(), self._ink.copy()
         pen = None
         eraser_page = None
+        palm_page = None
         if phase["kind"] == "write":
             paper, ink, pen = self._step_write(phase, local)
         elif phase["kind"] == "erase":
@@ -386,8 +439,19 @@ class SyntheticCapture:
             paper, ink = self._paper.copy(), self._ink.copy()
         elif phase["kind"] == "move":
             self._step_move(phase, local)
+            palm_page = phase.get("grab_at")
         elif phase["kind"] in ("lift_out", "return"):
             self._step_quad_lerp(phase, local)
+            # A pegada acompanha o quad — a mão que segura a folha sai
+            # de cena com ela no lift_out e volta junto no return.
+            palm_page = phase.get("grab_at")
+        elif phase["kind"] == "rest_hand":
+            palm_page = phase["palm_at"]
+        elif phase["kind"] == "sweep":
+            t = min(1.0, (local + 1) / (phase["end"] - phase["start"]))
+            palm_page = phase["sweep_from"] + t * (
+                phase["sweep_to"] - phase["sweep_from"]
+            )
         self.page_to_scene = cv2.getPerspectiveTransform(
             self._page_corners, self._quad_now
         )
@@ -420,6 +484,14 @@ class SyntheticCapture:
             cx, cy = (int(v) for v in location)
             gs._paste_hand(rgb, mask, hand_rgb, hand_mask, cx, cy)
             gs._paste_coverage(hand_cov, coverage, cx, cy)
+        if palm_page is not None and self._palm is not None:
+            location = cv2.perspectiveTransform(
+                np.float32(palm_page).reshape(1, 1, 2), self.page_to_scene
+            )[0, 0]
+            palm_rgb, palm_mask, palm_cov = self._palm
+            cx, cy = (int(v) for v in location)
+            gs._paste_hand(rgb, mask, palm_rgb, palm_mask, cx, cy)
+            gs._paste_coverage(hand_cov, palm_cov, cx, cy)
         mask, _ = gs._ambiguity_ignore(mask, paper_cov, ink_cov, hand_cov)
         # O ground truth é geométrico, anterior ao ruído e à oclusão.
         rgb = gs._sequence_photometric(self._rng, rgb, 1.0)
@@ -582,6 +654,7 @@ def export_video(capture: SyntheticCapture, output: str | Path) -> dict:
         "strokes_erased": int(capture.stroke_erased.sum()),
         "strokes_redraw": len(capture.redraw_specs),
         "hand_placeholder": capture._hand is not None,
+        "palm_placeholder": capture._palm is not None,
         "pose": "fixed" if len(capture.phases) == 3 else "scenario",
         "warmup_frames": capture.warmup_frames,
         "frames_per_stroke": capture.frames_per_stroke,
@@ -648,6 +721,29 @@ def main(argv=None):
     parser.add_argument("--absent-seconds", type=float, default=2.0)
     parser.add_argument("--lift-seconds", type=float, default=0.5)
     parser.add_argument("--return-seconds", type=float, default=0.5)
+    parser.add_argument(
+        "--rest-hand-seconds",
+        type=float,
+        default=0,
+        help="palma apoiada na folha após cada hold",
+    )
+    parser.add_argument(
+        "--sweep-seconds",
+        type=float,
+        default=0,
+        help="mão atravessa o canvas confirmado de ponta a ponta",
+    )
+    parser.add_argument(
+        "--grab-hand",
+        action="store_true",
+        help="mão segura a folha durante move/lift/return",
+    )
+    parser.add_argument(
+        "--hand-scale",
+        type=float,
+        default=1.0,
+        help="escala do sprite de palma/pegada (0<escala<=4)",
+    )
     args = parser.parse_args(argv)
     try:
         erase_rect = None
@@ -685,6 +781,10 @@ def main(argv=None):
             absent_seconds=args.absent_seconds,
             lift_seconds=args.lift_seconds,
             return_seconds=args.return_seconds,
+            rest_hand_seconds=args.rest_hand_seconds,
+            sweep_seconds=args.sweep_seconds,
+            grab_hand=args.grab_hand,
+            hand_scale=args.hand_scale,
         )
         manifest = export_video(capture, args.out)
     except (ValueError, RuntimeError, OSError, cv2.error) as error:

@@ -148,6 +148,84 @@ mesa — o provisório mediu 3,7k→346k px em ~1 s antes da queda fechar
 a sessão. Nada confirmou (as guardas de geração seguraram), mas é
 trabalho morto conhecido.
 
+## Cenário mão em massa (palma, sweep, pegada)
+
+A mão de instrumento (`--hand`) só existe colada na caneta/borracha —
+o que o humano faz com a mão SEM instrumento nunca estressava o laço.
+Três fases novas cobrem o resto:
+
+- `--rest-hand-seconds S` — fase `rest_hand`: palma apoiada na folha
+  depois de cada `hold` (e cria um hold se o cenário não tem nenhum).
+  A palma pousa no centro da tinta escrita — cobre o canvas confirmado.
+- `--sweep-seconds S` — fase `sweep` antes das fases de geometria: a
+  mão atravessa a faixa de texto de ponta a ponta. Estressa a fronteira
+  de abstenção do juiz de virada (`visible_px >= 50%` do canvas para
+  decidir) — a mão cobre/descobre tinta a cada quadro.
+- `--grab-hand` — a mão segura a folha (`grab_at`, borda inferior em
+  espaço de página) durante `move`, `lift_out` e `return` — acompanha
+  o quad: sai de cena com a folha e volta com ela. Em `absent` não há
+  mão (saiu de cena junto). `--hand-scale` dimensiona o sprite de
+  palma (default 1.0; o sprite de instrumento segue em 0.6).
+
+```sh
+python tools/sim_source.py --text "draw hand" --fps 15 \
+  --erase-rect 60,60,300,90 --redraw-text "go" \
+  --rest-hand-seconds 2.0 --sweep-seconds 1.5 \
+  --move 120,60,8 --grab-hand --hand --out captures/sim-hand.mp4
+```
+
+### O que a bancada mediu (2026-11-12)
+
+- **Palma e sweep são benignos por projeto confirmado**: o canvas
+  confirmado ficou estável (14,5k→14,5k px) em três `rest_hand` e um
+  `sweep` — zero eventos de virada/split. O juiz de virada abstém com
+  <50% de tinta visível, como foi escrito para fazer.
+- **Falha séria — detector cego a folha clipada**: `move 120,60`
+  levou a folha ~10% para fora do frame 512². A partir daí: drop do
+  tracker e `no_canvas` permanente — a folha estacionou 90% visível
+  na mesa por 87 quadros e nunca foi re-adquirida (logit ~-4). O
+  envelope medido deslocando uma cena detectável: clipe na borda
+  **direita ou esquerda cega já com ~7-9% fora**; no **topo**, ~7%;
+  em **baixo** tolera ~17% — assimetria consistente com viés do
+  corpus (folha pendurada na borda frontal da mesa). É o mesmo tipo
+  de gap do envelope de rotação: dados, não código — a bancada para
+  o augment de clipe é este cenário.
+- **Pegada durante o move degrada a detecção**: a palma sobre ~40%
+  da folha produziu quad parcial e logit 1,17 no meio do gesto — o
+  que acompanhou a queda do tracking. Todo move real tem mão.
+- **Tinta fantasma congela sob palma estacionada**: o confirmado na
+  região apagada ficou travado (~5,1k px) enquanto a palma cobria
+  100% do retângulo — `retained` exige `visible`, e pixel sem visão
+  não retrai. Semântica correta (não julga o que não vê), consequência
+  real: a tinta apagada segue "viva" na tela enquanto a palma estiver
+  parada sobre ela. Com `DRAW_INK_REMOVAL=1` a bancada mediu
+  `confirmed_in_erased_px: 0` — a retração acontece em toda região
+  visível após a borracha sair.
+
+### Mitigações validadas na mesma cena (2026-11-12)
+
+- `DRAW_CANVAS_PERSIST=1` — o drop do tracker não prova troca de
+  página: a geração da trabalhadora já era preservada
+  (`clean_recovery_pending`), mas o `clean_mask` ia embora na hora.
+  Com a flag, o canvas congela até o re-registro. Na bancada o
+  resultado mudou de `no_canvas` para `status: ok` com 18.351 px
+  confirmados no fim — e a queda real de página segue limpando tudo
+  (reopen/turn/split inalterados).
+- `DRAW_INK_SKIP_STALE=1` — na janela de graça do tracker (cantos
+  retidos, `_frames_since_seen > _SHEET_LOST_MIN_FRAMES`), as
+  passadas de reuso/LK param de subir: por construção só há mesa ou
+  oclusão lá. Acoplado a `draw.sheet_track._SHEET_LOST_MIN_FRAMES`.
+  Observação da bancada: a janela real é estreita (a queda dispara
+  na mesma faixa de contagem) — o grosso do provisório fantasma se
+  acumula na cadência normal durante move+oclusão, antes da graça
+  estourar. Bounded: nunca confirmou.
+- Dieta do corpus — `tools/gen_synthetic.py` ganhou `--clip-fraction`
+  (folha 5-40% fora por qualquer borda) e `--rotation-fraction` +
+  `--rotation-max` (rotação além do teto ±18° histórico), opt-in,
+  registrados em `manifest.diet`. Cobrem os dois gaps medidos do
+  detector: clipe ~7-9% nas laterais/topo e cego acima de ~15°.
+  A fração zero preserva o comportamento histórico byte a byte.
+
 A auditoria por fase trata `return` como o `move`: checkpoints após o
 retorno pontuam contra `page_to_scene_final`. Checkpoints de `absent`
 sem âncora/canvas registram status em vez de métrica — e o veredito
