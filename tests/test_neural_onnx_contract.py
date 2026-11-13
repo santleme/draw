@@ -118,6 +118,42 @@ def test_legacy_mask_and_presence_outputs_keep_their_contract():
     assert mask[0, 0] == 0
 
 
+def test_four_class_logits_expose_hand_mask():
+    """A classe mão sai em last_hand_mask (segunda fonte de oclusão)."""
+    classes = np.zeros((8, 8), dtype=np.uint8)
+    classes[1:7, 1:7] = 1
+    classes[2:4, 2:4] = 2
+    session = _Session({"logits": _logits_for_classes(classes)})
+    detector = NeuralSheetDetector("unused.onnx")
+    detector._session = session
+
+    detector.predict(np.zeros((16, 16, 3), dtype=np.uint8))
+
+    hand = detector.last_hand_mask
+    assert hand is not None and hand.shape == (8, 8)
+    assert np.all(hand[2:4, 2:4] == 255)
+    assert hand.sum() / 255 == 4
+    assert np.all(hand[1:7, 1:7][classes[1:7, 1:7] != 2] == 0)
+
+
+def test_two_channel_contract_has_no_hand_mask():
+    """O contrato legado (2 canais) não sabe o que é mão: None."""
+    logits = np.full((1, 2, 8, 8), -4.0, dtype=np.float32)
+    logits[0, 1, 1:7, 1:7] = 4.0
+    session = _Session(
+        {
+            "mask_logits": logits,
+            "presence_logit": np.array([2.5], dtype=np.float32),
+        }
+    )
+    detector = NeuralSheetDetector("unused.onnx")
+    detector._session = session
+
+    detector.predict(np.zeros((16, 16, 3), dtype=np.uint8))
+
+    assert detector.last_hand_mask is None
+
+
 def test_input_name_comes_from_the_file_not_from_a_literal():
     """A entrada pode se chamar "input": o feed tem de seguir o arquivo."""
     logits = np.zeros((1, 2, 8, 8), dtype=np.float32)

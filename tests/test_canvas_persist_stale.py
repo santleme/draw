@@ -133,3 +133,42 @@ def test_fresh_passes_unaffected_with_flag(monkeypatch):
     loop, _det, ink = _make_loop(lambda _i: (QUAD.copy(), "paper", None))
     _drive(loop, 40)
     assert len(ink.submitted) > 0
+
+
+def test_seg_hand_occlusion_flag_parsing(monkeypatch):
+    monkeypatch.delenv("DRAW_SEG_HAND_OCCLUSION", raising=False)
+    assert not loop_module._seg_hand_occlusion_enabled()
+    monkeypatch.setenv("DRAW_SEG_HAND_OCCLUSION", "1")
+    assert loop_module._seg_hand_occlusion_enabled()
+    monkeypatch.setenv("DRAW_SEG_HAND_OCCLUSION", "lixo")
+    assert not loop_module._seg_hand_occlusion_enabled()
+
+
+def test_seg_hand_occlusion_blocks_votes_under_hand(monkeypatch):
+    """A classe mão do seg vira oclusão: a passada não enxerga a
+    folha sob ela mesmo sem o masker (media pipe) responder."""
+    monkeypatch.setenv("DRAW_SEG_HAND_OCCLUSION", "1")
+    hand = np.zeros((720, 1280), np.uint8)
+    hand[120:280, 200:420] = 255
+    loop, _det, ink = _make_loop(lambda _i: (QUAD.copy(), "paper", {"hand_mask": hand}))
+    _drive(loop, 40)
+    assert loop._hand_mask_det is not None
+    visibles = [v for _g, _c, v, _cov in ink.submitted if v is not None]
+    assert visibles, "a oclusão semântica precisa chegar ao submit"
+    vis = visibles[-1]
+    assert vis.dtype == bool
+    # A faixa de mão retificada fica invisível para o voto; o resto
+    # da página segue visível — nem tudo abstém, nem nada abstém.
+    assert not vis.all()
+    assert vis.any()
+
+
+def test_seg_hand_occlusion_off_keeps_visible_none(monkeypatch):
+    """Sem a flag, a máscara semântica de mão não vira oclusão."""
+    monkeypatch.delenv("DRAW_SEG_HAND_OCCLUSION", raising=False)
+    hand = np.zeros((720, 1280), np.uint8)
+    hand[120:280, 200:420] = 255
+    loop, _det, ink = _make_loop(lambda _i: (QUAD.copy(), "paper", {"hand_mask": hand}))
+    _drive(loop, 40)
+    assert loop._hand_mask_det is not None
+    assert all(v is None for _g, _c, v, _cov in ink.submitted)

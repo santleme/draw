@@ -118,6 +118,7 @@ _MEMORY_SINGLE_OUTLIER_ANGLE_DEG = 6.0
 _MEMORY_SINGLE_OUTLIER_SHIFT_PX = 18.0
 _ENV_MODEL_VAR = "DRAW_NEURAL_MODEL"
 _PAPER_CLASS = 1
+_HAND_CLASS = 2
 _INK_CLASS = 3
 _SEGMENTATION_PRESENCE_MIN_RATIO = 0.01
 _SEGMENTATION_ABSENT_LOGIT = -10.0
@@ -823,6 +824,7 @@ class NeuralSheetDetector:
         # não virar buraco permanente onde a mão paira; quem segura
         # o voto sob a mão é a visibilidade, não a cobertura.
         self.last_coverage_mask = None
+        self.last_hand_mask = None
         self._timing_enabled = os.environ.get("DRAW_TIMING") == "1"
         self._timing_stats = {
             phase: {"count": 0, "sum_ms": 0.0, "max_ms": 0.0}
@@ -976,6 +978,7 @@ class NeuralSheetDetector:
                 # exp sobre 2 x lado x lado por frame.
                 mask_small = (logits[0, 1] > logits[0, 0]).astype(np.uint8)
                 coverage_small = mask_small
+                hand_small = None
             elif channels == 4:
                 # Export híbrido: máscara semântica de quatro classes
                 # com cabeça de presença treinada. Antes, esta forma
@@ -988,6 +991,7 @@ class NeuralSheetDetector:
                 # Cobertura de voto: tudo que não é fundo — papel,
                 # tinta e mão sobre a folha entram, mesa não entra.
                 coverage_small = (classes != 0).astype(np.uint8)
+                hand_small = (classes == _HAND_CLASS).astype(np.uint8)
             else:
                 raise ValueError(
                     "saída 'mask_logits' precisa ter 2 canais "
@@ -1007,6 +1011,7 @@ class NeuralSheetDetector:
             page_ratio = float(np.mean(page))
             mask_small = page.astype(np.uint8)
             coverage_small = (classes != 0).astype(np.uint8)
+            hand_small = (classes == _HAND_CLASS).astype(np.uint8)
             self.last_presence_logit = (
                 _SEGMENTATION_PRESENT_LOGIT
                 if page_ratio >= _SEGMENTATION_PRESENCE_MIN_RATIO
@@ -1026,6 +1031,11 @@ class NeuralSheetDetector:
         # quem consome (draw/app.py) faz o upsample no mesmo ponto
         # em que a máscara de chamada ganha a resolução do frame.
         self.last_coverage_mask = _fill_interior_holes(coverage_small) * 255
+        # Oclusão semântica: a classe mão vira segundo sinal do
+        # canal visible do voto de tinta (DRAW_SEG_HAND_OCCLUSION).
+        # Resolução nativa da máscara — quem consome faz o upsample
+        # no mesmo ponto da cobertura.
+        self.last_hand_mask = None if hand_small is None else hand_small * 255
         if not native:
             mask = cv2.resize(mask, (frame_w, frame_h), interpolation=cv2.INTER_NEAREST)
         if self._timing_enabled:
