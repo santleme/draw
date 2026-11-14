@@ -66,6 +66,17 @@ PROFILES = {
         # Medido no sim-hand: 421k → 36k px confirmados.
         "DRAW_SHEET_COVERAGE": "1",
         "DRAW_SEG_HAND_OCCLUSION": "1",
+        # Retração de tinta apagada: sim-hand tem 10/17 traços
+        # apagados no GT — sem ela ficam confirmados para sempre.
+        "DRAW_INK_REMOVAL": "1",
+        # Portões de prudência no registro: confirmar nada novo
+        # durante deslocamento de quad, e o juiz de conteúdo
+        # segura o canvas quando a pose não assentou. Não curam
+        # o fantasma rotacionado do sim-hand (medido: fp igual
+        # com e sem) — ficam porque o custo é zero e o risco
+        # que cobrem é real.
+        "DRAW_INK_MOTION_GATE": "1",
+        "DRAW_REG_CONTENT_GUARD": "1",
     },
 }
 
@@ -78,6 +89,9 @@ TOGGLED_ENV = (
     "DRAW_IDENTITY_CHAMFER",
     "DRAW_SHEET_COVERAGE",
     "DRAW_SEG_HAND_OCCLUSION",
+    "DRAW_INK_REMOVAL",
+    "DRAW_INK_MOTION_GATE",
+    "DRAW_REG_CONTENT_GUARD",
 )
 
 
