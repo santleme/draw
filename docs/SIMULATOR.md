@@ -326,6 +326,24 @@ falhas reais descobertas:
    numa folha só; mesa real com papel de verdade não tinha sido
    testada em massa até o gerador existir.
 
+Segunda safra (seed 11, com `DRAW_SHEET_MERGE_SPLIT=1` no perfil
+hardened): o split por defeito de convexidade corta o blob fundido
+no entalhe da junção e veste a âncora só no pedaço maior —
+`gen-002` 0,04→0,28 IoU, `gen-003` 0,78, `gen-004` 0,69. Dois
+sub-casos ficam em aberto: **papéis sobrepostos** (distrator por
+trás da folha — a junção não forma cintura e o corte sai pela
+folha alvo, `gen-004/005`) e **alvo parcialmente fora do quadro**
+após move (`gen-005`: o quad verdadeiro tem 2 cantos fora, o fit
+da união reprova na plausibilidade e a detecção vira só-presença —
+âncora congelada, recall 0). A medição de LK+FOLLOW nesse caso
+(recall 0→0,99) prova que a re-ancoragem por geometria resgata a
+pose, mas a flag migra a âncora para quads errados quando o fit
+oscila entre união e peça (gen-004 0,69→0,12, sim-e3-nomove
+0,85→0,59) — falta um portão de correção para a migração, que é a
+próxima frente. O LK sozinho preserva os ganhos nos cenários
+curados (sim-e3 0,43→0,80, sim-hand 0,34→0,81, lifts 0,82-0,86)
+mas quebra o gen-002 (propaga o quad sobre o distrator).
+
 As três flags do meio são da rodada do gargalo de registro instável:
 o portão de movimento só barra confirmação nova (a passada segue
 votando — diferente da abstenção revertida); o reset de voto impede

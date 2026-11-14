@@ -436,6 +436,97 @@ def _largest_contour(mask_bin):
     return max(contours, key=cv2.contourArea)
 
 
+# Dois papéis sobrepostos viram um blob só na máscara: a junção
+# marca entalhes profundos no contorno. O corte no par de defeitos
+# mais profundo separa os papéis — exigir dois pedaços grandes e
+# quase-convexos impede que um entalhe de mão/orelha de página
+# fragmente a folha (medido no gen-002 da bateria: junção com
+# defeitos de 52-127 px; ruído de borda fica abaixo de 5 px).
+_MERGE_SPLIT_ENV = "DRAW_SHEET_MERGE_SPLIT"
+_MERGE_SPLIT_MIN_DEPTH_PX = 12.0
+_MERGE_SPLIT_MIN_PIECE_FRAC = 0.15
+_MERGE_SPLIT_MIN_CONVEXITY = 0.85
+
+
+def _merged_sheet_split_enabled():
+    return os.environ.get(_MERGE_SPLIT_ENV, "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _merged_sheet_split(mask_bin, contour):
+    """Corta um blob de dois papéis sobrepostos no entalhe da junção.
+
+    Devolve a máscara do maior pedaço quando um corte entre dois
+    defeitos de convexidade profundos produz dois componentes cada
+    um >= _MERGE_SPLIT_MIN_PIECE_FRAC do blob e quase-convexos —
+    dois retângulos só saem de dois papéis de verdade, não de um
+    dente de mão. Sem corte bom, devolve None e o fit segue na
+    união como sempre.
+    """
+    hull = cv2.convexHull(contour, returnPoints=False)
+    if hull is None or len(hull) < 4:
+        return None
+    try:
+        # Contorno com auto-interseção (máscara fragmentada por
+        # mão/dobra) gera hull não-monotônico e o OpenCV levanta —
+        # blob assim não é união de papéis que o corte resolva.
+        defects = cv2.convexityDefects(contour, hull)
+    except cv2.error:
+        return None
+    if defects is None:
+        return None
+    ds = defects.reshape(-1, 4)
+    depths = ds[:, 3].astype(np.float64) / 256.0
+    if depths.max() < _MERGE_SPLIT_MIN_DEPTH_PX:
+        return None
+    order = np.argsort(-depths)[:4]
+    total = float(np.count_nonzero(mask_bin))
+    for a in range(len(order)):
+        for b in range(a + 1, len(order)):
+            pa = contour[ds[order[a], 2]][0]
+            pb = contour[ds[order[b], 2]][0]
+            cut = mask_bin.copy()
+            cv2.line(
+                cut,
+                (int(pa[0]), int(pa[1])),
+                (int(pb[0]), int(pb[1])),
+                0,
+                3,
+            )
+            n, lab, stats, _ = cv2.connectedComponentsWithStats(cut)
+            if n < 3:
+                continue
+            areas = stats[1:, cv2.CC_STAT_AREA].astype(np.float64)
+            big = np.argsort(-areas)
+            if areas[big[1]] < total * _MERGE_SPLIT_MIN_PIECE_FRAC:
+                continue
+            pieces = []
+            for i in big[:2]:
+                piece = (lab == int(i) + 1).astype(np.uint8)
+                pc = _largest_contour(piece)
+                hull_area = (
+                    0.0
+                    if pc is None
+                    else cv2.contourArea(cv2.convexHull(pc))
+                )
+                if (
+                    pc is None
+                    or hull_area <= 0
+                    or cv2.contourArea(pc) / hull_area
+                    < _MERGE_SPLIT_MIN_CONVEXITY
+                ):
+                    pieces = []
+                    break
+                pieces.append(piece)
+            if pieces:
+                return max(pieces, key=lambda m: int(np.count_nonzero(m)))
+    return None
+
+
 def _approx_quad(contour):
     perimeter = cv2.arcLength(contour, True)
     for epsilon in _paper._SHEET_EPSILON_LADDER:
@@ -752,6 +843,14 @@ def _fit_quad_impl(mask_bin, frame, fallback_lines, scale_x=1.0, scale_y=1.0):
     frame_area = float(mask_bin.shape[0] * mask_bin.shape[1])
     if cv2.contourArea(contour) < frame_area * _MIN_CONTOUR_AREA_RATIO:
         return None, None, None
+    if _merged_sheet_split_enabled():
+        piece = _merged_sheet_split(mask_bin, contour)
+        if piece is not None:
+            # Dois papéis na cena: o quad veste só o maior —
+            # a tinta do outro não contamina o warp e o fit
+            # deixa de responder pela união.
+            mask_bin = piece
+            contour = _largest_contour(piece)
     scale = np.array([scale_x, scale_y], dtype=np.float32)
     quad = _approx_quad(contour)
     if quad is None:

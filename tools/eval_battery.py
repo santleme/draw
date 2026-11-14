@@ -77,6 +77,10 @@ PROFILES = {
         # que cobrem é real.
         "DRAW_INK_MOTION_GATE": "1",
         "DRAW_REG_CONTENT_GUARD": "1",
+        # Dois papéis na cena (mesa real com caderno): corta o
+        # blob fundido no entalhe da junção e veste a âncora só
+        # no maior. Medido no gen-002: união → folha só.
+        "DRAW_SHEET_MERGE_SPLIT": "1",
     },
 }
 
@@ -92,6 +96,9 @@ TOGGLED_ENV = (
     "DRAW_INK_REMOVAL",
     "DRAW_INK_MOTION_GATE",
     "DRAW_REG_CONTENT_GUARD",
+    "DRAW_SHEET_MERGE_SPLIT",
+    "DRAW_SHEET_LK_PROPAGATE",
+    "DRAW_ANCHOR_FOLLOW",
 )
 
 
@@ -205,6 +212,12 @@ def _generate_captures(count, seed, out_dir):
         name = f"gen-{i:03d}"
         target = out_dir / f"{name}.mp4"
         argv = _sample_scenario_args(rng, desk_photos)
+        if target.exists():
+            # Cache da iteração: mesmo --gen-seed reproduz o
+            # cenário; não paga regeração pra rodar de novo.
+            generated[name] = {}
+            print(f"== {name}: reutilizado", flush=True)
+            continue
         cmd = [
             sys.executable,
             str(sim_source),
