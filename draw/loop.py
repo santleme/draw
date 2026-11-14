@@ -319,6 +319,13 @@ class SheetInkLoop:
         self._coverage_mask = None
         self._hand_mask_det = None
         self._sheet_mask_det = None
+        # Veredito da guarda sobre o quad rastreado NA ÚLTIMA
+        # detecção (DRAW_ANCHOR_COVERAGE_GUARD): medido não-folha,
+        # as passadas de tinta se abstêm enquanto a âncora ainda
+        # cai — a mesa dentro do quad não confirma nem re-confirma
+        # traço (medido no sim-lift10: 404k px de textura de mesa
+        # confirmados durante o lift-out, antes do streak vencer).
+        self._anchor_quad_bad = False
 
         self.tracker = _SheetTracker()
         self.ink_accumulator = ink_module.InkAccumulator()
@@ -503,6 +510,14 @@ class SheetInkLoop:
                 seg_clear = ~seg_hand_dil
                 visible = seg_clear if visible is None else (visible & seg_clear)
         coverage = self._sheet_coverage_page(warp_corners)
+        if anchor_coverage_guard_enabled() and self._anchor_quad_bad:
+            # A guarda já mediu o quad como não-folha mas a âncora
+            # ainda não caiu (streak em andamento): a passada se
+            # abstém inteira — abstinência não tira tinta, voto de
+            # mesa entra para sempre.
+            visible = np.zeros(ink_warped.shape[:2], dtype=bool)
+            if coverage is not None:
+                coverage = np.zeros_like(coverage)
         if coverage is not None:
             # Fora da folha o warp é preto: a transição
             # folha->preto é uma aresta artificial que o page_clean
@@ -684,7 +699,14 @@ class SheetInkLoop:
                 inside = _quad_coverage_fraction(
                     self._sheet_mask_det, self.tracker.corners
                 )
-                if inside < _ANCHOR_GUARD_MIN_COVERAGE:
+                # Veredito imediato para a abstenção de voto — o
+                # streak segura a queda da âncora contra flicker
+                # do seg, mas a passada já para de votar na
+                # primeira medida ruim (custa um frame de tinta
+                # real quando o seg pisca; salva o canvas inteiro
+                # quando a folha saiu de verdade).
+                self._anchor_quad_bad = inside < _ANCHOR_GUARD_MIN_COVERAGE
+                if self._anchor_quad_bad:
                     self._anchor_guard_streak += 1
                 else:
                     self._anchor_guard_streak = 0
@@ -758,6 +780,7 @@ class SheetInkLoop:
             # e orcamento da folha que caiu nao vazam para a proxima.
             self._det_stable_streak = 0
             self._det_skip_left = 0
+            self._anchor_quad_bad = False
             self._det_ref_small = None
             # A propagacao morre com a folha: ancora e pendente do
             # portao nao vazam para a proxima folha (frente 105).
@@ -1012,6 +1035,10 @@ class SheetInkLoop:
                     # nao vota, sem fabricar papel limpo que
                     # retrairia tinta quando a mascara falha.
                     visible = coverage if visible is None else (visible & coverage)
+                if anchor_coverage_guard_enabled() and self._anchor_quad_bad:
+                    # Quad medido nao-folha pela guarda: abstencao
+                    # total, igual ao caminho da trabalhadora.
+                    visible = np.zeros(ink_warped.shape[:2], dtype=bool)
                 if self.session_ink is not None:
                     if not self.session_ink.ready:
                         if self.baseline_armed:

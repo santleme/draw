@@ -190,3 +190,54 @@ def test_dark_quad_cannot_acquire_bright_can(monkeypatch):
     _drive(loop, 4, frame=frame)
     # O quad claro e cheio de folha adquire normalmente.
     assert loop.tracker.corners is not None
+
+
+def test_bad_quad_abstains_ink_votes(monkeypatch):
+    """Quad rastreado medido não-folha: a passada se abstém
+    inteira (visible=False) já na primeira medida ruim — não
+    espera o streak da queda da âncora. Abstenção é reversível;
+    voto de mesa confirmado, não."""
+    monkeypatch.setenv("DRAW_ANCHOR_COVERAGE_GUARD", "1")
+    good = _sheet_mask_for(QUAD)
+    empty = np.zeros_like(good)
+
+    def script(i):
+        if i < 2:
+            return QUAD.copy(), "paper", {"sheet_mask": good, "source": "neural"}
+        # A folha some: detector não acha nada e a máscara vem
+        # vazia — o quad rastreado continua ancorado na graça.
+        return None, None, {"sheet_mask": empty, "source": "neural"}
+
+    loop = _make_loop(script)
+    seen_visible = []
+    real_update = loop.ink_accumulator.update
+
+    def spy(observed, visible=None, **kw):
+        seen_visible.append(
+            None if visible is None else bool(np.any(visible))
+        )
+        return real_update(observed, visible, **kw)
+
+    loop.ink_accumulator.update = spy
+    _drive(loop, 3)
+    assert loop.tracker.corners is not None
+    assert not loop._anchor_quad_bad
+    # A cadência assentada pula detecções; dirigir bastante até a
+    # próxima rodada medir a máscara vazia contra o quad ancorado.
+    _drive(loop, 10)
+    assert loop._anchor_quad_bad
+    # As últimas passadas (quad ruim) chegaram ao acumulador sem
+    # nenhum pixel visível — nenhum voto de mesa.
+    assert seen_visible
+    assert seen_visible[-1] is False
+    assert not any(seen_visible[-2:])
+
+    # A folha volta na mesma pose: o veredito limpa e o voto
+    # flui de novo — a abstinência não virou trava permanente.
+    def script_back(i):
+        return QUAD.copy(), "paper", {"sheet_mask": good, "source": "neural"}
+
+    loop.detection_worker._script = script_back
+    _drive(loop, 4)
+    assert not loop._anchor_quad_bad
+    assert seen_visible[-1] is not False

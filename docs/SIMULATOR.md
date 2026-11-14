@@ -280,6 +280,23 @@ primeira passada e `same_page` na seguinte (recall 0,78 /
 containment 0,52), canvas preservado. Flag opt-in como a guarda:
 o caminho default segue sem registro por conteúdo.
 
+A peça que fechou a cadeia (2026-11-15, `sim-lift10`/`desk-return`):
+o streak da guarda segura a QUEDA da âncora contra flicker do seg,
+mas as passadas de tinta seguiam votando no quad ruim até a âncora
+cair — mesa confirmando como tinta em massa (404k px no
+`sim-lift10`, 569k no `desk-return`, referência de identidade
+envenenada → `new_page` garantido no retorno). Agora a primeira
+medida ruim (`inside < piso`) já abstém a passada inteira
+(`visible=zeros`, cobertura zerada): abstinência é reversível —
+custa um frame quando o seg pisca — voto de mesa não. Resultado
+na bateria (`tools/eval_battery.py --profile hardened`): os quatro
+cenários drop→retorno (`sim-lift`, `sim-lift0`, `sim-lift10`,
+`desk-return`) decidem `same_page` com referência limpa, e o
+`desk-ghost3` (sem retorno) termina sem canvas — desfecho
+correto. O que sobra em vermelho (`sim-e3`, `sim-hand`) é o outro
+mecanismo: tinta falsa com a folha PRESENTE, quad coberto pela
+máscara — fora do alcance da guarda de cobertura.
+
 As três flags do meio são da rodada do gargalo de registro instável:
 o portão de movimento só barra confirmação nova (a passada segue
 votando — diferente da abstenção revertida); o reset de voto impede
