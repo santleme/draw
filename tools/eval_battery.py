@@ -95,6 +95,137 @@ TOGGLED_ENV = (
 )
 
 
+# ---------- geração autônoma de cenários ----------
+#
+# O loop de feedback fecha aqui: em vez de só re-jogar os captures
+# fixos, --generate N amostra cenários da distribuição realista
+# (texto aleatório, mão, borracha, lift/return, props) e grava MP4
+# + GT via sim_source — depois avalia pelo MESMO caminho (_run),
+# sem branch de código diferente do caso curado.
+
+_TEXTS = [
+    "Draw v6",
+    "reunião 15h",
+    "lista mercado",
+    "ideia nova",
+    "ok google",
+    "hello world",
+    "desenho",
+    "nota fiscal",
+    "lembrar amanhã",
+    "rascunho 42",
+    "teste tinta",
+    "quarta feira",
+]
+
+# Fotos reais de mesa do laboratório — quando existem, metade dos
+# cenários gerados usa foto de fundo em vez do procedural.
+_DESK_PHOTOS_GLOB = "/home/lucas_coimbra/draw-lab/fp-fresh-*/fresh_*.jpg"
+
+
+def _sample_scenario_args(rng, desk_photos):
+    """Um cenário da distribuição realista -> argv do sim_source."""
+    args = [
+        "--text",
+        str(rng.choice(_TEXTS)),
+        "--seed",
+        str(int(rng.integers(1, 10_000))),
+        "--fps",
+        "15",
+        "--warmup-seconds",
+        "1",
+        "--settle-seconds",
+        str(float(rng.choice([5, 8, 10]))),
+        "--hold-seconds",
+        str(float(rng.choice([2, 4]))),
+    ]
+    if desk_photos and rng.random() < 0.5:
+        args += ["--desk-photo", str(rng.choice(desk_photos))]
+    # Mão sem instrumento: rest/sweep/grab — gesto de humano, não
+    # só a mão colada na caneta.
+    if rng.random() < 0.4:
+        args += ["--hand", "--rest-hand-seconds", "2"]
+        if rng.random() < 0.5:
+            args += ["--sweep-seconds", "2"]
+        if rng.random() < 0.3:
+            args += ["--grab-hand"]
+    # Borracha + redesenho em ~1/3 dos cenários.
+    if rng.random() < 0.33:
+        x = int(rng.integers(40, 200))
+        args += [
+            "--erase-rect",
+            f"{x},{int(rng.integers(30, 80))},"
+            f"{int(rng.integers(120, 260))},{int(rng.integers(30, 70))}",
+            "--redraw-text",
+            str(rng.choice(_TEXTS)),
+        ]
+    kind = rng.random()
+    if kind < 0.15:
+        # Move puro no fim: desliza/gira a folha sem tirar de cena.
+        dx, dy = int(rng.integers(-180, 180)), int(rng.integers(-120, 120))
+        deg = int(rng.integers(-15, 15))
+        args += [f"--move={dx},{dy},{deg}"]
+    elif kind < 0.45:
+        # Lift & return: a metade volta na mesma pose, a outra
+        # metade volta rodada/deslocada — o gesto real de pegar,
+        # virar e repousar. Valores negativos via `=` ou o argparse
+        # lê como opção.
+        dx, dy = int(rng.integers(-450, 450)), int(rng.integers(-350, 350))
+        if dx == 0 and dy == 0:
+            dx = 300
+        args += [f"--lift={dx},{dy}"]
+        args += ["--absent-seconds", str(float(rng.choice([1.5, 2.5, 4])))]
+        if rng.random() < 0.15:
+            args += ["--stay-out"]
+        elif rng.random() < 0.55:
+            rdx = int(rng.integers(-120, 120))
+            rdy = int(rng.integers(-120, 120))
+            rdeg = int(rng.integers(-25, 25))
+            args += [f"--return-pose={rdx},{rdy},{rdeg}"]
+    # Props e pauta: objetos na folha que não são tinta.
+    if rng.random() < 0.15:
+        args += ["--resting-pen"]
+    if rng.random() < 0.15:
+        args += ["--paper-style", "ruled"]
+    return args
+
+
+def _generate_captures(count, seed, out_dir):
+    """Grava `count` captures novos e devolve o dict BATTERY-style."""
+    import glob
+    import subprocess
+
+    desk_photos = sorted(glob.glob(_DESK_PHOTOS_GLOB))
+    rng = np.random.default_rng(seed)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    generated = {}
+    sim_source = Path(__file__).resolve().parent / "sim_source.py"
+    for i in range(count):
+        name = f"gen-{i:03d}"
+        target = out_dir / f"{name}.mp4"
+        argv = _sample_scenario_args(rng, desk_photos)
+        cmd = [
+            sys.executable,
+            str(sim_source),
+            "--out",
+            str(target),
+            *argv,
+        ]
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=600
+        )
+        if proc.returncode != 0 or not target.exists():
+            print(
+                f"!! {name}: geração falhou ({proc.returncode}) "
+                f"{proc.stderr[-300:]}"
+            )
+            continue
+        generated[name] = {}
+        print(f"++ {name}: {' '.join(argv)}", flush=True)
+    return generated
+
+
 def _identity_summary(events):
     """Decisões da vigia de identidade na ordem em que saíram."""
     out = []
@@ -296,6 +427,26 @@ def main(argv=None):
         help="cenários separados por vírgula (default: todos)",
     )
     parser.add_argument("--captures", type=Path, default=Path("captures"))
+    parser.add_argument(
+        "--generate",
+        type=int,
+        metavar="N",
+        help=(
+            "gera N cenários novos (sim_source, distribuição realista) "
+            "em --captures/battery-gen-<seed> e avalia junto"
+        ),
+    )
+    parser.add_argument(
+        "--gen-seed",
+        type=int,
+        default=103,
+        help="semente da amostragem de cenários gerados",
+    )
+    parser.add_argument(
+        "--skip-curated",
+        action="store_true",
+        help="roda só os cenários gerados (útil com --generate)",
+    )
     parser.add_argument("--out", type=Path, help="grava o relatório JSON")
     parser.add_argument("--neural-model", default=NEURAL)
     parser.add_argument("--page-clean-model")
@@ -311,12 +462,29 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
 
+    battery = dict(BATTERY)
+    captures_dir = args.captures
+    if args.generate:
+        gen_dir = args.captures / f"battery-gen-{args.gen_seed}"
+        generated = _generate_captures(
+            args.generate, args.gen_seed, gen_dir
+        )
+        for name in generated:
+            battery[f"gen/{name}"] = {
+                "name": name,
+                "captures": gen_dir,
+            }
+    if args.skip_curated:
+        battery = {
+            name: spec for name, spec in battery.items() if "/" in name
+        }
+
     wanted = (
-        set(BATTERY)
+        set(battery)
         if not args.only
         else {name.strip() for name in args.only.split(",") if name.strip()}
     )
-    missing = wanted - set(BATTERY)
+    missing = wanted - set(battery)
     if missing:
         raise SystemExit(f"cenários desconhecidos: {sorted(missing)}")
 
@@ -333,10 +501,12 @@ def main(argv=None):
     results = []
     os.environ.update(env)
     try:
-        for name in BATTERY:
+        for name in battery:
             if name not in wanted:
                 continue
-            spec = dict(BATTERY[name])
+            spec = dict(battery[name])
+            run_name = spec.pop("name", name)
+            run_captures = Path(spec.pop("captures", captures_dir))
             scenario_env = spec.pop("env", {})
             saved_scenario = {
                 key: os.environ.get(key) for key in scenario_env
@@ -344,7 +514,9 @@ def main(argv=None):
             os.environ.update(scenario_env)
             try:
                 print(f"== {name} ({args.profile})", flush=True)
-                results.append(_run(name, spec, args.captures, models))
+                results.append(
+                    _run(run_name, spec, run_captures, models)
+                )
             finally:
                 for key, value in saved_scenario.items():
                     if value is None:

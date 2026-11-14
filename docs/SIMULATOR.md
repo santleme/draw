@@ -297,6 +297,35 @@ correto. O que sobra em vermelho (`sim-e3`, `sim-hand`) é o outro
 mecanismo: tinta falsa com a folha PRESENTE, quad coberto pela
 máscara — fora do alcance da guarda de cobertura.
 
+## Geração autônoma de cenários (loop de feedback)
+
+`tools/eval_battery.py --generate N` fecha o ciclo: amostra cenários
+da distribuição realista via `sim_source` (texto aleatório, mão
+rest/sweep/grab, borracha+redesenho, move, lift/return na mesma
+pose ou rodada, stay-out, pauta, caneta apoiada, foto de mesa real
+em metade dos casos), grava MP4+GT em
+`captures/battery-gen-<seed>/` e avalia pelo mesmo `_run` dos
+cenários curados — `--gen-seed` reproduz a amostragem,
+`--skip-curated` roda só os gerados.
+
+Primeira safra (seed 11, 6 cenários): procedurais passam
+(IoU 0,86-0,87; o lift+return -8° decidiu `new_page` — resgate a
+investigar nesse conteúdo) e TODOS os desk-photo falharam — duas
+falhas reais descobertas:
+
+1. **Âncora na união de dois papéis** (`gen-002`): a foto de mesa
+   traz um caderno real com escrita no canto; a máscara do seg
+   funde folha sintética + caderno num blob só e o fit devolve o
+   quad da união — recall 0 com 11k px confirmados (a escrita do
+   caderno vira tinta). É falha de aquisição, não de tinta:
+   quando duas folhas dividem a cena o detector precisa escolher,
+   não somar.
+2. **Recall quebrado em mesa real** (`gen-003/004/005`): mesmo
+   padrão — quad contaminado pelo papel da foto ou fit solto nos
+   limites sintético/foto. A distribuição procedural sempre coube
+   numa folha só; mesa real com papel de verdade não tinha sido
+   testada em massa até o gerador existir.
+
 As três flags do meio são da rodada do gargalo de registro instável:
 o portão de movimento só barra confirmação nova (a passada segue
 votando — diferente da abstenção revertida); o reset de voto impede
