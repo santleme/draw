@@ -495,6 +495,28 @@ def sheet_coverage_enabled():
     )
 
 
+_ANCHOR_COVERAGE_GUARD_ENV = "DRAW_ANCHOR_COVERAGE_GUARD"
+
+
+def anchor_coverage_guard_enabled():
+    """Veto de refresh sobre âncora que deixou de cobrir folha.
+
+    DRAW_ANCHOR_COVERAGE_GUARD=1 (default desligado): a detecção
+    neural publica a máscara binária de folha junto do resultado e
+    o laço mede a fração do quad rastreado ainda coberta por ela.
+    Abaixo do piso por algumas rodadas seguidas, o refresh da
+    âncora é vetado e a folha cai pelo caminho natural do
+    rastreador — medido na mesa real em 2026-11-14: folha fora de
+    cena e a textura da mesa seguia renovando o seen para sempre.
+    """
+    return os.environ.get(_ANCHOR_COVERAGE_GUARD_ENV, "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 def _gate_info_from_trace(trace):
     """O pacote do portão de primeira confirmação de um rastro.
 

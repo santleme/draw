@@ -242,20 +242,148 @@ DRAW_INK_REMOVAL=1
 DRAW_SEG_HAND_OCCLUSION=1   # classe mão do seg vira 2º sinal de oclusão
 DRAW_ANCHOR_ARBITRATION=1   # veredito por conteúdo no assentamento
 DRAW_ANCHOR_FOLLOW=1        # re-âncora por divergência assentada
+DRAW_INK_MOTION_GATE=1      # deslocamento >8px não confirma tinta nova
+DRAW_ANCHOR_VOTE_RESET=1    # re-âncora zera janela de voto e E3/E4
+DRAW_ANCHOR_FAST_CLEAN=1    # streak de remoção 6→3 nas 12 pós-pouso
+DRAW_ANCHOR_COVERAGE_GUARD=1 # âncora sem folha embaixo perde o seen
 ```
 
 Medições do mesmo conjunto: `sim-hand` IoU 0,495 (era `no_canvas`
-no modelo anterior), `sim-e3` 0,501, `sim-e3-nomove` 0,853,
+no modelo anterior), `sim-e3` 0,848, `sim-e3-nomove` 0,853,
 lift/return 0,86-0,87, `sim`/`sim-long` 0,85-0,87, redraw recall
-0,98-0,99. Reprovado e revertido: `DRAW_ANCHOR_MOTION_ABSTAIN`
-(abster durante divergência quad/âncora mata o voto do retorno —
-lift conf 4,9k → 0).
+0,98-0,99, QuickDraw ×5 IoU médio 0,85 (40/40 traços). Reprovado e
+revertido: `DRAW_ANCHOR_MOTION_ABSTAIN` (abster durante divergência
+quad/âncora mata o voto do retorno — lift conf 4,9k → 0).
+
+`DRAW_ANCHOR_COVERAGE_GUARD` é da rodada da mesa real (2026-11-14):
+a folha sai de cena e o seg continua achando "papel" na textura da
+mesa — cada detecção renovava o seen do tracker e a âncora nunca
+caía, projetando mesa vazia como tinta (+17k px confirmados com a
+folha fora de cena no `desk-ghost`). A guarda mede a fração do quad
+rastreado coberta pela máscara binária de folha (≈0,99 com folha,
+≈0,03 sem); abaixo do piso por 5 rodadas, todo refresh é vetado e
+a folha cai. Sem âncora, vira portão de aquisição: quad precisa de
+fração alta (neural) E luma de papel — o falso quad da mesa mede
+~110 contra ~237 da folha real. Medido: âncora cai ~f75, 91 falsas
+aquisições vetadas, crescimento de tinta pós-saída = zero; retorno
+realista (`desk-return`, mesma pose) re-registra normal (17/17
+traços, recall 0,98). O retorno extremo (`sim-lift`, rotação
+forte + canto fora do frame) expôs a lacuna seguinte: a âncora
+re-adquirida mapeia a página com escala+translação+keystone
+diferentes — mesmo texto, recall direto 0,21 → `new_page` e
+canvas descartado. O resgate `DRAW_IDENTITY_ECC_ALIGN` alinha a
+candidata à referência por conteúdo antes dos mesmos limiares:
+sementes de similaridade por momentos (máscara inteira e maior
+componente, quatro rotações do eixo PCA) polidas por ECC
+homografia; medido no `sim-lift` — `deferred_pose_unstable` na
+primeira passada e `same_page` na seguinte (recall 0,78 /
+containment 0,52), canvas preservado. Flag opt-in como a guarda:
+o caminho default segue sem registro por conteúdo.
+
+A peça que fechou a cadeia (2026-11-15, `sim-lift10`/`desk-return`):
+o streak da guarda segura a QUEDA da âncora contra flicker do seg,
+mas as passadas de tinta seguiam votando no quad ruim até a âncora
+cair — mesa confirmando como tinta em massa (404k px no
+`sim-lift10`, 569k no `desk-return`, referência de identidade
+envenenada → `new_page` garantido no retorno). Agora a primeira
+medida ruim (`inside < piso`) já abstém a passada inteira
+(`visible=zeros`, cobertura zerada): abstinência é reversível —
+custa um frame quando o seg pisca — voto de mesa não. Resultado
+na bateria (`tools/eval_battery.py --profile hardened`): os quatro
+cenários drop→retorno (`sim-lift`, `sim-lift0`, `sim-lift10`,
+`desk-return`) decidem `same_page` com referência limpa, e o
+`desk-ghost3` (sem retorno) termina sem canvas — desfecho
+correto. O que sobra em vermelho (`sim-e3`, `sim-hand`) é o outro
+mecanismo: tinta falsa com a folha PRESENTE, quad coberto pela
+máscara — fora do alcance da guarda de cobertura.
+
+## Geração autônoma de cenários (loop de feedback)
+
+`tools/eval_battery.py --generate N` fecha o ciclo: amostra cenários
+da distribuição realista via `sim_source` (texto aleatório, mão
+rest/sweep/grab, borracha+redesenho, move, lift/return na mesma
+pose ou rodada, stay-out, pauta, caneta apoiada, foto de mesa real
+em metade dos casos), grava MP4+GT em
+`captures/battery-gen-<seed>/` e avalia pelo mesmo `_run` dos
+cenários curados — `--gen-seed` reproduz a amostragem,
+`--skip-curated` roda só os gerados.
+
+Primeira safra (seed 11, 6 cenários): procedurais passam
+(IoU 0,86-0,87; o lift+return -8° decidiu `new_page` — resgate a
+investigar nesse conteúdo) e TODOS os desk-photo falharam — duas
+falhas reais descobertas:
+
+1. **Âncora na união de dois papéis** (`gen-002`): a foto de mesa
+   traz um caderno real com escrita no canto; a máscara do seg
+   funde folha sintética + caderno num blob só e o fit devolve o
+   quad da união — recall 0 com 11k px confirmados (a escrita do
+   caderno vira tinta). É falha de aquisição, não de tinta:
+   quando duas folhas dividem a cena o detector precisa escolher,
+   não somar.
+2. **Recall quebrado em mesa real** (`gen-003/004/005`): mesmo
+   padrão — quad contaminado pelo papel da foto ou fit solto nos
+   limites sintético/foto. A distribuição procedural sempre coube
+   numa folha só; mesa real com papel de verdade não tinha sido
+   testada em massa até o gerador existir.
+
+Segunda safra (seed 11, com `DRAW_SHEET_MERGE_SPLIT=1` no perfil
+hardened): o split por defeito de convexidade corta o blob fundido
+no entalhe da junção e veste a âncora só no pedaço maior —
+`gen-002` 0,04→0,28 IoU, `gen-003` 0,78, `gen-004` 0,69. Dois
+sub-casos ficam em aberto: **papéis sobrepostos** (distrator por
+trás da folha — a junção não forma cintura e o corte sai pela
+folha alvo, `gen-004/005`) e **alvo parcialmente fora do quadro**
+após move (`gen-005`: o quad verdadeiro tem 2 cantos fora, o fit
+da união reprova na plausibilidade e a detecção vira só-presença —
+âncora congelada, recall 0). A medição de LK+FOLLOW nesse caso
+(recall 0→0,99) prova que a re-ancoragem por geometria resgata a
+pose, mas a flag migra a âncora para quads errados quando o fit
+oscila entre união e peça (gen-004 0,69→0,12, sim-e3-nomove
+0,85→0,59) — falta um portão de correção para a migração, que é a
+próxima frente. O LK sozinho preserva os ganhos nos cenários
+curados (sim-e3 0,43→0,80, sim-hand 0,34→0,81, lifts 0,82-0,86)
+mas quebra o gen-002 (propaga o quad sobre o distrator).
+
+As três flags do meio são da rodada do gargalo de registro instável:
+o portão de movimento só barra confirmação nova (a passada segue
+votando — diferente da abstenção revertida); o reset de voto impede
+que evidência da grade velha confirme na nova; e o fast-clean
+converge o detrito pós-pouso ~5s mais rápido (fp limpo em f579 vs
+f659 no sim-hand estendido), sempre com testemunha exigida.
 
 A auditoria por fase trata `return` como o `move`: checkpoints após o
 retorno pontuam contra `page_to_scene_final`. Checkpoints de `absent`
 sem âncora/canvas registram status em vez de métrica — e o veredito
 final ancora no último evento declarado (sem IoU emprestado de fases
 anteriores).
+
+## Bancada QuickDraw (qualidade de captura)
+
+`tools/quickdraw_sessions.py` converte desenhos reconhecidos do
+corpus QuickDraw (`~/draw-lab/ink-data/quickdraw/*.ndjson`) em specs
+`curve` do simulador e exporta MP4 + GT pronto para
+`tools/eval_capture.py` — traços vetoriais reais de humanos, não
+texto renderizado. Mede qualidade de captura (todo traço desenhado
+vira tinta confirmada?), é complementar aos cenários adversos e não
+substitui mesa real (pose fixa, mão placeholder):
+
+```sh
+PYTHON=.venv/bin/python tools/quickdraw_sessions.py \
+  --spec cat:0 --label qd-cat --hand \
+  --out captures/quickdraw-sessions/qd-cat.mp4
+PYTHON=.venv/bin/python tools/quickdraw_eval.sh          # todas
+PYTHON=.venv/bin/python tools/quickdraw_eval.sh qd-cat   # uma só
+PYTHON=.venv/bin/python tools/quickdraw_report.py        # tabela
+PYTHON=.venv/bin/python tools/quickdraw_overlay.py       # overlays
+```
+
+`--spec categoria:pick[@fx,fy,fw,fh]` é repetível (vários desenhos
+por folha, cada um numa fração da página). O eval roda com o conjunto
+de flags validado acima já exportado; `PYTHON` aponta o intérprete
+quando o checkout não tem `.venv` próprio. Bancada de referência
+(t16, 2026-11-13): 5 sessões, 40/40 traços capturados, recall
+0,97-0,99, IoU médio 0,85 com flags (0,79 sem) — fp residual é halo
+de ~1px (GT de 2px vs traço confirmado ~3px) mais specks de borda.
 
 ## Capturar e avaliar sem interface
 

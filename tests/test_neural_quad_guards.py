@@ -187,3 +187,85 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+# ---------- split de papéis fundidos (DRAW_SHEET_MERGE_SPLIT) ----------
+
+
+def _two_sheet_blob():
+    """Folha grande + caderno à direita em ângulo cruzando a
+    aresta dela — a junção cria a cintura com entalhes medida
+    no gen-002 da bateria."""
+    mask = np.zeros((512, 512), np.uint8)
+    cv2.fillPoly(
+        mask,
+        [np.array([[70, 80], [350, 25], [430, 430], [145, 488]], np.int32)],
+        255,
+    )
+    cv2.fillPoly(
+        mask,
+        [np.array([[400, 10], [512, 60], [480, 330], [380, 290]], np.int32)],
+        255,
+    )
+    return mask
+
+
+def test_merge_split_flag_default_off(monkeypatch):
+    monkeypatch.delenv("DRAW_SHEET_MERGE_SPLIT", raising=False)
+    assert not neural._merged_sheet_split_enabled()
+    monkeypatch.setenv("DRAW_SHEET_MERGE_SPLIT", "1")
+    assert neural._merged_sheet_split_enabled()
+
+
+def test_merge_split_separates_overlapping_papers():
+    mask = _two_sheet_blob()
+    contour = neural._largest_contour(mask)
+    piece = neural._merged_sheet_split(mask, contour)
+    assert piece is not None
+    # O pedaço devolvido é a folha grande — o caderno ficou fora.
+    piece_c = neural._largest_contour(piece)
+    assert cv2.contourArea(piece_c) > 0.5 * np.count_nonzero(mask)
+    assert piece[100, 500] == 0
+
+
+def test_merge_split_leaves_single_sheet_alone():
+    mask = np.zeros((512, 512), np.uint8)
+    cv2.fillPoly(
+        mask,
+        [np.array([[80, 90], [420, 60], [450, 430], [110, 470]], np.int32)],
+        255,
+    )
+    contour = neural._largest_contour(mask)
+    assert neural._merged_sheet_split(mask, contour) is None
+
+
+def test_merge_split_rejects_hand_notch():
+    """Entalhe de mão no topo da folha: o corte não pode produzir
+    dois 'retângulos' — um dedo não é papel."""
+    mask = np.zeros((512, 512), np.uint8)
+    cv2.fillPoly(
+        mask,
+        [np.array([[80, 60], [430, 40], [460, 440], [100, 480]], np.int32)],
+        255,
+    )
+    # Mordida profunda na aresta superior — formato de palma/dedo.
+    cv2.circle(mask, (255, 50), 45, 0, -1)
+    contour = neural._largest_contour(mask)
+    piece = neural._merged_sheet_split(mask, contour)
+    if piece is not None:
+        # Se cortou, o pedaço devolvido continua sustentando a folha.
+        assert np.count_nonzero(piece) > 0.6 * np.count_nonzero(mask)
+
+
+def test_merge_split_tolerates_self_intersecting_contour():
+    """Contorno com auto-interseção (blob fragmentado por mão/dobra)
+    faz o convexityDefects levantar — o split devolve None em vez
+    de derrubar a detecção inteira (crash medido no desk-*)."""
+    mask = np.zeros((256, 256), np.uint8)
+    pts = np.array(
+        [[40, 40], [200, 60], [120, 140], [220, 180], [60, 200], [100, 110]],
+        np.int32,
+    )
+    cv2.fillPoly(mask, [pts], 255)
+    contour = neural._largest_contour(mask)
+    assert neural._merged_sheet_split(mask, contour) is None
