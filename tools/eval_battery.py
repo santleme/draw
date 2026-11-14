@@ -61,6 +61,11 @@ PROFILES = {
     "hardened": {
         "DRAW_ANCHOR_COVERAGE_GUARD": "1",
         "DRAW_IDENTITY_ECC_ALIGN": "1",
+        # Par travado: a máscara de mão do seg só sai no extras
+        # quando a cobertura está ligada; a oclusão consome ela.
+        # Medido no sim-hand: 421k → 36k px confirmados.
+        "DRAW_SHEET_COVERAGE": "1",
+        "DRAW_SEG_HAND_OCCLUSION": "1",
     },
 }
 
@@ -71,6 +76,8 @@ TOGGLED_ENV = (
     "DRAW_IDENTITY_ECC_ALIGN",
     "DRAW_ECC_REFINE",
     "DRAW_IDENTITY_CHAMFER",
+    "DRAW_SHEET_COVERAGE",
+    "DRAW_SEG_HAND_OCCLUSION",
 )
 
 
