@@ -138,8 +138,13 @@ _TEXTS = [
 ]
 
 # Fotos reais de mesa do laboratório — quando existem, metade dos
-# cenários gerados usa foto de fundo em vez do procedural.
-_DESK_PHOTOS_GLOB = "/home/lucas_coimbra/draw-lab/fp-fresh-*/fresh_*.jpg"
+# cenários gerados usa foto de fundo em vez do procedural. O glob é
+# configurável (--desk-photos / DRAW_DESK_PHOTOS_GLOB): sem ele a
+# distribuição metade-foto só existia na máquina do laboratório.
+_DESK_PHOTOS_GLOB = os.environ.get(
+    "DRAW_DESK_PHOTOS_GLOB",
+    "/home/lucas_coimbra/draw-lab/fp-fresh-*/fresh_*.jpg",
+)
 
 # Folha que o sim_source produz (size_idx=0 fixo em
 # SyntheticCapture.__init__) — o retângulo de borracha é
@@ -272,12 +277,14 @@ def _photo_identity(argv):
 _GENERATION_MANIFEST = "battery-manifest.json"
 
 
-def _generate_captures(count, seed, out_dir):
+def _generate_captures(count, seed, out_dir, desk_photos_glob=None):
     """Grava `count` captures novos e devolve o dict BATTERY-style."""
     import glob
     import subprocess
 
-    desk_photos = sorted(glob.glob(_DESK_PHOTOS_GLOB))
+    desk_photos = sorted(
+        glob.glob(_DESK_PHOTOS_GLOB if desk_photos_glob is None else desk_photos_glob)
+    )
     rng = np.random.default_rng(seed)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -606,6 +613,16 @@ def main(argv=None):
         action="store_true",
         help="roda só os cenários gerados (útil com --generate)",
     )
+    parser.add_argument(
+        "--desk-photos",
+        metavar="GLOB",
+        help=(
+            "glob das fotos de mesa para os cenários gerados "
+            "(default: DRAW_DESK_PHOTOS_GLOB ou o diretório do "
+            "laboratório) — torna a distribuição metade-foto "
+            "portátil entre máquinas"
+        ),
+    )
     parser.add_argument("--out", type=Path, help="grava o relatório JSON")
     parser.add_argument("--neural-model", default=NEURAL)
     parser.add_argument("--page-clean-model")
@@ -625,7 +642,9 @@ def main(argv=None):
     captures_dir = args.captures
     if args.generate:
         gen_dir = args.captures / f"battery-gen-{args.gen_seed}"
-        generated = _generate_captures(args.generate, args.gen_seed, gen_dir)
+        generated = _generate_captures(
+            args.generate, args.gen_seed, gen_dir, args.desk_photos
+        )
         for name in generated:
             battery[f"gen/{name}"] = {
                 "name": name,

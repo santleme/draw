@@ -78,19 +78,23 @@ def _sheet_mask_for(quad, shape=(720, 1280)):
 
 class _SyncDetectionWorker:
     """Trabalhadora síncrona com extras (7º elemento): o script
-    devolve (cantos, veredito, extras) por submissão."""
+    devolve (cantos, veredito, extras) por submissão. Retém um
+    rastro por detecção até take_traces, como a trabalhadora real
+    no caminho traced — quem não drena, vê a fila crescer."""
 
     def __init__(self, script):
         self._script = script
         self._result = None
         self._seq = 0
         self._submits = 0
+        self._traces = []
         self.error = None
 
     def submit(self, frame, captured_at, frame_index=None):
         corners, verdict, extras = self._script(self._submits)
         self._submits += 1
         self._seq += 1
+        self._traces.append({"result_seq": self._seq, "acq_seq": self._seq})
         self._result = (self._seq, corners, verdict, captured_at, 1.0, None, extras)
 
     def poll(self, after_seq):
@@ -99,7 +103,17 @@ class _SyncDetectionWorker:
         return self._result
 
     def take_traces(self, upto_result_seq=None):
-        return []
+        if upto_result_seq is None:
+            taken, self._traces = self._traces, []
+            return taken
+        taken = [
+            trace
+            for trace in self._traces
+            if trace["result_seq"] is not None
+            and trace["result_seq"] <= upto_result_seq
+        ]
+        self._traces = [trace for trace in self._traces if trace not in taken]
+        return taken
 
 
 def _make_loop(script):
@@ -304,3 +318,27 @@ def test_traced_detection_carries_sheet_mask_and_luma(monkeypatch):
     # detecção — não com o frame que o laço tiver na mão.
     later = np.full((200, 300, 3), 20, np.uint8)
     assert extras["quad_luma"] != app_module._quad_luma_mean(later, corners)
+
+
+def test_unrecorded_detections_drain_the_trace_queue(monkeypatch):
+    """A guarda liga o caminho traced fora de sessão gravada: cada
+    detecção produz um rastro e a fila é drenada a cada rodada —
+    sem a drenagem ela crescia a sessão inteira."""
+    monkeypatch.setenv("DRAW_ANCHOR_COVERAGE_GUARD", "1")
+    good = _sheet_mask_for(QUAD)
+
+    def script(i):
+        # Folha entra e sai: o rastreador nunca assenta a cadência
+        # de detecção — cada passo submete de verdade.
+        if i % 3 == 2:
+            return None, "none", {"sheet_mask": good, "source": "neural"}
+        return QUAD.copy(), "paper", {"sheet_mask": good, "source": "neural"}
+
+    loop = _make_loop(script)
+    assert not loop.trace_acquisitions
+    _drive(loop, 10)
+    worker = loop.detection_worker
+    assert worker._submits > 3, "poucas detecções — a fila não foi medida"
+    # Rodadas consumidas saem da fila; sobra no máximo a detecção
+    # em voo da última submissão.
+    assert len(worker._traces) <= 1

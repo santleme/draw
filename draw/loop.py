@@ -160,7 +160,11 @@ def ink_follow_move_enabled():
 # rodadas seguidas, o refresh é vetado — quad próximo vira "none",
 # evento de só-presença também — e a queda acontece pelo caminho
 # natural do rastreador. Reivindicação distante (detecção longe da
-# âncora) passa intacta: salto de folha é julgamento da arbitragem.
+# âncora, ou sem âncora) também não passa de graça: a guarda vira
+# portão de aquisição e o quad "paper" novo precisa medir folha de
+# verdade — luma de papel sempre, fração da máscara neural quando a
+# fonte é o seg — o que barra o falso quad da mesa (~110) antes de
+# nascer âncora.
 _ANCHOR_GUARD_MIN_COVERAGE = 0.25
 _ANCHOR_GUARD_MISS_ROUNDS = 5
 _ANCHOR_GUARD_MIN_DET_COVERAGE = 0.85
@@ -746,10 +750,16 @@ class SheetInkLoop:
             ran_detection,
             det_captured_at if ran_detection else self._clock(),
         )
+        if ran_detection:
+            # A fila de rastros é drenada mesmo fora de sessão
+            # gravada: a forma traced da detecção também serve os
+            # extras (cobertura/guarda), e ninguém mais a consome —
+            # sem a drenagem ela crescia a sessão inteira.
+            det_traces = self.detection_worker.take_traces(self.last_det_seq)
         if self.trace_acquisitions:
             if ran_detection:
                 tracker_after = self.tracker.diagnostic_state()
-                for trace in self.detection_worker.take_traces(self.last_det_seq):
+                for trace in det_traces:
                     consumed = trace["result_seq"] == self.last_det_seq
                     if consumed:
                         self.last_acq_seq = trace["acq_seq"]

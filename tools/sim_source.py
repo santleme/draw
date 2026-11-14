@@ -120,6 +120,9 @@ class SyntheticCapture:
         if resting_pen:
             _apply_resting_pen(self._paper, self.pw, self.ph)
             _apply_resting_pen(self._paper_pristine, self.pw, self.ph)
+            self._pen_mask = _resting_pen_mask(self.pw, self.ph)
+        else:
+            self._pen_mask = None
         self.specs = plan_text_strokes(text, self._rng, self.pw, self.ph, height=height)
         self.quad = gs._sample_normal_quad(self._rng, self.pw, self.ph)
         # O gerador de treino admite folha cortada. A câmera inicial do
@@ -473,6 +476,12 @@ class SyntheticCapture:
         self.page_to_scene = cv2.getPerspectiveTransform(
             self._page_corners, self._quad_now
         )
+        if self._pen_mask is not None:
+            # Oclusão física: o traço não atravessa a caneta — no
+            # frame renderizado, a silhueta cobre a tinta. O GT do
+            # bundle segue geométrico (o traço existe sob a caneta).
+            paper[self._pen_mask] = self._paper_pristine[self._pen_mask]
+            ink[self._pen_mask] = 0
         quad = self._quad_now
         rgb_w, paper_mask, ink_w, paper_cov, ink_cov = gs._warp_paper(paper, ink, quad)
         rgb = self._background.copy()
@@ -641,6 +650,17 @@ def _apply_ruled(paper, pw, ph):
     for y in range(spacing * 2, ph - spacing // 2, spacing):
         cv2.line(paper, (0, y), (pw, y), (215, 200, 190), 1, cv2.LINE_AA)
     cv2.line(paper, (pw // 16, 0), (pw // 16, ph), (205, 180, 180), 1, cv2.LINE_AA)
+
+
+def _resting_pen_mask(pw, ph):
+    """Silhueta da caneta em repouso, para a oclusão física dela.
+
+    Renderiza a própria caneta sobre preto e limiariza — a máscara
+    segue qualquer mudança no desenho sem duplicar a geometria.
+    """
+    scratch = np.zeros((ph, pw, 3), np.uint8)
+    _apply_resting_pen(scratch, pw, ph)
+    return scratch.any(axis=2)
 
 
 def _apply_resting_pen(paper, pw, ph):

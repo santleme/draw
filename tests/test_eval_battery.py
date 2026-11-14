@@ -149,3 +149,33 @@ def test_final_checkpoint_healthy_reports_ok():
     assert final["iou"] == 0.9
     # Os problemas continuam com a palavra deles.
     assert "checkpoint" in eval_scenario._final_checkpoint([], events)["status"]
+
+
+def test_desk_photos_glob_is_configurable(tmp_path, monkeypatch):
+    """--desk-photos/DRAW_DESK_PHOTOS_GLOB tornam portátil o glob das
+    fotos de mesa — antes era fixo no diretório do laboratório."""
+    import glob as glob_module
+    import subprocess
+
+    photo = tmp_path / "mesa.jpg"
+    photo.write_bytes(b"\xff\xd8\xff")
+    seen = []
+    monkeypatch.setattr(
+        glob_module, "glob", lambda pattern: seen.append(pattern) or [str(photo)]
+    )
+
+    def fake_run(cmd, **kwargs):
+        target = Path(cmd[cmd.index("--out") + 1])
+        target.write_bytes(b"")
+        np.savez(target.with_suffix(".gt.npz"), a=np.zeros(1))
+        np.save(target.with_name(target.stem + "_ink_full.npy"), np.zeros(1, np.uint8))
+        target.with_suffix(".json").write_text("{}", encoding="utf-8")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    pattern = str(tmp_path / "fotos" / "*.jpg")
+    generated = eval_battery._generate_captures(
+        1, 0, tmp_path / "gen", desk_photos_glob=pattern
+    )
+    assert seen == [pattern]
+    assert list(generated) == ["gen-000"]

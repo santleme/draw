@@ -1423,12 +1423,24 @@ def _align_identity_masks(reference, candidate):
     # Polimento so nas melhores sementes: cada ECC e o trecho
     # caro do resgate e a bacia certa ja aparece na pontuacao da
     # similaridade.
+    ref_d = cv2.dilate(ref_bin.astype(np.uint8), kernel) > 0
     for recall, tag, _aligned, warp in scored[:3]:
-        # O ECC roda sob o lock do worker: similaridade ja no teto
-        # dispensa polimento (o veredito nao muda) e a cadeia para
-        # no primeiro mapa quase perfeito.
-        if min(half) < 2 or best[0] >= 0.9:
+        # O ECC roda sob o lock do worker: para de refinar so
+        # quando o mapa vencedor ja cobre os DOIS limiares do
+        # veredito — recall no teto com tinta sobrando fora da
+        # referencia (containment baixo) ainda merece a tentativa.
+        if min(half) < 2:
             break
+        if best[0] >= 0.9:
+            seen_b = best[2] > 0.5
+            seen_b_px = int(np.count_nonzero(seen_b))
+            contain_b = (
+                np.count_nonzero(seen_b & ref_d) / seen_b_px
+                if seen_b_px
+                else 0.0
+            )
+            if contain_b >= 0.5:
+                break
         polished = polish(warp, tag)
         if polished is not None and polished[0] > best[0]:
             best = polished

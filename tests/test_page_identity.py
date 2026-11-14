@@ -583,3 +583,34 @@ def test_align_identity_masks_does_not_forge_other_page():
     seen_d = cv2.dilate(seen.astype(np.uint8), kernel) > 0
     recall = np.count_nonzero((ref > 0.5) & seen_d) / (ref > 0.5).sum()
     assert recall < ink._PAGE_IDENTITY_MIN_RECALL
+
+
+def test_align_identity_masks_polishes_when_containment_is_low(monkeypatch):
+    """Recall no teto com containment baixo ainda tenta o ECC.
+
+    O corte cego por recall parava o resgate num mapa que o juiz
+    reprovaria — o early-break so vale quando os DOIS limiares do
+    veredito (recall E containment) ja estao cobertos.
+    """
+    cv2 = pytest.importorskip("cv2")
+
+    shape = (200, 200)
+    ref = np.zeros(shape, np.float32)
+    cv2.line(ref, (20, 40), (70, 120), 1.0, 3)
+    cv2.line(ref, (30, 150), (80, 60), 1.0, 2)
+    cand = ref.copy()
+    cv2.circle(cand, (160, 160), 40, 1.0, -1)  # massa extra >2x a da ref
+
+    monkeypatch.setattr(cv2, "warpAffine", lambda src, M, dsize, **kw: src.copy())
+    ecc_calls = []
+
+    def fake_ecc(*args, **kwargs):
+        ecc_calls.append(1)
+        return 1.0, np.eye(3, dtype=np.float32)
+
+    monkeypatch.setattr(cv2, "findTransformECC", fake_ecc)
+
+    aligned, info = ink._align_identity_masks(ref, cand)
+    assert ecc_calls, "o early-break por recall pulou o polimento"
+    assert info["align_converged"]
+    assert np.array_equal(aligned, cand)
