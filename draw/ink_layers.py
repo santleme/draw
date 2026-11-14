@@ -832,6 +832,48 @@ def _registration_is_identity(matrix):
     )
 
 
+def _positional_anchor(anchor, roll):
+    """A ancora sem a rotulacao ciclica, para pareamento posicional.
+
+    A ancora pode carregar os cantos rolados por k (pouso rodado
+    julgado pela arbitragem): o par (ancora, roll) e a rotulacao
+    certa para registrar tinta, mas comparacoes POSICIONAIS —
+    deslocamento de pose, gatilhos geometricos — precisam dos
+    cantos na ordem em que o rastreador os entrega. Rotulo de
+    canto nao e folha se movendo.
+    """
+    if anchor is None or not roll:
+        return anchor
+    return np.roll(anchor, -roll, axis=0)
+
+
+def _registration_gate_metrics(anchor, roll, reg_corners, shape):
+    """Deslocamento do registro nas duas leituras que a passada usa.
+
+    `registration_displacement_px` descreve o warp aplicado ao mapa
+    (a rotulacao rolada da ancora faz parte dele — e o que posiciona
+    a tinta na grade). `registration_displacement_positional_px`
+    mede so a POSE: mesma leitura posicional dos gatilhos de
+    arbitragem/FOLLOW. Os portoes de confirmacao e remocao leem a
+    segunda — um roll parado nao e a folha se movendo e nao pode
+    segurar a tinta nova refem para sempre (pagina que pousou
+    rodada media o rotulo como deslocamento permanente).
+    """
+    if anchor is None or reg_corners is None:
+        return {}
+    matrix = _registration_matrix(anchor, reg_corners, shape)
+    positional = _registration_matrix(
+        _positional_anchor(anchor, roll), reg_corners, shape
+    )
+    return {
+        "registration_displacement_px": _matrix_grid_displacement(matrix, shape),
+        "registration_is_identity": _registration_is_identity(matrix),
+        "registration_displacement_positional_px": _matrix_grid_displacement(
+            positional, shape
+        ),
+    }
+
+
 def _experimental_enabled(name):
     return os.environ.get(name, "0").strip().lower() in ("1", "true", "yes", "on")
 
@@ -1358,18 +1400,18 @@ def _align_identity_masks(reference, candidate):
             recall_p = float(
                 np.count_nonzero(ref_bin & seen_p) / ref_bin.sum()
             )
-            return recall_p, f"{tag}+ecc", aligned_p
+            return recall_p, f"{tag}+ecc", aligned_p, warp_p
 
-    scored = []  # (recall, mode, aligned, warp)
+    scored = []  # (recall, mode, aligned, warp2x3)
     for theta, scl, ctr_ref, ctr_cand, tag in seeds:
         aligned, warp, recall = score(theta, scl, ctr_ref, ctr_cand)
         if aligned is not None:
             scored.append((recall, tag, aligned, warp))
     scored.sort(key=lambda entry: entry[0], reverse=True)
-    best = None  # (recall, mode, aligned)
-    for recall, tag, aligned, _warp in scored:
+    best = None  # (recall, mode, aligned, warp3x3)
+    for recall, tag, aligned, warp in scored:
         if best is None or recall > best[0]:
-            best = (recall, tag, aligned)
+            best = (recall, tag, aligned, np.vstack((warp, [0.0, 0.0, 1.0])))
     # Polimento so nas melhores sementes: cada ECC e o trecho
     # caro do resgate e a bacia certa ja aparece na pontuacao da
     # similaridade.
@@ -1379,7 +1421,7 @@ def _align_identity_masks(reference, candidate):
             if polished is not None and polished[0] > best[0]:
                 best = polished
     if best is None or best[0] < 0.35:
-        grid_best = None  # (recall, mode, aligned, warp)
+        grid_best = None  # (recall, mode, aligned, warp2x3)
         for theta, tag in coarse:
             aligned, warp, recall = score(
                 theta, scale, c_ref, c_cand
@@ -1387,7 +1429,7 @@ def _align_identity_masks(reference, candidate):
             if aligned is None:
                 continue
             if best is None or recall > best[0]:
-                best = (recall, tag, aligned)
+                best = (recall, tag, aligned, np.vstack((warp, [0.0, 0.0, 1.0])))
             if grid_best is None or recall > grid_best[0]:
                 grid_best = (recall, tag, aligned, warp)
         if grid_best is not None and min(half) >= 2:
@@ -1400,6 +1442,10 @@ def _align_identity_masks(reference, candidate):
     info["align_converged"] = True
     info["align_mode"] = best[1]
     info["align_cc"] = best[0]
+    # A homografia cand->ref que o juiz validou, em lista para o
+    # evento serializar: quem resgatou a pagina a usa para votar a
+    # passada no mapa alinhado em vez do registrado deslocado.
+    info["align_matrix"] = best[3].tolist()
     return best[2], info
 
 
@@ -1479,6 +1525,13 @@ class _LayeredInkAccumulator:
         self._provisional = None
         self._provisional_ever = None
         self._retracted_ever = None
+        # Somas vitalicias das ever-masks: reset_vote_memory zera as
+        # mascaras posicionais (grade nova), mas a telemetria
+        # acumulada — retracted_px_total, provisional_ever_px — nao
+        # pode recuar: o SessionTelemetry le deltas e um total que
+        # cai vira incremento negativo.
+        self._provisional_ever_lifetime = 0
+        self._retracted_lifetime = 0
         self._low_overlap_streak = 0
         self._turn_fired = False
         self._score_buf = None
@@ -1930,6 +1983,15 @@ class _LayeredInkAccumulator:
         """
         self._window.clear()
         self._removal_streak = None
+        # As ever-masks recomecam na grade nova, mas o que elas ja
+        # contaram segue nos totais vitalicios — a serie reportada
+        # ao SessionTelemetry e monotonica dentro da geracao.
+        if self._provisional_ever is not None:
+            self._provisional_ever_lifetime += int(
+                np.count_nonzero(self._provisional_ever)
+            )
+        if self._retracted_ever is not None:
+            self._retracted_lifetime += int(np.count_nonzero(self._retracted_ever))
         for name in ("_provisional", "_provisional_ever", "_retracted_ever"):
             mask = getattr(self, name)
             if mask is not None:
@@ -1950,9 +2012,7 @@ class _LayeredInkAccumulator:
         """
         self._removal_fast_left = _REMOVAL_FAST_WINDOW
 
-    def add(
-        self, prob, visible=None, *, removal_allowed=True, confirm_allowed=True
-    ):
+    def add(self, prob, visible=None, *, removal_allowed=True, confirm_allowed=True):
         prob = np.asarray(prob, dtype=np.float32)
         if visible is not None:
             visible = np.asarray(visible, dtype=bool)
@@ -1964,6 +2024,10 @@ class _LayeredInkAccumulator:
             self._provisional = np.zeros(prob.shape, dtype=np.uint8)
             self._provisional_ever = np.zeros(prob.shape, dtype=bool)
             self._retracted_ever = np.zeros(prob.shape, dtype=bool)
+            # Grade nova de verdade (forma mudou): a serie vitalicia
+            # tambem recomeca — pixels de outra geometria nao somam.
+            self._provisional_ever_lifetime = 0
+            self._retracted_lifetime = 0
             self._window.clear()
             self._low_overlap_streak = 0
             self._turn_fired = False
@@ -2208,8 +2272,10 @@ class _LayeredInkAccumulator:
             "confirm_blocked_px": confirm_blocked_px,
             "confirmed_px": int(np.count_nonzero(self._confirmed)),
             "provisional_px": int(np.count_nonzero(self._provisional)),
-            "provisional_ever_px": int(np.count_nonzero(self._provisional_ever)),
-            "retracted_px_total": int(np.count_nonzero(self._retracted_ever)),
+            "provisional_ever_px": self._provisional_ever_lifetime
+            + int(np.count_nonzero(self._provisional_ever)),
+            "retracted_px_total": self._retracted_lifetime
+            + int(np.count_nonzero(self._retracted_ever)),
             "turn": turn,
         }
         if _experimental_enabled("DRAW_INK_REMOVAL"):
@@ -2356,6 +2422,13 @@ class _PageCleanWorker:
         self._anchor_roll = 0
         self._identity_reference = None
         self._identity_reference_corners = None
+        # O roll que rotula _identity_reference_corners: a copia da
+        # ancora salva na troca de geracao carrega a rotulacao
+        # vigente; o contador zera junto com a ancora, entao o roll
+        # precisa viajar junto para as comparacoes posicionais da
+        # recuperacao (e para restaurar a coerencia ancora/roll no
+        # veredito keep_page).
+        self._identity_reference_roll = 0
         self._identity_recovery_requested = False
         self._identity_defer_count = 0
         self._identity_switch_votes = 0
@@ -2454,9 +2527,13 @@ class _PageCleanWorker:
                     if self._anchor_corners is None
                     else self._anchor_corners.copy()
                 )
+                # Salva antes do zero abaixo: a referencia e a ancora
+                # rotulada de agora — o roll dela e o que descreve.
+                self._identity_reference_roll = self._anchor_roll
             else:
                 self._identity_reference = None
                 self._identity_reference_corners = None
+                self._identity_reference_roll = 0
             self._generation += 1
             self._anchor_samples = []
             self._content_guard_quads = []
@@ -2555,7 +2632,15 @@ class _PageCleanWorker:
                 # moldura ou a saida prova que nao ha nada novo.
                 away = (
                     float(
-                        np.max(np.linalg.norm(corners - self._anchor_corners, axis=1))
+                        np.max(
+                            np.linalg.norm(
+                                corners
+                                - _positional_anchor(
+                                    self._anchor_corners, self._anchor_roll
+                                ),
+                                axis=1,
+                            )
+                        )
                     )
                     > _GEO_WAKE_MOVE_PX
                 )
@@ -2652,6 +2737,16 @@ class _PageCleanWorker:
             return False
         if self._identity_recovery_requested and self._identity_reference is not None:
             return False
+        if len(self._accumulator._window) < _INK_VOTE_WINDOW:
+            # A janela de voto incompleta trava o descanso: a
+            # re-ancoragem (reset_vote_memory) esvazia a janela
+            # MAS os contadores de quietude sao da geracao e
+            # seguem contados — sem esta guarda a trabalhadora
+            # dormia antes da tinta fraca juntar os votos que o
+            # protocolo exige para confirmar, e o traco morria
+            # provisorio. As passadas rodadas aqui enchem a
+            # janela; cheia, a quietude normal decide.
+            return False
         if (
             self._generation_passes < _REST_MIN_GENERATION_PASSES
             or self._quiet_passes < _REST_QUIET_PASSES
@@ -2718,7 +2813,11 @@ class _PageCleanWorker:
             self._migration_streak = 0
             self._migration_quads = []
             return None
-        matrix = _registration_matrix(old_anchor, corners, shape)
+        # Pareamento posicional, como o da arbitragem/FOLLOW: o
+        # roll parado e rotulacao, nao deslocamento de pose.
+        matrix = _registration_matrix(
+            _positional_anchor(old_anchor, self._anchor_roll), corners, shape
+        )
         displacement = _matrix_grid_displacement(matrix, shape)
         if displacement <= _ANCHOR_MIGRATION_DISPLACEMENT_PX:
             self._migration_streak = 0
@@ -2729,6 +2828,11 @@ class _PageCleanWorker:
         if self._migration_streak < _ANCHOR_MIGRATION_PASSES:
             return None
         new_anchor = _median_anchor(self._migration_quads)
+        if self._anchor_roll != 0:
+            # Pouso sobre a grade rolada: a mediana posicional
+            # rolada pelo roll parado — a coerencia ancora/roll
+            # que arbitragem e FOLLOW ja mantem.
+            new_anchor = np.roll(new_anchor, self._anchor_roll, axis=0)
         # Inversa do registro ancora-nova -> ancora-velha: leva o
         # estado da grade velha para a nova.
         migration = np.linalg.inv(_registration_matrix(old_anchor, new_anchor, shape))
@@ -3355,7 +3459,13 @@ class _PageCleanWorker:
             self._identity_watch_streak = 0
             return None, False
         displacement = float(
-            np.max(np.linalg.norm(corners - self._anchor_corners, axis=1))
+            np.max(
+                np.linalg.norm(
+                    corners
+                    - _positional_anchor(self._anchor_corners, self._anchor_roll),
+                    axis=1,
+                )
+            )
         )
         if displacement > _IDENTITY_WATCH_MAX_DISPLACEMENT_PX:
             self._identity_watch_streak = 0
@@ -3533,6 +3643,11 @@ class _PageCleanWorker:
         identity_timed_out = False
         identity_switch_pending = False
         identity_align_info = None
+        # Resgate por conteudo vencido: o mapa alinhado que o juiz
+        # validou e a homografia cand->ref que o produziu — o voto
+        # da passada precisa deles (ver o bloco de escolha da prob).
+        identity_aligned_candidate = None
+        identity_align_matrix = None
         quarantine_reason = None
         quarantine_frames = 0
         ecc_refine_enabled = int(_ecc_refinement_enabled())
@@ -3712,11 +3827,20 @@ class _PageCleanWorker:
                         0.0,
                     ).astype(np.float32)
             if anchor is not None and registration_corners is not None:
-                matrix = _registration_matrix(anchor, registration_corners, prob.shape)
-                reg_info["registration_displacement_px"] = _matrix_grid_displacement(
-                    matrix, prob.shape
+                # A referencia salva na troca de geracao traz o roll
+                # dela; fora da recuperacao vale o roll corrente.
+                reg_info.update(
+                    _registration_gate_metrics(
+                        anchor,
+                        (
+                            self._identity_reference_roll
+                            if recovering
+                            else self._anchor_roll
+                        ),
+                        registration_corners,
+                        prob.shape,
+                    )
                 )
-                reg_info["registration_is_identity"] = _registration_is_identity(matrix)
         except Exception as error:  # noqa: BLE001 - vai para o laco
             with self._condition:
                 self._error = error
@@ -3853,22 +3977,15 @@ class _PageCleanWorker:
                     # mede: com mascara de visibilidade, so a parte
                     # visivel; sem ela, a referencia inteira.
                     if identity_visible is not None:
-                        align_target = np.where(
-                            prior_visible, prior, 0.0
-                        )
+                        align_target = np.where(prior_visible, prior, 0.0)
                     else:
                         align_target = prior
-                    candidate_aligned, identity_align_info = (
-                        _align_identity_masks(align_target, candidate)
+                    candidate_aligned, identity_align_info = _align_identity_masks(
+                        align_target, candidate
                     )
                     if identity_align_info["align_converged"]:
-                        seen_a = (
-                            candidate_aligned > self._accumulator.threshold
-                        )
-                        seen_ad = (
-                            cv2.dilate(seen_a.astype(np.uint8), kernel)
-                            > 0
-                        )
+                        seen_a = candidate_aligned > self._accumulator.threshold
+                        seen_ad = cv2.dilate(seen_a.astype(np.uint8), kernel) > 0
                         seen_a_px = int(np.count_nonzero(seen_a))
                         if identity_visible is not None:
                             recall_a = (
@@ -3876,14 +3993,11 @@ class _PageCleanWorker:
                                 / prior_visible_px
                             )
                         else:
-                            recall_a = (
-                                np.count_nonzero(prior & seen_ad) / prior_px
-                            )
+                            recall_a = np.count_nonzero(prior & seen_ad) / prior_px
                         contain_a = (
                             0.0
                             if seen_a_px == 0
-                            else np.count_nonzero(seen_a & prior_d)
-                            / seen_a_px
+                            else np.count_nonzero(seen_a & prior_d) / seen_a_px
                         )
                         if (
                             recall_a >= _PAGE_IDENTITY_MIN_RECALL
@@ -3895,6 +4009,13 @@ class _PageCleanWorker:
                             identity_recall = recall_a
                             identity_containment = contain_a
                             keep_page = True
+                            matrix = np.asarray(
+                                identity_align_info.get("align_matrix"),
+                                dtype=np.float64,
+                            )
+                            if matrix.shape == (3, 3):
+                                identity_aligned_candidate = candidate_aligned
+                                identity_align_matrix = matrix
                 if (
                     identity_reference is not None
                     and ecc_refine_enabled
@@ -3922,11 +4043,20 @@ class _PageCleanWorker:
                 # nunca assentar.
                 pose_displaced = False
                 if corners is not None and identity_corners is not None:
+                    # Os cantos de referencia podem carregar o roll
+                    # de um pouso rodado; o quad entrante e sempre
+                    # posicional — o pareamento segue a mesma
+                    # convencao dos gatilhos geometricos.
                     pose_displaced = (
                         float(
                             np.max(
                                 np.linalg.norm(
-                                    corners - identity_corners, axis=1
+                                    corners
+                                    - _positional_anchor(
+                                        identity_corners,
+                                        self._identity_reference_roll,
+                                    ),
+                                    axis=1,
                                 )
                             )
                         )
@@ -3935,6 +4065,7 @@ class _PageCleanWorker:
                 if (
                     identity_recovery_requested
                     and identity_reference is not None
+                    and not keep_page
                     and corners is not None
                     and pose_displaced
                     and (
@@ -4065,6 +4196,15 @@ class _PageCleanWorker:
                             if reg_anchor_median and corners is not None
                             else []
                         )
+                    else:
+                        # Pagina preservada: a ancora antiga fica —
+                        # e ela pode ser a rotulada de um pouso
+                        # rodado. O roll que a descreve foi salvo na
+                        # troca de geracao; sem restaura-lo, o par
+                        # ancora/roll sai incoerente (ancora rolada
+                        # + roll 0) e todo pareamento posicional
+                        # passa a ler rotulo como deslocamento.
+                        self._anchor_roll = self._identity_reference_roll
                     # Keep the old anchor when identity matched: all future
                     # observations remain registered into the same canvas.
                     self._identity_reference = None
@@ -4133,6 +4273,17 @@ class _PageCleanWorker:
                             visible,
                         )
                     )
+                    # A ancora trocou nesta passada: os portoes
+                    # leem o deslocamento da grade VIGENTE, nao o
+                    # do registro que motivou a troca.
+                    reg_info.update(
+                        _registration_gate_metrics(
+                            self._anchor_corners,
+                            self._anchor_roll,
+                            self._reg_frozen_corners if reg_deadband else corners,
+                            prob.shape,
+                        )
+                    )
                     force_publish = True
             elif anchor_migration and not anchor_follow:
                 migration = self._anchor_migration_step(
@@ -4160,6 +4311,14 @@ class _PageCleanWorker:
                             (self._reg_frozen_corners if reg_deadband else corners),
                             migrated_reference,
                             visible,
+                        )
+                    )
+                    reg_info.update(
+                        _registration_gate_metrics(
+                            self._anchor_corners,
+                            self._anchor_roll,
+                            self._reg_frozen_corners if reg_deadband else corners,
+                            prob.shape,
                         )
                     )
                     force_publish = True
@@ -4213,6 +4372,14 @@ class _PageCleanWorker:
                             visible,
                         )
                     )
+                    reg_info.update(
+                        _registration_gate_metrics(
+                            self._anchor_corners,
+                            self._anchor_roll,
+                            self._reg_frozen_corners if reg_deadband else corners,
+                            prob.shape,
+                        )
+                    )
                     arbitration_abstain = False
                     force_publish = True
             identity_watch_suspect = False
@@ -4253,6 +4420,17 @@ class _PageCleanWorker:
                     "reg_content_identity_won", False
                 )
                 reg_info.update(content_info)
+                if content_info.get("reg_content_identity_won"):
+                    # A guarda trocou a ancora por conteudo: os
+                    # portoes leem o registro da grade vigente.
+                    reg_info.update(
+                        _registration_gate_metrics(
+                            self._anchor_corners,
+                            self._anchor_roll,
+                            corners,
+                            prob.shape,
+                        )
+                    )
             if (
                 (first_pass or identity_pending)
                 and not identity_deferred
@@ -4264,6 +4442,24 @@ class _PageCleanWorker:
             else:
                 prob = registered_prob
                 visible = registered_visible
+                if identity_aligned_candidate is not None:
+                    # A passada que o resgate por conteudo alinhou
+                    # vota no mapa alinhado que o juiz validou —
+                    # votar a registrada crua depositava de novo a
+                    # copia deslocada que o veredito acabou de
+                    # descartar, refazendo a falha a cada passada.
+                    prob = identity_aligned_candidate
+                    if registered_visible is not None:
+                        visible = (
+                            cv2.warpPerspective(
+                                registered_visible.astype(np.uint8),
+                                identity_align_matrix,
+                                (prob.shape[1], prob.shape[0]),
+                                flags=cv2.INTER_NEAREST,
+                                borderValue=0,
+                            )
+                            > 0
+                        )
             if identity_switch_pending or (
                 identity_deferred
                 and (quarantine_reason == "ecc_rejected" or identity_timed_out)
@@ -4287,7 +4483,7 @@ class _PageCleanWorker:
                 # confirmar no canvas da antiga antes do
                 # veredito de identidade.
                 visible = np.zeros(prob.shape, dtype=bool)
-            _reg_disp_px = reg_info.get("registration_displacement_px")
+            _reg_disp_px = reg_info.get("registration_displacement_positional_px")
             motion_gate_blocked = (
                 _motion_confirm_gate_enabled()
                 and _reg_disp_px is not None
@@ -4308,15 +4504,15 @@ class _PageCleanWorker:
                     and corners is not None
                     and watch_step_px is not None
                     and watch_step_px <= _ARB_SETTLE_PX
-                    and reg_info.get("registration_displacement_px", float("inf"))
+                    and reg_info.get(
+                        "registration_displacement_positional_px", float("inf")
+                    )
                     <= _ANCHOR_MIGRATION_DISPLACEMENT_PX
                 ),
                 confirm_allowed=not motion_gate_blocked,
             )
             if result.get("confirm_blocked_px"):
-                reg_info["motion_confirm_blocked_px"] = result[
-                    "confirm_blocked_px"
-                ]
+                reg_info["motion_confirm_blocked_px"] = result["confirm_blocked_px"]
             if result.get("ink_vote_e3"):
                 # Telemetria da regra E3 (so com DRAW_INK_VOTE_E3
                 # ligada): fase da geracao e trilhas abertas.

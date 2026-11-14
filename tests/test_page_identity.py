@@ -123,6 +123,68 @@ def test_ecc_rejected_defers_and_preserves_canvas(worker):
     np.testing.assert_array_equal(worker.poll(generation, 0)[1], canvas)
 
 
+def test_displaced_pose_with_matching_content_keeps_page(worker):
+    """A quarentena de pose não segura um veredito que já passou.
+
+    A página voltou deslocada (drop→retorno ainda assentando): a
+    pose diverge da âncora, mas o conteúdo registrado casa — o
+    recall decide same_page na hora. Antes, o adiamento por pose
+    corria o relógio da quarentena mesmo com keep_page e o
+    timeout apagava o canvas que o juiz já tinha validado.
+    """
+    worker, _control = worker
+    canvas = settle(worker)
+    generation = worker.new_generation(preserve_identity=True)
+    moved = QUAD + np.float32([10, 5])
+    drive(worker, generation, corners=moved)
+    event = last_event(worker)
+    assert event["decision"] == "same_page"
+    assert event["deferred"] is False
+    np.testing.assert_array_equal(worker._accumulator._confirmed, canvas)
+    np.testing.assert_array_equal(worker.poll(generation, 0)[1], canvas)
+
+
+def test_identity_rescue_votes_the_aligned_candidate(worker, monkeypatch):
+    """A passada resgatada vota o mapa alinhado, não o deslocado.
+
+    O juiz alinha a candidata para julgar; sem levar esse mapa ao
+    acumulador, a MESMA passada que provou same_page depositava a
+    cópia deslocada de volta — o defeito que o resgate acabou de
+    afastar renascia um voto depois.
+    """
+    worker, _control = worker
+    canvas = settle(worker)
+    generation = worker.new_generation(preserve_identity=True)
+    shifted = np.zeros(SHAPE, np.float32)
+    shifted[40:95, 40:90] = 0.95  # o conteúdo da página, +30/+30
+    aligned_prob = canvas.astype(np.float32) / 255.0
+    seen_candidates = []
+
+    def fake_align(reference, candidate):
+        seen_candidates.append(candidate.copy())
+        return aligned_prob, {
+            "align_converged": True,
+            "align_mode": "test",
+            "align_cc": 0.99,
+            "align_matrix": np.eye(3).tolist(),
+        }
+
+    monkeypatch.setattr(ink, "_align_identity_masks", fake_align)
+    monkeypatch.setenv("DRAW_IDENTITY_ECC_ALIGN", "1")
+    drive(worker, generation, prob=shifted, corners=QUAD)
+    event = last_event(worker)
+    assert event["decision"] == "same_page"
+    assert event["align_converged"] is True
+    assert seen_candidates, "o resgate não rodou — o teste não mede nada"
+    _version, confirmed, provisional = worker.poll_display(generation, 0)
+    np.testing.assert_array_equal(confirmed > 0, canvas > 0)
+    # A tinta deslocada não ganhou nem provisória: a região que só
+    # o mapa desalinhado cobre (abaixo do traço original) ficou vazia.
+    only_shifted = np.zeros(SHAPE, bool)
+    only_shifted[66:95, 40:90] = True
+    assert not np.any(provisional[only_shifted])
+
+
 @pytest.mark.parametrize("enabled", [0, 1])
 @pytest.mark.parametrize("chamfer", [0, 1])
 def test_flag_telemetry_declared_in_all_states(worker, monkeypatch, enabled, chamfer):
@@ -449,7 +511,7 @@ def _strokes(shape):
 
     prob = np.zeros(shape, np.float32)
     h, w = shape
-    for (y0, x0, y1, x1) in (
+    for y0, x0, y1, x1 in (
         (0.15, 0.10, 0.45, 0.13),
         (0.20, 0.18, 0.50, 0.22),
         (0.18, 0.30, 0.46, 0.34),
@@ -476,9 +538,7 @@ def test_align_identity_masks_recovers_page_space_warp():
     # A tinta re-registrada pelo quad re-adquirido: mesma escrita
     # sob escala + rotacao + translacao + keystone leve — o caso
     # medido no sim-lift, em que a comparacao direta mede ~0,2.
-    src = np.float32(
-        [[0, 0], [300, 0], [300, 400], [0, 400]]
-    )
+    src = np.float32([[0, 0], [300, 0], [300, 400], [0, 400]])
     angle = np.radians(20)
     rot = np.array(
         [[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]],

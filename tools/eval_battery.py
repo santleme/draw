@@ -55,9 +55,21 @@ BATTERY = {
 
 # O perfil endurecido liga as proteções da rodada da mesa real:
 # a guarda de cobertura (âncora-fantasma) e o resgate de
-# identidade por conteúdo (drop→retorno extremo).
+# identidade por conteúdo (drop→retorno extremo). O default
+# fixa as mesmas chaves em "0" — sem isso uma flag exportada no
+# ambiente vazava para a rodada e a linha de base media o
+# comportamento endurecido.
 PROFILES = {
-    "default": {},
+    "default": {
+        "DRAW_ANCHOR_COVERAGE_GUARD": "0",
+        "DRAW_IDENTITY_ECC_ALIGN": "0",
+        "DRAW_SHEET_COVERAGE": "0",
+        "DRAW_SEG_HAND_OCCLUSION": "0",
+        "DRAW_INK_REMOVAL": "0",
+        "DRAW_INK_MOTION_GATE": "0",
+        "DRAW_REG_CONTENT_GUARD": "0",
+        "DRAW_SHEET_MERGE_SPLIT": "0",
+    },
     "hardened": {
         "DRAW_ANCHOR_COVERAGE_GUARD": "1",
         "DRAW_IDENTITY_ECC_ALIGN": "1",
@@ -129,6 +141,11 @@ _TEXTS = [
 # cenários gerados usa foto de fundo em vez do procedural.
 _DESK_PHOTOS_GLOB = "/home/lucas_coimbra/draw-lab/fp-fresh-*/fresh_*.jpg"
 
+# Folha que o sim_source produz (size_idx=0 fixo em
+# SyntheticCapture.__init__) — o retângulo de borracha é
+# amostrado dentro dela.
+_GEN_PAGE_W, _GEN_PAGE_H = 360, 510
+
 
 def _sample_scenario_args(rng, desk_photos):
     """Um cenário da distribuição realista -> argv do sim_source."""
@@ -158,11 +175,17 @@ def _sample_scenario_args(rng, desk_photos):
             args += ["--grab-hand"]
     # Borracha + redesenho em ~1/3 dos cenários.
     if rng.random() < 0.33:
+        # A folha gerada tem 360x510 px (o sim_source fixa
+        # size_idx=0): a posição é amostrada primeiro e o tamanho
+        # cabe no que sobra — x e w independentes passavam da
+        # borda e o _resolve_erase_rect rejeitava o cenário.
         x = int(rng.integers(40, 200))
+        y = int(rng.integers(30, 80))
+        w = min(int(rng.integers(120, 260)), _GEN_PAGE_W - x)
+        h = min(int(rng.integers(30, 70)), _GEN_PAGE_H - y)
         args += [
             "--erase-rect",
-            f"{x},{int(rng.integers(30, 80))},"
-            f"{int(rng.integers(120, 260))},{int(rng.integers(30, 70))}",
+            f"{x},{y},{w},{h}",
             "--redraw-text",
             str(rng.choice(_TEXTS)),
         ]
@@ -197,6 +220,58 @@ def _sample_scenario_args(rng, desk_photos):
     return args
 
 
+def _capture_artifacts(target):
+    """Os quatro arquivos que a exportação do sim_source grava."""
+    target = Path(target)
+    return (
+        target,
+        target.with_suffix(".gt.npz"),
+        target.with_name(target.stem + "_ink_full.npy"),
+        target.with_suffix(".json"),
+    )
+
+
+def _capture_bundle_complete(target):
+    """O pacote de exportação inteiro existe e o GT abre.
+
+    O sim_source grava MP4 -> GT -> ink_full -> manifesto, nessa
+    ordem: morto no meio, deixa MP4 sem bundle e o _run morre no
+    np.load. Um pacote válido tem os quatro artefatos e um GT
+    legível.
+    """
+    artifacts = _capture_artifacts(target)
+    if not all(artifact.exists() for artifact in artifacts):
+        return False
+    try:
+        with np.load(artifacts[1], allow_pickle=False) as bundle:
+            bundle.files
+    except Exception:
+        return False
+    return True
+
+
+def _drop_capture_artifacts(target):
+    for artifact in _capture_artifacts(target):
+        artifact.unlink(missing_ok=True)
+
+
+def _photo_identity(argv):
+    """Identidade das fotos citadas no argv: caminho, tamanho, mtime."""
+    photos = {}
+    for index, arg in enumerate(argv):
+        if arg == "--desk-photo" and index + 1 < len(argv):
+            path = Path(argv[index + 1])
+            try:
+                stat = path.stat()
+                photos[str(path)] = [stat.st_size, stat.st_mtime_ns]
+            except OSError:
+                photos[str(path)] = None
+    return photos
+
+
+_GENERATION_MANIFEST = "battery-manifest.json"
+
+
 def _generate_captures(count, seed, out_dir):
     """Grava `count` captures novos e devolve o dict BATTERY-style."""
     import glob
@@ -206,15 +281,35 @@ def _generate_captures(count, seed, out_dir):
     rng = np.random.default_rng(seed)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = out_dir / _GENERATION_MANIFEST
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        manifest = {}
+    scenarios = manifest.setdefault("scenarios", {})
     generated = {}
+    failed = []
     sim_source = Path(__file__).resolve().parent / "sim_source.py"
     for i in range(count):
         name = f"gen-{i:03d}"
         target = out_dir / f"{name}.mp4"
         argv = _sample_scenario_args(rng, desk_photos)
+        entry = scenarios.get(name)
+        cache_ok = (
+            entry is not None
+            and entry.get("argv") == argv
+            and entry.get("photos") == _photo_identity(argv)
+            and _capture_bundle_complete(target)
+        )
+        if target.exists() and not cache_ok:
+            # Pacote incompleto (geração morta no meio) ou cache sem
+            # identidade conferida (manifesto ausente, argv ou foto
+            # diferentes): reaproveitar cega a origem dos pixels
+            # avaliados.
+            _drop_capture_artifacts(target)
         if target.exists():
-            # Cache da iteração: mesmo --gen-seed reproduz o
-            # cenário; não paga regeração pra rodar de novo.
+            # Cache validado: mesmos argumentos amostrados, mesmas
+            # fotos, pacote completo — reproduz o cenário.
             generated[name] = {}
             print(f"== {name}: reutilizado", flush=True)
             continue
@@ -225,17 +320,29 @@ def _generate_captures(count, seed, out_dir):
             str(target),
             *argv,
         ]
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=600
-        )
-        if proc.returncode != 0 or not target.exists():
-            print(
-                f"!! {name}: geração falhou ({proc.returncode}) "
-                f"{proc.stderr[-300:]}"
-            )
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if proc.returncode != 0 or not _capture_bundle_complete(target):
+            _drop_capture_artifacts(target)
+            failed.append(name)
+            print(f"!! {name}: geração falhou ({proc.returncode}) {proc.stderr[-300:]}")
             continue
+        scenarios[name] = {
+            "argv": argv,
+            "photos": _photo_identity(argv),
+        }
         generated[name] = {}
         print(f"++ {name}: {' '.join(argv)}", flush=True)
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    if failed:
+        # Cenário pedido que não existe não pode virar relatório
+        # verde com zero avaliações: --generate 1 --skip-curated
+        # saía 0 com results vazio.
+        raise SystemExit(
+            f"geração falhou para {len(failed)}/{count} cenários: {failed}"
+        )
     return generated
 
 
@@ -282,7 +389,7 @@ def _run(name, spec, captures, models):
             all_events = getattr(worker, "_identity_events", None) or []
             if len(all_events) < events_seen[0]:
                 events_seen[0] = 0  # lista reiniciada por geração
-            identity_events.extend(list(all_events)[events_seen[0]:])
+            identity_events.extend(list(all_events)[events_seen[0] :])
             events_seen[0] = len(all_events)
         if frame_index in ends:
             snapshots[frame_index] = {
@@ -322,10 +429,24 @@ def _run(name, spec, captures, models):
 
     if phased:
         # Auditoria por fase com os helpers do eval_scenario — o
-        # mesmo veredito, sem rodar a captura de novo.
+        # mesmo veredito, sem rodar a captura de novo. As métricas
+        # por checkpoint espelham as de audit(): resíduo na região
+        # apagada e recall/provisória do redesenho, que é onde o
+        # contrato erase→redraw se lê.
         events = json.loads(str(bundle["events"]))
         canvas_hw = tuple(pipeline["canvas_shape"])
         stroke_phase = bundle["stroke_phase"]
+        points, offsets = bundle["points"], bundle["offsets"]
+        shape = bundle["page_ink_full"].shape
+
+        def phase_stroke_masks(phase_index):
+            masks = []
+            for index in np.nonzero(stroke_phase == phase_index)[0]:
+                geo = points[offsets[index] : offsets[index + 1]]
+                masks.append(
+                    eval_scenario._stroke_mask(shape, geo, bundle["thickness"][index])
+                )
+            return masks
 
         checkpoints = []
         applied_upto = 0
@@ -350,13 +471,9 @@ def _run(name, spec, captures, models):
                 for p in events
             )
             page_to_scene = (
-                bundle["page_to_scene_final"]
-                if moved
-                else bundle["page_to_scene"]
+                bundle["page_to_scene_final"] if moved else bundle["page_to_scene"]
             )
-            expected = eval_scenario._page_expected(
-                bundle, applied_upto, erased
-            )
+            expected = eval_scenario._page_expected(bundle, applied_upto, erased)
             entry = {
                 "frame": frame,
                 "phase": phase["kind"],
@@ -368,14 +485,42 @@ def _run(name, spec, captures, models):
                 continue
             corners = snap["corners"]
             confirmed = np.asarray(snap["confirmed"]) > 0
+            provisional = (
+                np.zeros_like(confirmed)
+                if snap["provisional"] is None
+                else np.asarray(snap["provisional"]) > 0
+            )
             truth = (
-                eval_scenario._project(
-                    expected, corners, page_to_scene, canvas_hw
-                )
-                > 0
+                eval_scenario._project(expected, corners, page_to_scene, canvas_hw) > 0
             )
             entry.update(pixel_metrics(confirmed, truth))
             entry["confirmed_px"] = int(confirmed.sum())
+            entry["provisional_px"] = int(provisional.sum())
+            x, y, w, h = (int(v) for v in bundle["erase_rect"])
+            if w and h:
+                rect_mask = np.zeros(shape, np.uint8)
+                rect_mask[y : y + h, x : x + w] = 255
+                rect_canvas = (
+                    eval_scenario._project(rect_mask, corners, page_to_scene, canvas_hw)
+                    > 0
+                )
+                entry["confirmed_in_erased_px"] = int((confirmed & rect_canvas).sum())
+            redraw_masks = phase_stroke_masks(1)
+            if redraw_masks:
+                redraw = np.zeros(shape, np.uint8)
+                for mask in redraw_masks:
+                    redraw |= mask
+                redraw_canvas = (
+                    eval_scenario._project(redraw, corners, page_to_scene, canvas_hw)
+                    > 0
+                )
+                denom = max(1, int(redraw_canvas.sum()))
+                entry["redraw_confirmed_recall"] = (
+                    float((confirmed & redraw_canvas).sum()) / denom
+                )
+                entry["redraw_provisional_px"] = int(
+                    (provisional & redraw_canvas).sum()
+                )
             checkpoints.append(entry)
 
         final = eval_scenario._final_checkpoint(checkpoints, events)
@@ -385,14 +530,15 @@ def _run(name, spec, captures, models):
             "final_iou": final.get("iou"),
             "final_recall": final.get("recall"),
             "final_confirmed_px": final.get("confirmed_px"),
+            "redraw_confirmed_recall": final.get("redraw_confirmed_recall"),
+            "redraw_provisional_px": final.get("redraw_provisional_px"),
+            "residual_confirmed_in_erased_px": final.get("confirmed_in_erased_px"),
         }
     else:
         metrics = evaluate_canvas(
             pipeline["mask"],
             gt,
-            canvas_space=(
-                "page" if pipeline["mask"] is not None else "scene"
-            ),
+            canvas_space=("page" if pipeline["mask"] is not None else "scene"),
             corners=pipeline.get("corners"),
         )
         result["verdict"] = {
@@ -479,18 +625,14 @@ def main(argv=None):
     captures_dir = args.captures
     if args.generate:
         gen_dir = args.captures / f"battery-gen-{args.gen_seed}"
-        generated = _generate_captures(
-            args.generate, args.gen_seed, gen_dir
-        )
+        generated = _generate_captures(args.generate, args.gen_seed, gen_dir)
         for name in generated:
             battery[f"gen/{name}"] = {
                 "name": name,
                 "captures": gen_dir,
             }
     if args.skip_curated:
-        battery = {
-            name: spec for name, spec in battery.items() if "/" in name
-        }
+        battery = {name: spec for name, spec in battery.items() if "/" in name}
 
     wanted = (
         set(battery)
@@ -521,15 +663,11 @@ def main(argv=None):
             run_name = spec.pop("name", name)
             run_captures = Path(spec.pop("captures", captures_dir))
             scenario_env = spec.pop("env", {})
-            saved_scenario = {
-                key: os.environ.get(key) for key in scenario_env
-            }
+            saved_scenario = {key: os.environ.get(key) for key in scenario_env}
             os.environ.update(scenario_env)
             try:
                 print(f"== {name} ({args.profile})", flush=True)
-                results.append(
-                    _run(run_name, spec, run_captures, models)
-                )
+                results.append(_run(run_name, spec, run_captures, models))
             finally:
                 for key, value in saved_scenario.items():
                     if value is None:

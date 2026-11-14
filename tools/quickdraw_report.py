@@ -1,4 +1,5 @@
 """Resumo tabular das avaliações QuickDraw em captures/quickdraw-sessions/."""
+
 import json
 from pathlib import Path
 

@@ -112,9 +112,7 @@ def _run_headless(plan, fake_ink_factory, period_s=0.006):
     # replay (periodo de 6 ms) nao comporta inferencia real — a
     # geracao de retorno nunca publica canvas e o teste falha por
     # ambiente, nao por regressao.
-    app_module.hand_module.hand_model_available = (
-        lambda *_args, **_kwargs: False
-    )
+    app_module.hand_module.hand_model_available = lambda *_args, **_kwargs: False
     cv2.imshow, cv2.waitKey = spy.imshow, spy.waitKey
     cv2.destroyAllWindows = spy.destroyAllWindows
     try:

@@ -640,9 +640,7 @@ def _apply_ruled(paper, pw, ph):
     spacing = max(20, ph // 46)
     for y in range(spacing * 2, ph - spacing // 2, spacing):
         cv2.line(paper, (0, y), (pw, y), (215, 200, 190), 1, cv2.LINE_AA)
-    cv2.line(
-        paper, (pw // 16, 0), (pw // 16, ph), (205, 180, 180), 1, cv2.LINE_AA
-    )
+    cv2.line(paper, (pw // 16, 0), (pw // 16, ph), (205, 180, 180), 1, cv2.LINE_AA)
 
 
 def _apply_resting_pen(paper, pw, ph):

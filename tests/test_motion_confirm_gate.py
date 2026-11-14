@@ -78,15 +78,17 @@ def test_confirm_allowed_default_is_byte_identical(monkeypatch):
         assert b["confirm_blocked_px"] == 0
 
 
-def drive(sequence, monkeypatch, flag="1"):
+def drive(sequence, monkeypatch, flag="1", worker=None, gen=None):
     monkeypatch.setenv("DRAW_INK_MOTION_GATE", flag)
     monkeypatch.setenv("DRAW_REG_CONTENT_GUARD", "0")
     monkeypatch.setenv("DRAW_ANCHOR_ARBITRATION", "0")
     monkeypatch.setenv("DRAW_ANCHOR_FOLLOW", "0")
     monkeypatch.setenv("DRAW_ECC_REFINE", "0")
-    clock = rr.SceneClock()
-    worker = rr.make_ink_worker(_ProbIsWarp(), clock)
-    gen = worker.new_generation()
+    if worker is None:
+        clock = rr.SceneClock()
+        worker = rr.make_ink_worker(_ProbIsWarp(), clock)
+        gen = worker.new_generation()
+    clock = worker._clock
     for prob, corners in sequence:
         clock.now += 1
         worker.submit(prob, gen, corners, np.ones(prob.shape, bool))
@@ -108,12 +110,8 @@ def test_moved_quad_suppresses_duplicate_settle_confirms_new_ink(monkeypatch):
     moved = base + np.float32([80, 0])
     more = prob.copy()
     more[80:90, 15:35] = 0.95
-    worker = drive(
-        [(prob, base)] * 8 + [(more, moved)] * 8, monkeypatch
-    )
-    original = np.count_nonzero(
-        (worker._accumulator._confirmed > 0)
-    )
+    worker = drive([(prob, base)] * 8 + [(more, moved)] * 8, monkeypatch)
+    original = np.count_nonzero((worker._accumulator._confirmed > 0))
     records = worker.telemetry_snapshot()["records"]
     blocked = [r for r in records if r.get("motion_confirm_blocked")]
     assert blocked, "o portao tinha que registrar nas passadas moved"
@@ -134,3 +132,40 @@ def test_gate_off_does_not_record_or_block(monkeypatch):
     worker = drive([(prob, base)] * 8 + [(prob, moved)] * 4, monkeypatch, "0")
     records = worker.telemetry_snapshot()["records"]
     assert not any(r.get("motion_confirm_blocked") for r in records)
+
+
+def test_rolled_anchor_keeps_positional_gate_open(monkeypatch):
+    """Página que pousou rodada segue confirmando tinta nova.
+
+    O pouso rodado rotula a âncora (roll=2) — a permutação de
+    cantos é RÓTULO, não deslocamento de pose. Lendo o deslocamento
+    do registro rotulado, o portão media a rotação como movimento
+    permanente e nenhuma tinta nova confirmava nunca mais.
+    """
+    prob = ink()
+    base = rr.base_quad(prob.shape)
+    worker = drive([(prob, base)] * 8, monkeypatch)
+    gen = worker._generation
+    # Estado pós-landing_rotated: âncora rotulada roll=2 e a
+    # entrega posicional traz o conteúdo permutado.
+    worker._anchor_corners = np.roll(base, 2, axis=0)
+    worker._anchor_roll = 2
+    delivered = np.rot90(prob, 2).copy()
+    worker = drive(
+        [(delivered, base)] * 4,
+        monkeypatch,
+        worker=worker,
+        gen=gen,
+    )
+    records = worker.telemetry_snapshot()["records"]
+    assert not any(r.get("motion_confirm_blocked") for r in records[-4:])
+    # Tinta nova no mapa entregue: confirma na grade canônica —
+    # a posição é o rot90 da região entregue.
+    more = delivered.copy()
+    more[5:25, 5:15] = 0.95
+    worker = drive([(more, base)] * 12, monkeypatch, worker=worker, gen=gen)
+    confirmed = worker._accumulator._confirmed
+    # delivered[5:25,5:15] volta à grade da página em [75:95,105:115]
+    # (rot90 de 180° é a própria inversa; inset de 1 px pela borda
+    # do warp).
+    assert np.all(confirmed[76:94, 106:114] == 255)

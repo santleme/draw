@@ -87,7 +87,10 @@ def _final_checkpoint(checkpoints, events):
             "phase": final["phase"],
             "confirmed_px": final.get("confirmed_px"),
         }
-    return final
+    # O checkpoint saudável não escreve "status" (a chave marca
+    # só os problemas) — o veredito precisa de uma palavra: sem
+    # ela a tabela lia None e imprimia "-" numa rodada válida.
+    return {**final, "status": final.get("status") or "ok"}
 
 
 def _project(mask, corners, page_to_scene, canvas_hw):

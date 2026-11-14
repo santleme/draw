@@ -59,9 +59,10 @@ def place(strokes, box, rng, jitter=0.3):
     lo, hi = all_pts.min(axis=0), all_pts.max(axis=0)
     span = np.maximum(hi - lo, 1.0)
     scale = min(bw / span[0], bh / span[1])
-    offset = np.array([bx, by], np.float32) + (
-        np.array([bw, bh], np.float32) - span * scale
-    ) / 2
+    offset = (
+        np.array([bx, by], np.float32)
+        + (np.array([bw, bh], np.float32) - span * scale) / 2
+    )
     specs = []
     for stroke in strokes:
         pts = np.rint((stroke - lo) * scale + offset).astype(np.float32)

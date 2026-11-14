@@ -175,9 +175,7 @@ def _quad_coverage_fraction(mask, corners):
     """
     h, w = mask.shape[:2]
     fill = np.zeros((h, w), np.uint8)
-    cv2.fillPoly(
-        fill, [np.asarray(corners, np.int32).reshape(-1, 1, 2)], 255
-    )
+    cv2.fillPoly(fill, [np.asarray(corners, np.int32).reshape(-1, 1, 2)], 255)
     area = int((fill > 0).sum())
     if area <= 0:
         return 1.0
@@ -188,9 +186,7 @@ def _quad_coverage_fraction(mask, corners):
 def _quad_luma_mean(frame, corners):
     """Luma média dentro do quad; quad fora do frame devolve 255."""
     fill = np.zeros(frame.shape[:2], np.uint8)
-    cv2.fillPoly(
-        fill, [np.asarray(corners, np.int32).reshape(-1, 1, 2)], 255
-    )
+    cv2.fillPoly(fill, [np.asarray(corners, np.int32).reshape(-1, 1, 2)], 255)
     if not fill.any():
         return 255.0
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -692,8 +688,10 @@ class SheetInkLoop:
         # E claro e uniforme de papel (luma média) — o falso quad
         # da mesa (fração ~0,7-0,9 mas luma ~110 contra ~237 da
         # folha real) não volta a subir âncora depois da queda.
-        if anchor_coverage_guard_enabled() and ran_detection and (
-            self._sheet_mask_det is not None
+        if (
+            anchor_coverage_guard_enabled()
+            and ran_detection
+            and (self._sheet_mask_det is not None)
         ):
             if self.tracker.corners is not None:
                 inside = _quad_coverage_fraction(
@@ -713,17 +711,21 @@ class SheetInkLoop:
                 if self._anchor_guard_streak >= _ANCHOR_GUARD_MISS_ROUNDS:
                     self.anchor_guard_vetoes += 1
                     detected_corners, detected_verdict = None, "none"
-            elif (
-                detected_corners is not None
-                and detected_verdict == "paper"
-            ):
+            elif detected_corners is not None and detected_verdict == "paper":
                 # Aquisição: a luma vale para qualquer fonte (o
                 # falso quad da mesa mede ~110 contra ~237 da
                 # folha real); a fração só julga o neural, que
                 # carrega a máscara da mesma rodada — clássico
                 # aterrissando onde o modelo não viu folha não
                 # pode ser derrubado por ela.
-                det_luma = _quad_luma_mean(frame, detected_corners)
+                det_luma = det_extras.get("quad_luma")
+                if det_luma is None:
+                    # Caminho sem extras (a guarda pede a forma com
+                    # extras, mas um resultado antigo na fila pode
+                    # chegar sem): mede no frame atual — o mesmo
+                    # deslize frame-a-frame de sempre, aceito só
+                    # como último recurso.
+                    det_luma = _quad_luma_mean(frame, detected_corners)
                 vetoed = det_luma < _ANCHOR_GUARD_MIN_LUMA
                 if not vetoed and det_extras.get("source") == "neural":
                     det_frac = _quad_coverage_fraction(

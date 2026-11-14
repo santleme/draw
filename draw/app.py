@@ -65,6 +65,7 @@ from .loop import (
     SheetInkLoop,
     _INK_CORNER_HISTORY as _INK_CORNER_HISTORY,
     _acquisition_record as _acquisition_record,
+    _quad_luma_mean as _quad_luma_mean,
 )
 
 from . import capture as capture_module
@@ -418,6 +419,13 @@ def _detect_sheet_combined_traced(frame, neural_detector):
             # recebe dentro do pacote do portão de primeira
             # confirmação, que exige edge_in — flag diferente.
             extras["source"] = source
+        if guard_on and corners is not None:
+            # A luma mede no MESMO frame que produziu os cantos:
+            # a detecção é assíncrona e o laço colhe o resultado
+            # sob um frame mais novo — medir lá relia a cena
+            # errada (a mão que acabou de entrar no quad derrubava
+            # a luma de uma folha clara de verdade).
+            extras["quad_luma"] = _quad_luma_mean(frame, corners)
         return corners, verdict, trace, extras if masks_on else (extras or None)
 
     def _classic():
@@ -433,11 +441,7 @@ def _detect_sheet_combined_traced(frame, neural_detector):
 
     if neural_detector is not None:
         trace["veto_logit"] = float(neural_module.PRESENCE_VETO_LOGIT)
-        if (
-            neural_module.first_confirm_gate_enabled()
-            or coverage_on
-            or guard_on
-        ):
+        if neural_module.first_confirm_gate_enabled() or coverage_on or guard_on:
             # Portão de primeira confirmação (frente 88), cobertura
             # de folha (DRAW_SHEET_COVERAGE) e guarda da âncora
             # (DRAW_ANCHOR_COVERAGE_GUARD): com qualquer uma ligada,
@@ -514,6 +518,23 @@ def _detect_sheet_combined_traced(frame, neural_detector):
         return _done(corners, verdict, "classic" if corners is not None else "none")
     corners, verdict = _classic()
     return _done(corners, verdict, "classic" if corners is not None else "none")
+
+
+def _detection_needs_traced(trace_acquisitions):
+    """A forma com rastro/extras é obrigatória quando alguém a lê.
+
+    Sessão gravada lê o rastro; o portão de primeira confirmação lê
+    logit/edge_in; cobertura de folha e guarda da âncora leem as
+    máscaras dos extras (sheet_mask/coverage_mask/hand_mask) — sem
+    a forma completa o laço recebe det_extras como None para
+    sempre e a guarda roda sem a máscara que a alimenta.
+    """
+    return (
+        trace_acquisitions
+        or neural_module.first_confirm_gate_enabled()
+        or sheet_coverage_enabled()
+        or anchor_coverage_guard_enabled()
+    )
 
 
 def _emit_acquisition(telemetry, session_recorder, record):
@@ -698,11 +719,9 @@ def run(
     trace_acquisitions = False
 
     def detect_sheet(frame):
-        # Com o portão de primeira confirmação ligado, a forma com
-        # rastro é obrigatória mesmo fora de sessão gravada: é o
-        # rastro que carrega logit/edge_in até o laço (a trabalhadora
-        # extrai dele o gate_info do resultado).
-        if trace_acquisitions or neural_module.first_confirm_gate_enabled():
+        # A forma com rastro carrega o que o consumidor pede —
+        # ver _detection_needs_traced.
+        if _detection_needs_traced(trace_acquisitions):
             return _detect_sheet_combined_traced(frame, neural_detector)
         return _detect_sheet_combined(frame, neural_detector)
 

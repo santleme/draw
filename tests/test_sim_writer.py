@@ -115,7 +115,18 @@ def test_events_corners_push_and_rotation():
     assert not np.allclose(rotated, pushed)
 
 
-def test_generate_scenario_corpus_contract(tmp_path):
+def test_generate_scenario_corpus_contract(tmp_path, monkeypatch):
+    import cv2
+
+    import sim_writer
+
+    bg_dir = tmp_path / "bgs"
+    bg_dir.mkdir()
+    for i in range(2):
+        desk = np.full((720, 1280, 3), (90, 80, 70), np.uint8)
+        cv2.imwrite(str(bg_dir / f"bg_keyboard_mouse_{i:03d}.png"), desk)
+    monkeypatch.setattr(sim_writer, "BG_ROOT", bg_dir)
+
     side = generate_scenario(tmp_path, "blank_keyboard")
     scen = tmp_path / "blank_keyboard"
     assert (scen / "frames").is_dir()

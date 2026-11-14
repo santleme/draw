@@ -19,6 +19,7 @@ import numpy as np
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
+from draw import app as app_module  # noqa: E402
 from draw import loop as loop_module  # noqa: E402
 from draw.sheet_track import (  # noqa: E402
     _SHEET_LOST_MIN_FRAMES,
@@ -172,14 +173,22 @@ def test_dark_quad_cannot_acquire_bright_can(monkeypatch):
     def script(i):
         calls["n"] = i
         if i < 4:
-            return dark_quad.copy(), "paper", {
-                "sheet_mask": mask,
+            return (
+                dark_quad.copy(),
+                "paper",
+                {
+                    "sheet_mask": mask,
+                    "source": "neural",
+                },
+            )
+        return (
+            QUAD.copy(),
+            "paper",
+            {
+                "sheet_mask": _sheet_mask_for(QUAD),
                 "source": "neural",
-            }
-        return QUAD.copy(), "paper", {
-            "sheet_mask": _sheet_mask_for(QUAD),
-            "source": "neural",
-        }
+            },
+        )
 
     loop = _make_loop(script)
     frame = np.full((720, 1280, 3), 240, dtype=np.uint8)
@@ -213,9 +222,7 @@ def test_bad_quad_abstains_ink_votes(monkeypatch):
     real_update = loop.ink_accumulator.update
 
     def spy(observed, visible=None, **kw):
-        seen_visible.append(
-            None if visible is None else bool(np.any(visible))
-        )
+        seen_visible.append(None if visible is None else bool(np.any(visible)))
         return real_update(observed, visible, **kw)
 
     loop.ink_accumulator.update = spy
@@ -241,3 +248,59 @@ def test_bad_quad_abstains_ink_votes(monkeypatch):
     _drive(loop, 4)
     assert not loop._anchor_quad_bad
     assert seen_visible[-1] is not False
+
+
+# ---------- detecção: extras no caminho sem rastro ----------
+
+
+def test_guard_forces_traced_detection_without_recording(monkeypatch):
+    """O laço lê det_extras — a guarda só o recebe pela forma
+    completa da detecção, mesmo fora de sessão gravada e sem o
+    portão de primeira confirmação."""
+    monkeypatch.delenv("DRAW_ANCHOR_COVERAGE_GUARD", raising=False)
+    monkeypatch.delenv("DRAW_SHEET_COVERAGE", raising=False)
+    monkeypatch.delenv("DRAW_FIRST_CONFIRM_GATE", raising=False)
+    assert not app_module._detection_needs_traced(False)
+    assert app_module._detection_needs_traced(True)
+    monkeypatch.setenv("DRAW_ANCHOR_COVERAGE_GUARD", "1")
+    assert app_module._detection_needs_traced(False)
+    monkeypatch.delenv("DRAW_ANCHOR_COVERAGE_GUARD")
+    monkeypatch.setenv("DRAW_SHEET_COVERAGE", "1")
+    assert app_module._detection_needs_traced(False)
+
+
+class _StubNeural:
+    """Detector mínimo para o caminho com máscara."""
+
+    last_presence_logit = 5.0
+    last_coverage_mask = None
+    last_hand_mask = None
+
+    def __init__(self, corners, mask):
+        self._corners = corners
+        self._mask = mask
+
+    def __call__(self, frame, return_mask=False):
+        return self._corners, "paper", self._mask
+
+
+def test_traced_detection_carries_sheet_mask_and_luma(monkeypatch):
+    """Com a guarda ligada, extras traz sheet_mask e a luma do
+    quad medida no MESMO frame da detecção."""
+    monkeypatch.setenv("DRAW_ANCHOR_COVERAGE_GUARD", "1")
+    frame = np.full((200, 300, 3), 40, np.uint8)
+    frame[50:150, 60:240] = 235
+    quad = np.float32([[60, 50], [240, 50], [240, 150], [60, 150]])
+    mask = np.zeros((200, 300), np.uint8)
+    mask[40:160, 50:250] = 255
+    detector = _StubNeural(quad, mask)
+    corners, verdict, _trace, extras = app_module._detect_sheet_combined_traced(
+        frame, detector
+    )
+    assert corners is not None and verdict == "paper"
+    assert np.array_equal(extras["sheet_mask"], mask)
+    assert extras["quad_luma"] == app_module._quad_luma_mean(frame, corners)
+    # Medir de novo noutro frame prova que o valor viajou com a
+    # detecção — não com o frame que o laço tiver na mão.
+    later = np.full((200, 300, 3), 20, np.uint8)
+    assert extras["quad_luma"] != app_module._quad_luma_mean(later, corners)

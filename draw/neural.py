@@ -508,16 +508,11 @@ def _merged_sheet_split(mask_bin, contour):
             for i in big[:2]:
                 piece = (lab == int(i) + 1).astype(np.uint8)
                 pc = _largest_contour(piece)
-                hull_area = (
-                    0.0
-                    if pc is None
-                    else cv2.contourArea(cv2.convexHull(pc))
-                )
+                hull_area = 0.0 if pc is None else cv2.contourArea(cv2.convexHull(pc))
                 if (
                     pc is None
                     or hull_area <= 0
-                    or cv2.contourArea(pc) / hull_area
-                    < _MERGE_SPLIT_MIN_CONVEXITY
+                    or cv2.contourArea(pc) / hull_area < _MERGE_SPLIT_MIN_CONVEXITY
                 ):
                     pieces = []
                     break

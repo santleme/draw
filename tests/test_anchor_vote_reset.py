@@ -147,9 +147,7 @@ def drive_stepped(sequence, monkeypatch, vote_reset="1"):
 
 
 @pytest.mark.parametrize("vote_reset", ["0", "1"])
-def test_follow_reanchor_resets_window_written_in_old_grid(
-    monkeypatch, vote_reset
-):
+def test_follow_reanchor_resets_window_written_in_old_grid(monkeypatch, vote_reset):
     """Na passada do re-ancora a janela reflete a grade vigente.
 
     Sem a flag a janela atravessa a troca cheia da evidencia
@@ -179,3 +177,67 @@ def test_follow_reanchor_resets_window_written_in_old_grid(
         assert window_at_reanchor == 1
     else:
         assert window_at_reanchor > 1
+
+
+def test_reset_vote_memory_keeps_retraction_totals_monotonic():
+    """O total de retração não recua quando a janela zera.
+
+    As ever-masks são posicionais — a grade nova as recomeca, mas
+    o que já foi contado segue nos totais: o SessionTelemetry lê
+    deltas e um retracted_px_total que cai vira incremento
+    negativo na série.
+    """
+    acc = layers._LayeredInkAccumulator()
+    prob = ink()
+    confirmed(acc, prob)
+    visible = np.ones(prob.shape, bool)
+    # Faísca provisória: some da janela sem confirmar → retração.
+    spark = prob.copy()
+    spark[5:12, 90:110] = 0.95
+    acc.add(spark, visible)
+    for _ in range(layers._INK_VOTE_WINDOW + 1):
+        result = acc.add(prob, visible)
+    retracted = result["retracted_px_total"]
+    provisional_ever = result["provisional_ever_px"]
+    assert retracted > 0
+    acc.reset_vote_memory()
+    result = acc.add(prob, visible)
+    assert result["retracted_px_total"] >= retracted
+    assert result["provisional_ever_px"] >= provisional_ever
+
+
+def test_incomplete_vote_window_blocks_total_rest(monkeypatch):
+    """Pós-re-ancoragem o descanso espera a janela encher.
+
+    O reset de voto esvazia a janela mas os contadores de
+    quietude são da geração e seguem contados — sem a guarda, a
+    trabalhadora dormia antes do 3º voto e a tinta fraca morria
+    provisória.
+    """
+    monkeypatch.setenv("DRAW_ANCHOR_VOTE_RESET", "1")
+    monkeypatch.setenv("DRAW_ECC_REFINE", "0")
+    clock = rr.SceneClock()
+    worker = rr.make_ink_worker(_ProbIsWarp(), clock)
+    gen = worker.new_generation()
+    prob = ink()
+    base = rr.base_quad(prob.shape)
+    visible = np.ones(prob.shape, bool)
+    for _ in range(6):
+        clock.now += 1
+        worker.submit(prob, gen, base, visible)
+        assert worker.pump()
+        assert worker.error is None
+    # Condições de descanso total, montadas como a quiescência
+    # real as deixa: sem mão, confirmada parada, geração velha.
+    worker._hand_state = False
+    worker._confirm_once = False
+    worker._generation_passes = 99
+    worker._quiet_passes = 99
+    assert worker._at_rest()
+    worker._accumulator.reset_vote_memory()
+    assert not worker._at_rest()
+    # A janela enche com as passadas seguintes e o descanso
+    # volta a ser decidido pela quietude de sempre.
+    for _ in range(layers._INK_VOTE_WINDOW):
+        worker._accumulator.add(prob, visible)
+    assert worker._at_rest()
