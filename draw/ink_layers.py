@@ -1251,6 +1251,11 @@ def _align_identity_masks(reference, candidate):
         "align_cc": 0.0,
         "align_displacement": 0.0,
     }
+    align_start = time.monotonic()
+
+    def elapsed_ms():
+        return (time.monotonic() - align_start) * 1000.0
+
     ref = np.asarray(reference, dtype=np.float32)
     cand = np.asarray(candidate, dtype=np.float32)
     if (
@@ -1258,17 +1263,20 @@ def _align_identity_masks(reference, candidate):
         or not np.isfinite(ref).all()
         or not np.isfinite(cand).all()
     ):
+        info["align_ms"] = elapsed_ms()
         return candidate, info
     ref_bin = ref > 0.5
     cand_bin = cand > 0.5
     m_ref = _mask_moments(ref_bin)
     m_cand = _mask_moments(cand_bin)
     if m_ref is None or m_cand is None:
+        info["align_ms"] = elapsed_ms()
         return candidate, info
     height, width = ref.shape
     (c_ref, a_ref), (c_cand, a_cand) = m_ref, m_cand
     scale = float(np.sqrt(ref_bin.sum() / cand_bin.sum()))
     if not np.isfinite(scale) or not 0.2 <= scale <= 5.0:
+        info["align_ms"] = elapsed_ms()
         return candidate, info
     kernel = np.ones((_IDENTITY_DILATION_KERNEL,) * 2, np.uint8)
 
@@ -1416,10 +1424,14 @@ def _align_identity_masks(reference, candidate):
     # caro do resgate e a bacia certa ja aparece na pontuacao da
     # similaridade.
     for recall, tag, _aligned, warp in scored[:3]:
-        if min(half) >= 2:
-            polished = polish(warp, tag)
-            if polished is not None and polished[0] > best[0]:
-                best = polished
+        # O ECC roda sob o lock do worker: similaridade ja no teto
+        # dispensa polimento (o veredito nao muda) e a cadeia para
+        # no primeiro mapa quase perfeito.
+        if min(half) < 2 or best[0] >= 0.9:
+            break
+        polished = polish(warp, tag)
+        if polished is not None and polished[0] > best[0]:
+            best = polished
     if best is None or best[0] < 0.35:
         grid_best = None  # (recall, mode, aligned, warp2x3)
         for theta, tag in coarse:
@@ -1438,6 +1450,7 @@ def _align_identity_masks(reference, candidate):
                 best = polished
     if best is None:
         info["align_mode"] = "rejected"
+        info["align_ms"] = elapsed_ms()
         return candidate, info
     info["align_converged"] = True
     info["align_mode"] = best[1]
@@ -1446,6 +1459,7 @@ def _align_identity_masks(reference, candidate):
     # evento serializar: quem resgatou a pagina a usa para votar a
     # passada no mapa alinhado em vez do registrado deslocado.
     info["align_matrix"] = best[3].tolist()
+    info["align_ms"] = elapsed_ms()
     return best[2], info
 
 
@@ -3386,6 +3400,13 @@ class _PageCleanWorker:
         self._identity_reference_corners = (
             None if self._anchor_corners is None else self._anchor_corners.copy()
         )
+        # A ancora salva pode ser a rotulada de um pouso rodado:
+        # o roll que a descreve e o CORRENTE — o valor herdado da
+        # ultima troca de geracao e de outra ancora e, restaurado
+        # no veredito keep_page, dessincronizava o par ancora/roll.
+        self._identity_reference_roll = (
+            self._anchor_roll if self._anchor_corners is not None else 0
+        )
         self._identity_recovery_requested = True
         self._identity_defer_count = 0
         self._identity_switch_votes = int(seed_votes)
@@ -4209,6 +4230,7 @@ class _PageCleanWorker:
                     # observations remain registered into the same canvas.
                     self._identity_reference = None
                     self._identity_reference_corners = None
+                    self._identity_reference_roll = 0
                     self._identity_recovery_requested = False
                     self._identity_defer_count = 0
                     self._identity_switch_votes = 0
