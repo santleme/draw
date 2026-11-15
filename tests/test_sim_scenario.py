@@ -468,3 +468,34 @@ def test_hand_mass_ground_truth_neutral(tmp_path):
         np.testing.assert_array_equal(
             bundle["page_ink_final"] > 0, bundle["page_ink_full"] > 0
         )
+
+
+def test_resting_pen_occludes_crossing_ink_in_frame():
+    """A caneta em repouso oclui o traço que a cruza: no frame
+    renderizado a silhueta cobre a tinta; o GT do bundle segue
+    geométrico (o traço existe sob a caneta)."""
+    import tools.gen_synthetic as gs
+
+    capture = SyntheticCapture("pen", resting_pen=True)
+    pen = capture._pen_mask
+    assert pen is not None and pen.any()
+    ys, xs = np.nonzero(pen)
+    cy, cx = int(ys.mean()), int(xs.mean())
+    gs._apply_stroke(
+        capture._paper,
+        capture._ink,
+        ("line", (40, 40, 40), 8, np.array([cx - 70, cy, cx + 70, cy], np.int32)),
+    )
+    ok, _ = capture.read()
+    assert ok
+    # A borda AA da caneta sangra alguns pixels do traço vizinho;
+    # a oclusão estrita é verificada no interior da silhueta.
+    pen_scene = cv2.erode(
+        cv2.warpPerspective(
+            pen.astype(np.uint8) * 255, capture.page_to_scene, (gs.SIZE, gs.SIZE)
+        ),
+        np.ones((3, 3), np.uint8),
+    )
+    ink_scene = capture.last_scene["ink_full"] > 0
+    assert not np.any(ink_scene & (pen_scene > 0))
+    assert np.any(capture._ink[pen] > 0)

@@ -435,7 +435,7 @@ def test_index_offset_shards_byte_identical(tmp_path):
     Contrato: offset só ao shardar UM split; shards multi-split
     rodam com offset 0 (o offset vale para todos os splits que o
     processo gera)."""
-    full = gs.generate_dataset(
+    gs.generate_dataset(
         tmp_path / "full",
         seed=7,
         counts={"train": 10, "val": 2, "test": 2},

@@ -281,7 +281,6 @@ def test_witness_floor_unblocks_stale_canvas(monkeypatch):
     acc = layers._LayeredInkAccumulator()
     prob = _big_ink()
     confirmed(acc, prob)
-    canvas = int((acc._confirmed > 0).sum())
     # Copia defasada: metade da tinta "some" (stale), metade segue.
     stale = prob.copy()
     stale[10:190, 10:110] = 0.0

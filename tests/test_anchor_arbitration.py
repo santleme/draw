@@ -293,6 +293,61 @@ def test_straight_landing_after_rotated_landing(fast):
 
 
 @pytest.mark.lento
+def test_same_page_verdict_keeps_roll_armed_mid_generation(fast):
+    # Armamento de identidade no meio da geracao (vigia, pose_jump):
+    # new_generation grava (cantos, roll) juntos; o armamento
+    # gravava so os cantos e o roll herdado (0) era restaurado pelo
+    # veredito same_page sobre a ancora rolada — o pareamento
+    # posicional passava a ler rotulo como deslocamento e o motion
+    # gate travava a pagina parada.
+    full = np.array(
+        [[0.0, 0.0], [199.0, 0.0], [199.0, 99.0], [0.0, 99.0]], dtype=np.float32
+    )
+    moved = full + np.array([30.0, 10.0], dtype=np.float32)
+    content = np.zeros(SHAPE, dtype=np.float32)
+    content[15:22, 30:110] = 1.0
+    content[45:70, 55:63] = 1.0
+    content[75:82, 120:180] = 1.0
+    rotated = _permute(content, 2)
+    worker = ink_layers_module._PageCleanWorker(_ProbIsWarp()).start()
+    try:
+        generation = worker.new_generation()
+        _drive(worker, generation, [(content, full.copy()) for _ in range(3)])
+        _drive(worker, generation, [(rotated, moved.copy()) for _ in range(6)])
+        events = worker.telemetry_snapshot()["anchor_arbitration_events"]
+        assert [e["verdict"] for e in events] == ["landing_rotated"]
+        assert worker._anchor_roll == 2
+        np.testing.assert_allclose(worker._anchor_corners, np.roll(moved, 2, axis=0))
+        # A vigia fica desligada durante o pouso (nao arma sozinha
+        # no deslocamento) e liga so para o armamento; o piso de
+        # canvas da miniatura e menor que o da bancada.
+        fast.setenv("DRAW_IDENTITY_WATCH", "1")
+        fast.setattr(ink_layers_module, "_IDENTITY_WATCH_MIN_CANVAS_PX", 100)
+        assert worker.arm_identity_check("pose_jump")
+        _drive(worker, generation, [(rotated, moved.copy())])
+        events = worker.telemetry_snapshot()["page_identity_events"]
+        assert events[-1]["decision"] == "same_page"
+        # O par ancora/roll sai coerente: a ancora rolada do pouso
+        # com o roll que a descreve — nao o 0 herdado.
+        assert worker._anchor_roll == 2
+        np.testing.assert_allclose(worker._anchor_corners, np.roll(moved, 2, axis=0))
+        positional = float(
+            np.max(
+                np.linalg.norm(
+                    moved
+                    - ink_layers_module._positional_anchor(
+                        worker._anchor_corners, worker._anchor_roll
+                    ),
+                    axis=1,
+                )
+            )
+        )
+        assert positional < 1.0
+    finally:
+        worker.stop()
+
+
+@pytest.mark.lento
 def test_no_mass_defaults_to_anchor_swap(fast):
     content = _content()
     empty = np.zeros(SHAPE, np.float32)

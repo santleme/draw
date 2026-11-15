@@ -1,24 +1,24 @@
 {
-  "models": {
-    "draw_seg_v3_dyn.onnx": {
-      "approved_by": "FINE-TUNE no Colab do autor em 2026-11-03 (init v3; pilot do Guss: 297 treino / 422 holdout selado) - FORMA DINAMICA 384 (o binario e o draw_seg_ft_dyn.onnx). Julgamento de laboratorio da forma (JUDGE_FT_384.md, draw-kaggle-ruler/colab-finetune): empate tecnico de qualidade com a forma fixa 512 (holdout selado paper+cantos 92,4% vs 92,7%, sem reconhecimento 32 vs 31, IoU mediano 0,920 vs 0,922) e 2,11x mais rapida por passada de deteccao. Instalado no nome padrao por decisao do autor em 2026-11-03 e em uso ao vivo na mesa dele desde entao (teste ao vivo de 2026-11-03: deteccao 42,2 ms/passada, metade da forma 512). A forma fixa 512 (a159a1d6) esta preservada em draw_seg_v3_dyn.onnx.ft512-a159a1d6.bak, com o MANIFEST dela em MANIFEST.json.ft512.bak; a v3 original (751e74da) segue preservada em draw_seg_v3_dyn.onnx.v3-751e74da.bak e o MANIFEST original em MANIFEST.json.v3.bak; rollbacks em FT_TEST_ROLLBACK.md.",
-      "bytes": 15191109,
-      "date": "2026-11-03",
-      "sha256": "e20a89f0eae7c76d3b2f2cbb286d61ce9e9a0274ce4ad736c7aa902de05e765f"
-    },
-    "hand_landmarker.task": {
-      "approved_by": "modelo oficial do Google MediaPipe (Apache-2.0), sem modificacao; fonte: https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
-      "bytes": 7819105,
-      "date": "2026-11-02",
-      "sha256": "fbc2a30080c3c557093b5ddfc334698132eb341044ccee322ccf8bcf3607cde1"
-    },
-    "page_clean_unet.onnx": {
-      "approved_by": "regua de replay (laboratorio, 2026-11-01): IoU DIBCO 0,188, traco fino 0,402, FP em warps vazios 0,072%, 96,6 ms a passada no Ryzen do autor; instalada como padrao por decisao do autor em 2026-11-01 (modelo vigente, provisorio)",
-      "bytes": 495102,
-      "date": "2026-11-01",
-      "sha256": "a470bd28d459221a8106b6578d33e99a555de730fcf145444809e83768e0ccfb"
-    }
+ "models": {
+  "draw_seg_v3_dyn.onnx": {
+   "approved_by": "T16 (dieta clipe+rotacao, Colab A100 2026-11-13, autorizada pelo autor): receita t15 completa (init_t14 + r2_best + pool 501 + pares 641 + sup 242 + SmartDoc) sobre corpus seed42 com --clip-fraction 0.20 --rotation-fraction 0.15 --rotation-max 45. Val IoU: paper 0,977 hand 0,978 ink 0,70. Bancadas: sim-lift readquiriu folha rotacionada (IoU 0,865; antes cega >~15°) e sim-hand status ok no move+clipe+pegada (antes no_canvas permanente); presenca -5,34 em mesa vazia. Anterior (e20a89f0) preservado em draw_seg_v3_dyn.onnx.pre16-e20a89f0.bak + MANIFEST.json.t16pre.bak.",
+   "bytes": 14161212,
+   "date": "2026-11-13",
+   "sha256": "5e2c611f347742454a6963a703cc061dab3d77f97cca4ddc16887e2f3e5029b5"
   },
-  "notes": "Integrity record for the model binaries. sha256 and byte size are verified at load time for every model the app opens (.onnx and the MediaPipe .task). Verification is strict by default: a mismatch, or a model file with no entry here, is refused with an error. DRAW_MODEL_STRICT=0 or the app flag --allow-unverified downgrades both to a warning. The binaries do not live in git: the official distribution is this repository's 'models-2026-11-06' Release, and 'python tools/fetch_models.py' downloads the files listed here into models/, verifying sha256 and size against this record. Without the fetch, a fresh clone runs on the fallbacks (classic sheet detector and legacy ink stack). hand_landmarker.task is a Google MediaPipe model (Apache-2.0), redistributed unmodified from the official source given in its entry.",
-  "schema": 1
+  "hand_landmarker.task": {
+   "approved_by": "modelo oficial do Google MediaPipe (Apache-2.0), sem modificacao; fonte: https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+   "bytes": 7819105,
+   "date": "2026-11-02",
+   "sha256": "fbc2a30080c3c557093b5ddfc334698132eb341044ccee322ccf8bcf3607cde1"
+  },
+  "page_clean_unet.onnx": {
+   "approved_by": "bancada de material real da campanha de tinta (frente 48, laboratorio): recall@0,5 71,9% (w8: 12,0% no GT temporal), FP@0,7 187.061 px, fracao P4 >0,5 32,0%, estabilidade fotometrica x1,15 1,025; terceira vitoria seguida da linhagem (v4, v5, v6) contra o w8; instalada no slot padrao por decisao do autor em 2026-11-11 (swap w8 -> v6). O w8 (a470bd28) esta preservado em page_clean_unet.onnx.w8-a470bd28.bak e o MANIFEST anterior em MANIFEST.json.w8.bak; reversao = restaurar os dois arquivos.",
+   "bytes": 494586,
+   "date": "2026-11-11",
+   "sha256": "613e250f5f7e15e9681cb1af1317aea30b4a4bdcbad7c7bfd7350a497ae6a4b1"
+  }
+ },
+ "notes": "Integrity record for the model binaries. sha256 and byte size are verified at load time for every model the app opens (.onnx and the MediaPipe .task). Verification is strict by default: a mismatch, or a model file with no entry here, is refused with an error. DRAW_MODEL_STRICT=0 or the app flag --allow-unverified downgrades both to a warning. The binaries do not live in git: the official distribution is this repository's 'models-2026-11-06' Release, and 'python tools/fetch_models.py' downloads the files listed here into models/, verifying sha256 and size against this record. Without the fetch, a fresh clone runs on the fallbacks (classic sheet detector and legacy ink stack). hand_landmarker.task is a Google MediaPipe model (Apache-2.0), redistributed unmodified from the official source given in its entry.",
+ "schema": 1
 }
