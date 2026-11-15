@@ -1279,6 +1279,23 @@ def _align_identity_masks(reference, candidate):
         info["align_ms"] = elapsed_ms()
         return candidate, info
     kernel = np.ones((_IDENTITY_DILATION_KERNEL,) * 2, np.uint8)
+    ref_d = cv2.dilate(ref_bin.astype(np.uint8), kernel) > 0
+
+    def _rank(recall, contain):
+        # O vencedor e escolhido pelo criterio do JUIZ, nao so por
+        # recall: primeiro quem ja passa nos dois limiares do
+        # veredito, depois o gargalo normalizado, depois recall.
+        # Um polimento que conserta containment vence mesmo
+        # abrindo mao de recall.
+        return (
+            recall >= _PAGE_IDENTITY_MIN_RECALL
+            and contain >= _PAGE_IDENTITY_MIN_CONTAINMENT,
+            min(
+                recall / _PAGE_IDENTITY_MIN_RECALL,
+                contain / _PAGE_IDENTITY_MIN_CONTAINMENT,
+            ),
+            recall,
+        )
 
     # O eixo principal tem ambiguidade de sinal (o autovetor do
     # eigh sai com sinal arbitrario — muda entre processos) e de
@@ -1336,16 +1353,19 @@ def _align_identity_masks(reference, candidate):
         warp_t = ctr_ref - warp_linear @ ctr_cand
         warp = np.hstack((warp_linear, warp_t.reshape(2, 1)))
         if not np.isfinite(warp).all():
-            return None, None, 0.0
+            return None, None, 0.0, 0.0
         aligned = cv2.warpAffine(
             cand, warp, (width, height), flags=cv2.INTER_LINEAR,
             borderValue=0.0,
         )
-        seen_d = (
-            cv2.dilate((aligned > 0.5).astype(np.uint8), kernel) > 0
-        )
-        return aligned, warp, float(
-            np.count_nonzero(ref_bin & seen_d) / ref_bin.sum()
+        seen = aligned > 0.5
+        seen_d = cv2.dilate(seen.astype(np.uint8), kernel) > 0
+        seen_px = int(np.count_nonzero(seen))
+        return (
+            aligned,
+            warp,
+            float(np.count_nonzero(ref_bin & seen_d) / ref_bin.sum()),
+            float(np.count_nonzero(seen & ref_d) / seen_px) if seen_px else 0.0,
         )
 
     # A distorcao real e projetiva (keystone num lado — canto do
@@ -1401,78 +1421,86 @@ def _align_identity_masks(reference, candidate):
                 cand, warp_p, (width, height),
                 flags=cv2.INTER_LINEAR, borderValue=0.0,
             )
-            seen_p = (
-                cv2.dilate((aligned_p > 0.5).astype(np.uint8), kernel)
-                > 0
-            )
+            seen_p = aligned_p > 0.5
+            seen_p_px = int(np.count_nonzero(seen_p))
+            seen_p_d = cv2.dilate(seen_p.astype(np.uint8), kernel) > 0
             recall_p = float(
-                np.count_nonzero(ref_bin & seen_p) / ref_bin.sum()
+                np.count_nonzero(ref_bin & seen_p_d) / ref_bin.sum()
             )
-            return recall_p, f"{tag}+ecc", aligned_p, warp_p
+            contain_p = (
+                float(np.count_nonzero(seen_p & ref_d) / seen_p_px)
+                if seen_p_px
+                else 0.0
+            )
+            return recall_p, contain_p, f"{tag}+ecc", aligned_p, warp_p
 
-    scored = []  # (recall, mode, aligned, warp2x3)
+    scored = []  # (recall, contain, mode, aligned, warp2x3)
     for theta, scl, ctr_ref, ctr_cand, tag in seeds:
-        aligned, warp, recall = score(theta, scl, ctr_ref, ctr_cand)
+        aligned, warp, recall, contain = score(theta, scl, ctr_ref, ctr_cand)
         if aligned is not None:
-            scored.append((recall, tag, aligned, warp))
+            scored.append((recall, contain, tag, aligned, warp))
     scored.sort(key=lambda entry: entry[0], reverse=True)
-    best = None  # (recall, mode, aligned, warp3x3)
-    for recall, tag, aligned, warp in scored:
-        if best is None or recall > best[0]:
-            best = (recall, tag, aligned, np.vstack((warp, [0.0, 0.0, 1.0])))
+    best = None  # (recall, contain, mode, aligned, warp3x3)
+    for recall, contain, tag, aligned, warp in scored:
+        if best is None or _rank(recall, contain) > _rank(best[0], best[1]):
+            best = (recall, contain, tag, aligned, np.vstack((warp, [0.0, 0.0, 1.0])))
     # Polimento so nas melhores sementes: cada ECC e o trecho
     # caro do resgate e a bacia certa ja aparece na pontuacao da
     # similaridade.
-    ref_d = cv2.dilate(ref_bin.astype(np.uint8), kernel) > 0
-    for recall, tag, _aligned, warp in scored[:3]:
+    for recall, contain, tag, _aligned, warp in scored[:3]:
         # O ECC roda sob o lock do worker: para de refinar so
         # quando o mapa vencedor ja cobre os DOIS limiares do
-        # veredito — recall no teto com tinta sobrando fora da
-        # referencia (containment baixo) ainda merece a tentativa.
+        # veredito — e o _rank acima garante que um polimento que
+        # conserta o gargalo entra no lugar, nao e descartado.
         if min(half) < 2:
             break
-        if best[0] >= 0.9:
-            seen_b = best[2] > 0.5
-            seen_b_px = int(np.count_nonzero(seen_b))
-            contain_b = (
-                np.count_nonzero(seen_b & ref_d) / seen_b_px
-                if seen_b_px
-                else 0.0
-            )
-            if contain_b >= 0.5:
-                break
+        if (
+            best[0] >= 0.9
+            and best[1] >= _PAGE_IDENTITY_MIN_CONTAINMENT
+        ):
+            break
         polished = polish(warp, tag)
-        if polished is not None and polished[0] > best[0]:
+        if polished is not None and _rank(polished[0], polished[1]) > _rank(
+            best[0], best[1]
+        ):
             best = polished
     if best is None or best[0] < 0.35:
-        grid_best = None  # (recall, mode, aligned, warp2x3)
+        grid_best = None  # (recall, contain, mode, aligned, warp2x3)
         for theta, tag in coarse:
-            aligned, warp, recall = score(
+            aligned, warp, recall, contain = score(
                 theta, scale, c_ref, c_cand
             )
             if aligned is None:
                 continue
-            if best is None or recall > best[0]:
-                best = (recall, tag, aligned, np.vstack((warp, [0.0, 0.0, 1.0])))
+            if best is None or _rank(recall, contain) > _rank(best[0], best[1]):
+                best = (
+                    recall,
+                    contain,
+                    tag,
+                    aligned,
+                    np.vstack((warp, [0.0, 0.0, 1.0])),
+                )
             if grid_best is None or recall > grid_best[0]:
-                grid_best = (recall, tag, aligned, warp)
+                grid_best = (recall, contain, tag, aligned, warp)
         if grid_best is not None and min(half) >= 2:
-            polished = polish(grid_best[3], grid_best[1])
-            if polished is not None and polished[0] > best[0]:
+            polished = polish(grid_best[4], grid_best[2])
+            if polished is not None and _rank(polished[0], polished[1]) > _rank(
+                best[0], best[1]
+            ):
                 best = polished
     if best is None:
         info["align_mode"] = "rejected"
         info["align_ms"] = elapsed_ms()
         return candidate, info
     info["align_converged"] = True
-    info["align_mode"] = best[1]
+    info["align_mode"] = best[2]
     info["align_cc"] = best[0]
     # A homografia cand->ref que o juiz validou, em lista para o
     # evento serializar: quem resgatou a pagina a usa para votar a
     # passada no mapa alinhado em vez do registrado deslocado.
-    info["align_matrix"] = best[3].tolist()
+    info["align_matrix"] = best[4].tolist()
     info["align_ms"] = elapsed_ms()
-    return best[2], info
+    return best[3], info
 
 
 def _register_ink_probability(prob, anchor, corners, reference, visible=None):

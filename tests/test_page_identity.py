@@ -602,6 +602,10 @@ def test_align_identity_masks_polishes_when_containment_is_low(monkeypatch):
     cv2.circle(cand, (160, 160), 40, 1.0, -1)  # massa extra >2x a da ref
 
     monkeypatch.setattr(cv2, "warpAffine", lambda src, M, dsize, **kw: src.copy())
+    # O polimento devolve um mapa que fecha os DOIS limiares do
+    # juiz (a referencia em si): com selecao so por recall ele
+    # seria descartado empatado em 1.0 — por _rank ele vence.
+    monkeypatch.setattr(cv2, "warpPerspective", lambda src, M, dsize, **kw: ref.copy())
     ecc_calls = []
 
     def fake_ecc(*args, **kwargs):
@@ -613,4 +617,5 @@ def test_align_identity_masks_polishes_when_containment_is_low(monkeypatch):
     aligned, info = ink._align_identity_masks(ref, cand)
     assert ecc_calls, "o early-break por recall pulou o polimento"
     assert info["align_converged"]
-    assert np.array_equal(aligned, cand)
+    assert info["align_mode"].endswith("+ecc")
+    assert np.array_equal(aligned, ref)
