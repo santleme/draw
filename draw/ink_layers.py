@@ -1226,7 +1226,7 @@ def _largest_component_mask(mask):
     return labels == largest
 
 
-def _align_identity_masks(reference, candidate):
+def _align_identity_masks(reference, candidate, threshold=0.5):
     """Alinha a candidata à referência por conteúdo.
 
     Uso exclusivo do juiz de identidade: a referência vive na grade
@@ -1242,8 +1242,13 @@ def _align_identity_masks(reference, candidate):
     recall dilatado: a máscara inteira e o maior componente, cada
     uma nas quatro rotações do eixo (PCA é mod 180° e o sinal do
     autovetor é arbitrário); grade grossa cobre o caso sem eixo
-    confiável. Retorna (prob alinhada, info); `align_converged`
-    False mantém a candidata original — nunca piora a comparação.
+    confiável. `threshold` é o corte do acumulador que o juiz
+    aplica ao mapa retornado — recall e containment são medidos
+    na tinta que o veredito conta (a referência em >0, como
+    `prior`), senão um mapa de tinta sub-limiar vence o _rank e
+    morre no veredito. Retorna (prob alinhada, info);
+    `align_converged` False mantém a candidata original — nunca
+    piora a comparação.
     """
     info = {
         "align_converged": False,
@@ -1265,8 +1270,11 @@ def _align_identity_masks(reference, candidate):
     ):
         info["align_ms"] = elapsed_ms()
         return candidate, info
-    ref_bin = ref > 0.5
-    cand_bin = cand > 0.5
+    # A referência corta em >0, como o `prior` do juiz; a
+    # candidata corta no limiar do acumulador — é a tinta que o
+    # veredito conta quando rejulga o mapa alinhado.
+    ref_bin = ref > 0
+    cand_bin = cand > threshold
     m_ref = _mask_moments(ref_bin)
     m_cand = _mask_moments(cand_bin)
     if m_ref is None or m_cand is None:
@@ -1358,7 +1366,7 @@ def _align_identity_masks(reference, candidate):
             cand, warp, (width, height), flags=cv2.INTER_LINEAR,
             borderValue=0.0,
         )
-        seen = aligned > 0.5
+        seen = aligned > threshold
         seen_d = cv2.dilate(seen.astype(np.uint8), kernel) > 0
         seen_px = int(np.count_nonzero(seen))
         return (
@@ -1421,7 +1429,7 @@ def _align_identity_masks(reference, candidate):
                 cand, warp_p, (width, height),
                 flags=cv2.INTER_LINEAR, borderValue=0.0,
             )
-            seen_p = aligned_p > 0.5
+            seen_p = aligned_p > threshold
             seen_p_px = int(np.count_nonzero(seen_p))
             seen_p_d = cv2.dilate(seen_p.astype(np.uint8), kernel) > 0
             recall_p = float(
@@ -4042,7 +4050,9 @@ class _PageCleanWorker:
                     else:
                         align_target = prior
                     candidate_aligned, identity_align_info = _align_identity_masks(
-                        align_target, candidate
+                        align_target,
+                        candidate,
+                        self._accumulator.threshold,
                     )
                     if identity_align_info["align_converged"]:
                         seen_a = candidate_aligned > self._accumulator.threshold

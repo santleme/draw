@@ -160,7 +160,7 @@ def test_identity_rescue_votes_the_aligned_candidate(worker, monkeypatch):
     aligned_prob = canvas.astype(np.float32) / 255.0
     seen_candidates = []
 
-    def fake_align(reference, candidate):
+    def fake_align(reference, candidate, threshold=0.5):
         seen_candidates.append(candidate.copy())
         return aligned_prob, {
             "align_converged": True,
@@ -619,3 +619,44 @@ def test_align_identity_masks_polishes_when_containment_is_low(monkeypatch):
     assert info["align_converged"]
     assert info["align_mode"].endswith("+ecc")
     assert np.array_equal(aligned, ref)
+
+
+def test_align_identity_masks_scores_at_verdict_threshold(monkeypatch):
+    """O rank mede a tinta no limiar do veredito, não em 0.5.
+
+    Cenário do review: um warp cobre a referência a 0.6 (vence a
+    0.5, morre a 0.7 — seen vazio), outro cobre a 1.0 com tinta
+    extra de mesma área (passa nos dois limiares). Com o corte do
+    acumulador, o mapa válido vence — o fraco nem disputa.
+    """
+    cv2 = pytest.importorskip("cv2")
+    import itertools
+
+    shape = (200, 200)
+    ref = np.zeros(shape, np.float32)
+    cv2.line(ref, (20, 40), (70, 120), 1.0, 3)
+    cv2.line(ref, (30, 150), (80, 60), 1.0, 2)
+    ref_px = int(np.count_nonzero(ref > 0))
+    faint = ref * 0.6  # cobre tudo, mas abaixo do limiar do juiz
+    extra = np.roll(ref, (0, 110))  # mesma massa, fora da referência
+    valid = np.maximum(ref, extra)
+    assert not np.any((extra > 0) & (ref > 0))
+    cand = valid.copy()
+
+    warps = itertools.cycle([faint, valid])
+    monkeypatch.setattr(
+        cv2, "warpAffine", lambda src, M, dsize, **kw: next(warps).copy()
+    )
+    ecc_calls = []
+    monkeypatch.setattr(
+        cv2,
+        "findTransformECC",
+        lambda *a, **k: ecc_calls.append(1) or (1.0, np.eye(3, np.float32)),
+    )
+
+    aligned, info = ink._align_identity_masks(ref, cand, threshold=0.7)
+    assert info["align_converged"]
+    # O vencedor passa nos dois limiares e encerra antes do ECC.
+    assert np.array_equal(aligned, valid)
+    assert not ecc_calls
+    del ref_px
