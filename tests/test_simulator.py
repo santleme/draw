@@ -201,6 +201,81 @@ def test_bundle_scene_page_and_detected_anchor_alignment(tmp_path):
     source.release()
 
 
+def test_bundle_moved_truth_uses_final_pose(tmp_path):
+    """Depois de move, ink_full/ink_final projetam na pose FINAL —
+    o avaliador compara o que o vídeo termina vendo, não a câmera
+    de __init__."""
+    source = SyntheticCapture(
+        "abc",
+        fps=4,
+        stroke_seconds=0.3,
+        warmup_seconds=0.2,
+        settle_seconds=0.3,
+        move=(50, -30, 12),
+        move_seconds=0.5,
+    )
+    while source.read()[0]:
+        pass
+    gt = tmp_path / "moved.gt.npz"
+    source.save_ground_truth(gt)
+    with np.load(gt, allow_pickle=False) as archive:
+        bundle = {key: archive[key] for key in archive.files}
+    final_warp = cv2.warpPerspective(
+        bundle["page_ink_final"],
+        bundle["page_to_scene_final"],
+        (512, 512),
+        flags=cv2.INTER_NEAREST,
+    )
+    # sem borracha: ink_final = ink_full = projeção na pose final
+    np.testing.assert_array_equal(bundle["ink_final"], final_warp)
+    np.testing.assert_array_equal(bundle["ink_full"], final_warp)
+    assert not np.array_equal(bundle["quad_final"], bundle["quad"])
+    for space, prediction, corners in (
+        ("scene", bundle["ink_final"], None),
+        ("page", bundle["page_ink_final"], None),
+        ("page", bundle["page_ink_final"], bundle["quad_final"]),
+    ):
+        report = evaluate_canvas(
+            prediction, gt, canvas_space=space, corners=corners
+        )
+        assert report["iou"] == 1
+    source.release()
+
+
+def test_bundle_erased_truth_is_post_erase(tmp_path):
+    """Com borracha, a verdade de fim é a tinta SOBREVIVENTE:
+    ink_final < ink_full e a predição correta é ink_final."""
+    source = SyntheticCapture(
+        "Draw ok",
+        fps=4,
+        stroke_seconds=0.3,
+        warmup_seconds=0.2,
+        settle_seconds=0.3,
+        erase_stroke=-1,
+        redraw_text="ok",
+        erase_seconds=0.3,
+    )
+    while source.read()[0]:
+        pass
+    gt = tmp_path / "erased.gt.npz"
+    source.save_ground_truth(gt)
+    with np.load(gt, allow_pickle=False) as archive:
+        bundle = {key: archive[key] for key in archive.files}
+    assert int(bundle["page_ink_final"].sum()) < int(
+        bundle["page_ink_full"].sum()
+    )
+    scene_final = cv2.warpPerspective(
+        bundle["page_ink_final"],
+        bundle["page_to_scene_final"],
+        (512, 512),
+        flags=cv2.INTER_NEAREST,
+    )
+    np.testing.assert_array_equal(bundle["ink_final"], scene_final)
+    report = evaluate_canvas(bundle["ink_final"], gt, canvas_space="scene")
+    assert report["iou"] == 1
+    source.release()
+
+
 def test_plain_npy_requires_pose_for_rectified_canvas(tmp_path):
     source = SyntheticCapture("a")
     gt = tmp_path / "ink_full.npy"

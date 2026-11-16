@@ -17,10 +17,15 @@ python main.py --source captures/sim.mp4
 
 O exportador grava `sim.mp4` (512×512, codec `mp4v`), `sim.gt.npz`,
 `sim_ink_full.npy` e `sim.json`. O bundle NPZ contém o desenho completo no
-espaço da câmera (`ink_full`), no espaço original do papel
-(`page_ink_full`), a homografia papel→câmera e as polylines individuais.
-Não usa pickle. O manifesto identifica seed, FPS, número de frames,
-traços e se há mão placeholder.
+espaço da câmera na pose final (`ink_full`), o estado final da tinta
+pós-borracha/redesenho na mesma pose (`ink_final`), ambos no espaço
+original do papel (`page_ink_full`, `page_ink_final`), a homografia
+papel→câmera inicial e final, e as polylines individuais. Fases
+geométricas declaram `quad_end` em `events` — a pose no último frame
+da fase — para reconstrução por checkpoint. Não usa pickle. O
+manifesto identifica seed, FPS, número de frames, traços e se há mão
+placeholder. Os campos `*_final` são determinísticos: o GT sai correto
+antes ou depois de consumir o vídeo.
 
 No app, **s** salva o canvas confirmado em `captures/canvas_*.png`.
 O app tem uma bomba de captura que pode consumir arquivos mais rápido
@@ -354,6 +359,80 @@ métricas globais, mas não relatório por traço. No modo `--video`, o runner
 usa o quad detectado para projetá-lo ao canvas. Para canvas já retificado
 é obrigatório informar `--corners`; para uma máscara que já está na
 grade 512×512 da câmera, use `--canvas-space scene`.
+
+## Gêmeo óptico e físico (sim-to-real gap)
+
+Os flags abaixo implementam os efeitos que separam a colagem simples
+da mesa real — todos opt-in e registrados no manifesto (`isp`,
+`hand_shadow`, `ink_sheen`, `page_curl`, `background`). Sem eles, a
+sequência é a fotometria histórica, byte a byte.
+
+- `--isp` (ou `--ae --awb --motion-blur` separados): o firmware da
+  webcam. A auto-exposição mede a luminância da cena composta e
+  aproxima o ganho com constante de tempo de frames — mão ou folha
+  grande entrando derruba a exposição até convergir, o regime em que
+  o traço fino perde contraste. O AWB faz o mesmo por canal
+  (gray-world com deriva lenta). O ruído de sensor escala com o
+  ganho, como ISO. `--jpeg-quality N` (10–100) soma compressão JPEG
+  controlada por frame, além dos artefatos do mp4v.
+- `--motion-blur`: blur direcional proporcional à velocidade real —
+  mão, borracha e palma borram na direção do gesto (a velocidade é a
+  do sprite na cena, não um valor fixo); a folha em `move`/`lift`/
+  `return` borra junto, e a franja de movimento vira rótulo ambíguo
+  (ignore) via cobertura, como na mesa real.
+- `--hand-shadow`: a mão/borracha projeta penumbra suave deslocada na
+  direção da luz (uma direção sorteada por captura, coerente entre
+  frames), caindo sobre folha, tinta e mesa.
+- `--ink-sheen S` (0–1): faixa especular alongada na direção da luz
+  incidente — dentro dela o traço preto vira cinza claro, o caso em
+  que a tinta some no reflexo.
+- `--page-curl C` (0–1): a folha deixa de ser plano. Uma dobra
+  cilíndrica com eixo, início e ângulo sorteados encurta a folha em
+  direção à dobra (foreshortening), sombreia a área curvada e expõe
+  mesa onde a pose plana cobriria. O detector vê o contorno real da
+  folha curvada — o GT deixa de ser projetável por homografia e o
+  bundle carrega os mapas densos `scene_to_page_*` das poses inicial
+  e final, que `eval_capture`/`eval_scenario` usam no lugar da
+  homografia quando presentes.
+- `--background SRC`: troca o fundo procedural (valores de
+  `BACKGROUND_SOURCES`); em Python, `background=<ndarray HxWx3>`
+  injeta uma foto real de mesa como fundo da cena.
+
+```sh
+python tools/sim_source.py --text "draw" --fps 15 --hand --grab-hand \
+  --move 120,60,8 --isp --jpeg-quality 65 --hand-shadow \
+  --ink-sheen 0.5 --page-curl 0.4 --out captures/sim-twin.mp4
+```
+
+Nenhum efeito toca o ground truth além do que a câmera veria: sombra
+e brilho mudam pixels, não classes; a curvatura muda a geometria e o
+GT exporta o mapa correspondente. Achado de sim continua sendo
+hipótese — a régua sintética não substitui a confirmação na mesa.
+
+## Falsificador: busca adversarial em loop fechado
+
+`tools/falsify.py` é o motor que procura ativamente as combinações
+que quebram o laço, em vez de cenários escritos à mão. Cada
+tentativa sorteia uma configuração do `SyntheticCapture` (fases,
+mão, ISP, curvatura, luz, fundo), exporta o MP4, roda a auditoria
+real de `eval_scenario` e pontua a falha — IoU final, ausência de
+canvas, resíduo confirmado em região apagada, recall do redesenho e
+o pior checkpoint de fase, com os componentes no relatório. Com
+`--rounds`, os piores casos são mutados e re-avaliados: a busca
+converge para a vizinhança do erro.
+
+```sh
+python tools/falsify.py --trials 12 --rounds 2 --out captures/falsify
+```
+
+O relatório `falsify_report.json` ordena os cenários do pior ao
+melhor com config+seed completos — todo caso é reproduzível com
+`tools/sim_source.py`. Os `--keep` piores mantêm vídeo, GT,
+manifesto, máscaras confirmadas por fase e frames da cena no
+instante de cada checkpoint: a prancha visual do erro. Uma rodada
+de bancada mediu ~10–30 s por tentativa nesta VM; `--trials` e
+`--rounds` controlam o orçamento. Modelos seguem a precedência de
+sempre (`--neural-model`, `--page-clean-model`, `--hand-model`).
 
 ## Fonte ao vivo em Python
 

@@ -24,6 +24,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from draw.paper import perspective_matrix  # noqa: E402
+from tools import sim_isp  # noqa: E402
 from tools.eval_capture import pixel_metrics, run_pipeline  # noqa: E402
 
 
@@ -90,10 +91,26 @@ def _final_checkpoint(checkpoints, events):
     return final
 
 
-def _project(mask, corners, page_to_scene, canvas_hw):
+def _project(mask, corners, page_to_scene, canvas_hw, scene_map=None):
+    """Projeta máscara de página para a grade do canvas pela âncora.
+
+    Com ``scene_map`` (mapa denso cena→página da folha curvada),
+    página→cena é remap — a homografia nominal não descreve a dobra.
+    """
     height, width = canvas_hw
     destination = np.float32([[0, 0], [width, 0], [width, height], [0, height]])
     matrix = perspective_matrix(np.asarray(corners, np.float32), destination)
+    if scene_map is not None:
+        scene = cv2.remap(
+            mask,
+            scene_map[0],
+            scene_map[1],
+            cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+        )
+        return cv2.warpPerspective(
+            scene, matrix, (width, height), flags=cv2.INTER_NEAREST
+        )
     return cv2.warpPerspective(
         mask, matrix @ page_to_scene, (width, height), flags=cv2.INTER_NEAREST
     )
@@ -128,9 +145,7 @@ def audit(video, gt_path, *, fps=None, models=(), save_masks=None):
                     else loop.clean_provisional_mask.copy()
                 ),
                 "corners": (
-                    None
-                    if worker is None or worker._anchor_corners is None
-                    else np.asarray(worker._anchor_corners).copy()
+                    None if worker is None else worker.anchor_corners
                 ),
             }
 
@@ -168,6 +183,19 @@ def audit(video, gt_path, *, fps=None, models=(), save_masks=None):
     applied_upto = 0
     erased = False
     writes_seen = 0
+    # Geometria por fase: quad_end no evento marca a pose no último
+    # frame da fase geométrica (move/lift_out/return). Fases sem gesto
+    # herdam a pose do último gesto — move+lift+return juntos ficam
+    # corretos, não só "antes/depois de qualquer movimento". Bundles
+    # antigos sem quad_end caem na heurística de pose final.
+    ph, pw = bundle["page_ink_full"].shape
+    page_corners = np.float32([[0, 0], [pw, 0], [pw, ph], [0, ph]])
+    quad_now = np.asarray(bundle["quad"], np.float32)
+    has_quad_end = any("quad_end" in p for p in events)
+    moved = False
+    curl = (
+        json.loads(str(bundle["page_curl"])) if "page_curl" in bundle else None
+    )
     for phase in events:
         frame = phase["end"] - 1
         if phase["kind"] == "write":
@@ -189,12 +217,28 @@ def audit(video, gt_path, *, fps=None, models=(), save_masks=None):
                 str(save_masks / f"confirmed_{phase['kind']}_{frame}.png"),
                 (np.asarray(snap["confirmed"]) > 0).astype(np.uint8) * 255,
             )
-        moved = any(
-            p["kind"] in ("move", "return") and p["end"] <= phase["end"] for p in events
-        )
-        page_to_scene = (
-            bundle["page_to_scene_final"] if moved else bundle["page_to_scene"]
-        )
+        quad_end = phase.get("quad_end")
+        if quad_end is not None:
+            quad_now = np.asarray(quad_end, np.float32)
+            moved = True
+        elif phase["kind"] in ("move", "lift_out", "return"):
+            # Bundle antigo sem quad_end: só sabemos a pose final.
+            moved = True
+        if has_quad_end or not moved or "page_to_scene_final" not in bundle:
+            page_to_scene = cv2.getPerspectiveTransform(page_corners, quad_now)
+        else:
+            page_to_scene = bundle["page_to_scene_final"]
+        scene_map = None
+        if curl is not None:
+            scene_map = sim_isp.scene_to_page_map(
+                np.linalg.inv(page_to_scene), pw, ph, curl
+            )
+        elif "scene_to_page_x" in bundle:
+            tag = "final_" if moved else ""
+            scene_map = (
+                bundle[f"scene_to_page_{tag}x"],
+                bundle[f"scene_to_page_{tag}y"],
+            )
         expected = _page_expected(bundle, applied_upto, erased)
         entry = {
             "frame": frame,
@@ -212,7 +256,7 @@ def audit(video, gt_path, *, fps=None, models=(), save_masks=None):
             if snap["provisional"] is None
             else np.asarray(snap["provisional"]) > 0
         )
-        truth = _project(expected, corners, page_to_scene, canvas_hw) > 0
+        truth = _project(expected, corners, page_to_scene, canvas_hw, scene_map) > 0
         entry.update(pixel_metrics(confirmed, truth))
         entry["confirmed_px"] = int(confirmed.sum())
         entry["provisional_px"] = int(provisional.sum())
@@ -220,14 +264,18 @@ def audit(video, gt_path, *, fps=None, models=(), save_masks=None):
         if w and h:
             rect_mask = np.zeros(shape, np.uint8)
             rect_mask[y : y + h, x : x + w] = 255
-            rect_canvas = _project(rect_mask, corners, page_to_scene, canvas_hw) > 0
+            rect_canvas = (
+                _project(rect_mask, corners, page_to_scene, canvas_hw, scene_map) > 0
+            )
             entry["confirmed_in_erased_px"] = int((confirmed & rect_canvas).sum())
         redraw_masks = phase_stroke_masks(1)
         if redraw_masks:
             redraw = np.zeros(shape, np.uint8)
             for mask in redraw_masks:
                 redraw |= mask
-            redraw_canvas = _project(redraw, corners, page_to_scene, canvas_hw) > 0
+            redraw_canvas = (
+                _project(redraw, corners, page_to_scene, canvas_hw, scene_map) > 0
+            )
             denom = max(1, int(redraw_canvas.sum()))
             entry["redraw_confirmed_recall"] = (
                 float((confirmed & redraw_canvas).sum()) / denom

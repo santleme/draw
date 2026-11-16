@@ -28,6 +28,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tools import gen_synthetic as gs
+from tools import sim_isp
 from tools.sim_text import plan_text_strokes
 
 
@@ -67,6 +68,14 @@ class SyntheticCapture:
         sweep_seconds: float = 0,
         grab_hand: bool = False,
         hand_scale: float = 1.0,
+        background: str | np.ndarray = "table_wood",
+        auto_exposure: bool = False,
+        auto_white_balance: bool = False,
+        motion_blur: bool = False,
+        jpeg_quality: int | None = None,
+        hand_shadow: bool = False,
+        ink_sheen: float = 0.0,
+        page_curl: float = 0.0,
     ):
         if not math.isfinite(fps) or not 0 < fps <= 120:
             raise ValueError("fps deve estar entre 0 e 120")
@@ -94,6 +103,11 @@ class SyntheticCapture:
                 raise ValueError(f"{name} deve ser finito e não negativo")
         if not math.isfinite(hand_scale) or not 0 < hand_scale <= 4:
             raise ValueError("hand_scale deve ser positivo, finito e <= 4")
+        if jpeg_quality is not None and not 10 <= jpeg_quality <= 100:
+            raise ValueError("jpeg_quality deve estar em [10, 100]")
+        for name, value in (("ink_sheen", ink_sheen), ("page_curl", page_curl)):
+            if not math.isfinite(value) or not 0 <= value <= 1:
+                raise ValueError(f"{name} deve estar em [0, 1]")
         self.fps = float(fps)
         self.seed, self.text = seed, text
         self.realtime = realtime
@@ -102,7 +116,17 @@ class SyntheticCapture:
         self._position = 0
         self._completed = 0
         self._rng = gs._scene_rng(seed, "simulator", 0)
-        self._background = gs._background(self._rng, "table_wood")
+        if isinstance(background, str):
+            if background not in gs.BACKGROUND_SOURCES:
+                raise ValueError(f"background desconhecido: {background!r}")
+            self.background_source = background
+            self._background = gs._background(self._rng, background)
+        else:
+            photo = np.asarray(background)
+            if photo.ndim != 3 or photo.shape[2] != 3:
+                raise ValueError("background em array precisa ser HxWx3")
+            self.background_source = "photo"
+            self._background = gs._fit_background_photo(photo.astype(np.uint8))
         self._paper, self.pw, self.ph = gs._paper_base(self._rng, "white", size_idx=0)
         self._paper_pristine = self._paper.copy()
         self.specs = plan_text_strokes(text, self._rng, self.pw, self.ph, height=height)
@@ -298,6 +322,27 @@ class SyntheticCapture:
         self.frame_count = start
         self._phase_ends = np.array([p["end"] for p in self.phases])
 
+        # Pose final determinística: compõe move/lift/return sobre o
+        # quad inicial — igual ao _quad_now no fim da linha do tempo,
+        # sem depender da leitura dos frames. Com isso o GT pode ser
+        # salvo antes ou depois de consumir o vídeo.
+        if lift_off is not None:
+            self._quad_final = quad_return
+        elif move is not None:
+            mdx, mdy, mdeg = move
+            quad_final = self.quad + np.float32([mdx, mdy])
+            center = quad_final.mean(axis=0)
+            rad = math.radians(mdeg)
+            rot = np.float32(
+                [[math.cos(rad), -math.sin(rad)], [math.sin(rad), math.cos(rad)]]
+            )
+            self._quad_final = (quad_final - center) @ rot.T + center
+        else:
+            self._quad_final = self.quad.copy()
+        self._page_to_scene_final = cv2.getPerspectiveTransform(
+            self._page_corners, self._quad_final
+        )
+
         self.page_ink_full = np.zeros_like(self._ink)
         final_paper = self._paper.copy()
         for spec in self.specs_all:
@@ -321,6 +366,79 @@ class SyntheticCapture:
         self._eraser = None
         if self.erase_rect is not None:
             self._eraser = _eraser_sprite()
+
+        # --- gêmeo óptico / físico (opt-in) -------------------------------
+        # Direção da luz da cena: uma por captura — sombra e faixa
+        # especular têm de concordar entre si e entre frames.
+        self._light_dir = None
+        if hand_shadow or ink_sheen > 0:
+            ang = float(self._rng.uniform(0, 2 * math.pi))
+            self._light_dir = np.float32([math.cos(ang), math.sin(ang)])
+        self._hand_shadow = bool(hand_shadow)
+        self._shadow_offset = (
+            tuple(-self._light_dir * float(self._rng.uniform(14, 26)))
+            if hand_shadow
+            else (0.0, 0.0)
+        )
+        self._shadow_sigma = float(self._rng.uniform(8, 14)) if hand_shadow else 0.0
+        self._shadow_strength = (
+            float(self._rng.uniform(0.25, 0.45)) if hand_shadow else 0.0
+        )
+        self._ink_sheen = float(ink_sheen)
+        # Faixa especular atravessa a cena ao longo do eixo da luz,
+        # centrada num ponto sorteado — a lâmpada é fixa na mesa.
+        self._sheen_center = (
+            (float(self._rng.uniform(0, gs.SIZE)), float(self._rng.uniform(0, gs.SIZE)))
+            if ink_sheen > 0
+            else None
+        )
+        self._sheen_width = float(self._rng.uniform(45, 90)) if ink_sheen > 0 else 0.0
+        self._motion_blur = bool(motion_blur)
+        self._prev_quad = self._quad_now.copy()
+        self._prev_sprite = {}
+        self._curl = None
+        self._curl_shade = None
+        if page_curl > 0:
+            # Dobra cilíndrica: eixo unitário em espaço de página,
+            # começo da dobra numa faixa tardia e ângulo máximo
+            # proporcional à intensidade pedida (teto ~70°).
+            axis_ang = float(self._rng.uniform(0, 2 * math.pi))
+            axis = np.float32([math.cos(axis_ang), math.sin(axis_ang)])
+            corners_page = np.float32(
+                [[0, 0], [self.pw, 0], [self.pw, self.ph], [0, self.ph]]
+            )
+            s_vals = corners_page @ axis
+            s_lo, s_hi = float(s_vals.min()), float(s_vals.max())
+            self._curl = {
+                "axis": (float(axis[0]), float(axis[1])),
+                "bend_start": s_lo
+                + float(self._rng.uniform(0.55, 0.85)) * (s_hi - s_lo),
+                "edge": s_hi,
+                "theta_max": float(page_curl) * math.radians(70.0),
+                "intensity": float(page_curl),
+            }
+            self._curl_shade = sim_isp.curl_shade(self.pw, self.ph, self._curl)
+            # ink_full em espaço de cena segue o mesmo mapa denso da
+            # renderização — homografia não descreve folha curvada.
+            mx, my = sim_isp.scene_to_page_map(
+                np.linalg.inv(self._page_to_scene_init), self.pw, self.ph, self._curl
+            )
+            self.ink_full = cv2.remap(
+                self.page_ink_full,
+                mx,
+                my,
+                cv2.INTER_NEAREST,
+                borderMode=cv2.BORDER_CONSTANT,
+            )
+        self._isp = None
+        if auto_exposure or auto_white_balance or jpeg_quality is not None:
+            self._isp = sim_isp.IspTwin(
+                self._rng,
+                self.fps,
+                ae=auto_exposure,
+                awb=auto_white_balance,
+                jpeg_quality=jpeg_quality,
+            )
         self.last_scene = None
 
     def _resolve_erase_rect(self, erase_stroke, erase_rect):
@@ -456,7 +574,42 @@ class SyntheticCapture:
             self._page_corners, self._quad_now
         )
         quad = self._quad_now
-        rgb_w, paper_mask, ink_w, paper_cov, ink_cov = gs._warp_paper(paper, ink, quad)
+        if self._curl is not None:
+            paper_render = np.clip(
+                paper.astype(np.float32) * self._curl_shade[..., None], 0, 255
+            ).astype(np.uint8)
+            s2p = sim_isp.scene_to_page_map(
+                np.linalg.inv(self.page_to_scene), self.pw, self.ph, self._curl
+            )
+            rgb_w, paper_mask, ink_w, paper_cov, ink_cov = sim_isp.warp_paper_mapped(
+                paper_render, ink, s2p[0], s2p[1]
+            )
+        else:
+            rgb_w, paper_mask, ink_w, paper_cov, ink_cov = gs._warp_paper(
+                paper, ink, quad
+            )
+        quad_delta = self._quad_now - self._prev_quad
+        self._prev_quad = self._quad_now.copy()
+        page_vx, page_vy = (
+            float(quad_delta[:, 0].mean()),
+            float(quad_delta[:, 1].mean()),
+        )
+        if self._motion_blur:
+            # A folha em movimento borra na direção do gesto; as
+            # coberturas borram junto — a franja de movimento vira
+            # rótulo ambíguo (ignore), como na mesa real.
+            rgb_w = sim_isp.blur_along(rgb_w, page_vx, page_vy)
+            paper_cov = sim_isp.blur_along(paper_cov, page_vx, page_vy)
+            ink_cov = sim_isp.blur_along(ink_cov, page_vx, page_vy)
+        if self._sheen_center is not None:
+            sim_isp.ink_sheen(
+                rgb_w,
+                ink_w,
+                self._sheen_center,
+                (float(self._light_dir[0]), float(self._light_dir[1])),
+                self._sheen_width,
+                self._ink_sheen,
+            )
         rgb = self._background.copy()
         on_paper = paper_mask > 0
         rgb[on_paper] = rgb_w[on_paper]
@@ -464,37 +617,60 @@ class SyntheticCapture:
         mask[on_paper] = gs.PAPER
         mask[(ink_w > 0) & on_paper] = gs.INK
         hand_cov = np.zeros_like(paper_cov)
+
+        def sprite_motion(key, cx, cy):
+            prev = self._prev_sprite.get(key)
+            self._prev_sprite[key] = (cx, cy, self._position)
+            if prev is None or prev[2] != self._position - 1:
+                return 0.0, 0.0
+            return float(cx - prev[0]), float(cy - prev[1])
+
+        def paste_sprite(key, sprite, cx, cy):
+            rgb_s, mask_s, cov_s = sprite
+            vx, vy = sprite_motion(key, cx, cy)
+            if self._hand_shadow:
+                sim_isp.cast_shadow(
+                    rgb,
+                    cov_s,
+                    cx,
+                    cy,
+                    self._shadow_offset,
+                    self._shadow_sigma,
+                    self._shadow_strength,
+                )
+            if self._motion_blur and math.hypot(vx, vy) >= 2:
+                rgb_s = sim_isp.blur_along(rgb_s, vx, vy)
+                mask_s = sim_isp.blur_along(mask_s, vx, vy)
+                cov_s = sim_isp.blur_along(cov_s, vx, vy)
+            gs._paste_hand(rgb, mask, rgb_s, mask_s, cx, cy)
+            gs._paste_coverage(hand_cov, cov_s, cx, cy)
+
         if eraser_page is not None and self._eraser is not None:
             location = cv2.perspectiveTransform(
                 np.float32(eraser_page).reshape(1, 1, 2), self.page_to_scene
             )[0, 0]
-            eraser_rgb, eraser_mask, eraser_cov = self._eraser
             cx, cy = (int(v) for v in location)
-            gs._paste_hand(rgb, mask, eraser_rgb, eraser_mask, cx, cy)
-            gs._paste_coverage(hand_cov, eraser_cov, cx, cy)
+            paste_sprite("eraser", self._eraser, cx, cy)
             if self._hand is not None:
-                hand_rgb, hand_mask, coverage = self._hand
-                gs._paste_hand(rgb, mask, hand_rgb, hand_mask, cx, cy - 60)
-                gs._paste_coverage(hand_cov, coverage, cx, cy - 60)
+                paste_sprite("hand_eraser", self._hand, cx, cy - 60)
         elif self._hand is not None and pen is not None:
             location = cv2.perspectiveTransform(
                 np.float32(pen).reshape(1, 1, 2), self.page_to_scene
             )[0, 0]
-            hand_rgb, hand_mask, coverage = self._hand
             cx, cy = (int(v) for v in location)
-            gs._paste_hand(rgb, mask, hand_rgb, hand_mask, cx, cy)
-            gs._paste_coverage(hand_cov, coverage, cx, cy)
+            paste_sprite("hand_pen", self._hand, cx, cy)
         if palm_page is not None and self._palm is not None:
             location = cv2.perspectiveTransform(
                 np.float32(palm_page).reshape(1, 1, 2), self.page_to_scene
             )[0, 0]
-            palm_rgb, palm_mask, palm_cov = self._palm
             cx, cy = (int(v) for v in location)
-            gs._paste_hand(rgb, mask, palm_rgb, palm_mask, cx, cy)
-            gs._paste_coverage(hand_cov, palm_cov, cx, cy)
+            paste_sprite("palm", self._palm, cx, cy)
         mask, _ = gs._ambiguity_ignore(mask, paper_cov, ink_cov, hand_cov)
         # O ground truth é geométrico, anterior ao ruído e à oclusão.
-        rgb = gs._sequence_photometric(self._rng, rgb, 1.0)
+        if self._isp is not None:
+            rgb = self._isp.process(rgb)
+        else:
+            rgb = gs._sequence_photometric(self._rng, rgb, 1.0)
         self.last_scene = {"rgb": rgb, "mask": mask, "ink_full": ink_w}
         self._position += 1
         return True, rgb
@@ -504,8 +680,15 @@ class SyntheticCapture:
 
         ``page_ink_full`` é o plano completo (todos os traços, antes de
         apagar); ``page_ink_final`` é o estado real da folha no fim da
-        captura — igual ao plano em cenário sem borracha. ``events``
-        descreve a linha do tempo para a auditoria por fase.
+        captura — igual ao plano em cenário sem borracha. ``ink_full`` e
+        ``ink_final`` são essas máscaras projetadas na pose FINAL da
+        folha — move/lift/return mudam o quad, então a pose de
+        ``__init__`` não é a cena que a avaliação compara. ``events``
+        descreve a linha do tempo; fases geométricas carregam
+        ``quad_end`` (o quad no último frame da fase), que a auditoria
+        usa para reconstruir a pose por fase. Os campos ``*_final`` são
+        determinísticos — o GT sai correto antes ou depois de consumir
+        o vídeo.
         """
         offsets = np.cumsum([0, *[len(spec[3]) for spec in self.specs_all]])
         points = (
@@ -515,24 +698,103 @@ class SyntheticCapture:
         )
         erased = np.zeros(len(self.specs_all), dtype=bool)
         erased[: len(self.stroke_erased)] = self.stroke_erased
-        events = [
-            {
+        events = []
+        for phase in self.phases:
+            entry = {
                 key: value
                 for key, value in phase.items()
                 if key in ("kind", "start", "end", "rect", "delta")
             }
-            for phase in self.phases
-        ]
+            if phase["kind"] == "move":
+                dx, dy, deg = phase["delta"]
+                quad = phase["quad_from"] + np.float32([dx, dy])
+                center = quad.mean(axis=0)
+                rad = math.radians(deg)
+                rot = np.float32(
+                    [
+                        [math.cos(rad), -math.sin(rad)],
+                        [math.sin(rad), math.cos(rad)],
+                    ]
+                )
+                entry["quad_end"] = ((quad - center) @ rot.T + center).tolist()
+            elif phase["kind"] in ("lift_out", "return"):
+                entry["quad_end"] = np.asarray(phase["quad_to"]).tolist()
+            events.append(entry)
+        # Estado final da página é determinístico (não depende de o
+        # vídeo já ter sido consumido): todos os traços menos a faixa
+        # apagada, e os redesenhos de volta por cima — eles nascem
+        # DEPOIS da borracha, dentro do retângulo que ela limpou.
+        page_ink_final = self.page_ink_full.copy()
+        if self.erase_rect is not None:
+            x, y, w, h = self.erase_rect
+            page_ink_final[y : y + h, x : x + w] = 0
+            for spec in self.redraw_specs:
+                cv2.polylines(
+                    page_ink_final, [spec[3]], False, 255, int(spec[2])
+                )
+        # Máscaras em cena na pose final: com curvatura segue o mapa
+        # denso da pose final; planar usa a homografia final.
+        if self._curl is not None:
+            fx, fy = sim_isp.scene_to_page_map(
+                np.linalg.inv(self._page_to_scene_final),
+                self.pw,
+                self.ph,
+                self._curl,
+            )
+            ink_full = cv2.remap(
+                self.page_ink_full,
+                fx,
+                fy,
+                cv2.INTER_NEAREST,
+                borderMode=cv2.BORDER_CONSTANT,
+            )
+            ink_final = cv2.remap(
+                page_ink_final,
+                fx,
+                fy,
+                cv2.INTER_NEAREST,
+                borderMode=cv2.BORDER_CONSTANT,
+            )
+        else:
+            ink_full = cv2.warpPerspective(
+                self.page_ink_full,
+                self._page_to_scene_final,
+                (gs.SIZE, gs.SIZE),
+                flags=cv2.INTER_NEAREST,
+            )
+            ink_final = cv2.warpPerspective(
+                page_ink_final,
+                self._page_to_scene_final,
+                (gs.SIZE, gs.SIZE),
+                flags=cv2.INTER_NEAREST,
+            )
+        self.ink_full = ink_full
+        extra = {}
+        if self._curl is not None:
+            # Com folha curvada, homografia não projeta o GT: o bundle
+            # carrega os mapas densos cena→página das poses inicial e
+            # final, e a avaliação os usa no lugar da homografia.
+            mx, my = sim_isp.scene_to_page_map(
+                np.linalg.inv(self._page_to_scene_init), self.pw, self.ph, self._curl
+            )
+            extra["scene_to_page_x"] = mx
+            extra["scene_to_page_y"] = my
+            extra["scene_to_page_final_x"] = fx
+            extra["scene_to_page_final_y"] = fy
+            extra["page_curl"] = np.array(json.dumps(self._curl, ensure_ascii=False))
+        if self._light_dir is not None:
+            extra["light_dir"] = self._light_dir
         np.savez_compressed(
             path,
             version=np.array(1),
-            ink_full=self.ink_full,
+            ink_full=ink_full,
+            ink_final=ink_final,
             page_ink_full=self.page_ink_full,
-            page_ink_final=self._ink,
+            page_ink_final=page_ink_final,
             quad=self.quad,
-            quad_final=self._quad_now,
+            quad_final=self._quad_final,
             page_to_scene=self._page_to_scene_init,
-            page_to_scene_final=self.page_to_scene,
+            page_to_scene_final=self._page_to_scene_final,
             points=points,
             offsets=offsets,
             thickness=np.array([spec[2] for spec in self.specs_all], dtype=np.int32),
@@ -545,6 +807,7 @@ class SyntheticCapture:
             events=np.array(json.dumps(events, ensure_ascii=False)),
             text=np.array(self.text),
             seed=np.array(self.seed),
+            **extra,
         )
 
 
@@ -655,6 +918,20 @@ def export_video(capture: SyntheticCapture, output: str | Path) -> dict:
         "strokes_redraw": len(capture.redraw_specs),
         "hand_placeholder": capture._hand is not None,
         "palm_placeholder": capture._palm is not None,
+        "background": capture.background_source,
+        "isp": (
+            {
+                "auto_exposure": capture._isp.ae if capture._isp else False,
+                "auto_white_balance": capture._isp.awb if capture._isp else False,
+                "jpeg_quality": (capture._isp.jpeg_quality if capture._isp else None),
+                "motion_blur": capture._motion_blur,
+            }
+            if capture._isp is not None or capture._motion_blur
+            else None
+        ),
+        "hand_shadow": capture._hand_shadow,
+        "ink_sheen": capture._ink_sheen,
+        "page_curl": capture._curl,
         "pose": "fixed" if len(capture.phases) == 3 else "scenario",
         "warmup_frames": capture.warmup_frames,
         "frames_per_stroke": capture.frames_per_stroke,
@@ -744,6 +1021,48 @@ def main(argv=None):
         default=1.0,
         help="escala do sprite de palma/pegada (0<escala<=4)",
     )
+    parser.add_argument(
+        "--background",
+        default="table_wood",
+        help="fonte de fundo procedural (BACKGROUND_SOURCES do gen_synthetic)",
+    )
+    parser.add_argument(
+        "--isp",
+        action="store_true",
+        help="gêmeo óptico da webcam: AE + AWB + motion blur (equivale a "
+        "--ae --awb --motion-blur)",
+    )
+    parser.add_argument("--ae", action="store_true", help="auto-exposição reativa")
+    parser.add_argument(
+        "--awb", action="store_true", help="balanço de branco automático"
+    )
+    parser.add_argument(
+        "--motion-blur",
+        action="store_true",
+        help="blur direcional proporcional à velocidade de mão/folha",
+    )
+    parser.add_argument(
+        "--jpeg-quality",
+        type=int,
+        help="compressão JPEG controlada (10-100) por frame",
+    )
+    parser.add_argument(
+        "--hand-shadow",
+        action="store_true",
+        help="mão/borracha projetam penumbra suave na direção da luz",
+    )
+    parser.add_argument(
+        "--ink-sheen",
+        type=float,
+        default=0.0,
+        help="reflexo especular da tinta na faixa da luz (0-1)",
+    )
+    parser.add_argument(
+        "--page-curl",
+        type=float,
+        default=0.0,
+        help="curvatura cilíndrica da folha (0-1; dobra com foreshortening)",
+    )
     args = parser.parse_args(argv)
     try:
         erase_rect = None
@@ -785,6 +1104,14 @@ def main(argv=None):
             sweep_seconds=args.sweep_seconds,
             grab_hand=args.grab_hand,
             hand_scale=args.hand_scale,
+            background=args.background,
+            auto_exposure=args.isp or args.ae,
+            auto_white_balance=args.isp or args.awb,
+            motion_blur=args.isp or args.motion_blur,
+            jpeg_quality=args.jpeg_quality,
+            hand_shadow=args.hand_shadow,
+            ink_sheen=args.ink_sheen,
+            page_curl=args.page_curl,
         )
         manifest = export_video(capture, args.out)
     except (ValueError, RuntimeError, OSError, cv2.error) as error:

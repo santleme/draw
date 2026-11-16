@@ -307,6 +307,48 @@ def test_lift_return_ground_truth(tmp_path):
         assert not np.allclose(bundle["page_to_scene_final"], bundle["page_to_scene"])
 
 
+def test_events_carry_quad_end_matching_simulated_pose(tmp_path):
+    """quad_end declara a pose no ÚLTIMO frame de cada fase geométrica
+    — o avaliador reconstrói poses intermediárias (move+lift+return),
+    não só inicial/final."""
+    capture = scenario(
+        erase_stroke=None,
+        redraw_text=None,
+        move=(40, 20, 8),
+        lift=(200, 150),
+        return_pose=(0, 0, 10),
+        lift_seconds=0.3,
+        absent_seconds=0.3,
+        return_seconds=0.3,
+    )
+    quads = {}
+    while True:
+        ok, _ = capture.read()
+        if not ok:
+            break
+        quads[capture._position - 1] = capture._quad_now.copy()
+    gt = tmp_path / "q.gt.npz"
+    capture.save_ground_truth(gt)
+    with np.load(gt, allow_pickle=False) as bundle:
+        events = json.loads(str(bundle["events"]))
+        for event in events:
+            if event["kind"] in ("move", "lift_out", "return"):
+                quad_end = np.asarray(event["quad_end"], np.float32)
+                assert quad_end.shape == (4, 2)
+                assert np.isfinite(quad_end).all()
+                np.testing.assert_allclose(
+                    quad_end, quads[event["end"] - 1], atol=1e-4
+                )
+            else:
+                assert "quad_end" not in event
+        # a última fase geométrica termina na pose final do bundle
+        np.testing.assert_allclose(
+            np.asarray(events[-2]["quad_end"], np.float32),
+            bundle["quad_final"],
+            atol=1e-4,
+        )
+
+
 def test_lift_validations():
     with pytest.raises(ValueError):
         SyntheticCapture("ab", return_pose=(10, 0, 15))

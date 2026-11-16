@@ -3958,6 +3958,21 @@ class _PageCleanWorker:
         with self._condition:
             return self._error
 
+    @property
+    def anchor_corners(self):
+        """Âncora publicada no frame atual (4×2) — cópia defensiva.
+
+        Superfície de observabilidade para eval/replay: os call sites
+        liam ``_anchor_corners`` direto; a propriedade formaliza o
+        acesso sem expor o array interno à mutação.
+        """
+        with self._condition:
+            return (
+                None
+                if self._anchor_corners is None
+                else self._anchor_corners.copy()
+            )
+
     def stop(self):
         # O teto cobre uma passada em voo: a trabalhadora so ve o
         # stop entre passadas, e sair com ela dentro do ONNX

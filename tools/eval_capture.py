@@ -259,8 +259,8 @@ def run_pipeline(
         raise ValueError("fonte de vídeo não contém frames decodificáveis")
     if worker is not None:
         mask = None if loop.clean_mask is None else loop.clean_mask.copy()
-        corners = worker._anchor_corners
-        passes = worker._passes_total
+        corners = worker.anchor_corners
+        passes = worker.stats()["passes_total"]
     else:
         mask = (
             None
@@ -334,7 +334,11 @@ def evaluate_canvas(
             bundle = {key: archive[key] for key in archive.files}
         if int(bundle["version"]) != 1:
             raise ValueError("versão de GT não suportada")
-        truth = bundle["ink_full"]
+        # A avaliação do fim do vídeo pede a tinta no estado final
+        # (pós-borracha/redesenho): ink_full guarda TODOS os traços e
+        # só serve à métrica por traço — usar como verdade puniria um
+        # pipeline que apagou corretamente.
+        truth = bundle["ink_final"] if "ink_final" in bundle else bundle["ink_full"]
     else:
         truth = np.load(gt_path, allow_pickle=False)
     if truth.ndim != 2:
@@ -347,13 +351,67 @@ def evaluate_canvas(
     if prediction.ndim != 2:
         raise ValueError("predição precisa ser uma máscara 2D")
     height, width = prediction.shape
+    # Pose final da folha: a avaliação é do estado em que o vídeo
+    # termina — move/lift/return fazem a pose inicial divergir da
+    # âncora detectada no fim. page_to_scene_final existe sempre;
+    # os mapas densos só existem quando a folha curva.
+    page_to_scene_key = (
+        "page_to_scene_final"
+        if bundle is not None and "page_to_scene_final" in bundle
+        else "page_to_scene"
+    )
+    map_tag = (
+        "final_"
+        if bundle is not None and "scene_to_page_final_x" in bundle
+        else ""
+    )
+    scene_map = (
+        (
+            bundle[f"scene_to_page_{map_tag}x"],
+            bundle[f"scene_to_page_{map_tag}y"],
+        )
+        if bundle is not None and f"scene_to_page_{map_tag}x" in bundle
+        else None
+    )
+    page_truth = (
+        bundle["page_ink_final"] if "page_ink_final" in bundle
+        else bundle["page_ink_full"]
+    ) if bundle is not None else None
+
+    def project(mask):
+        """Projeta máscara de página para a grade do canvas/cena.
+
+        Folha curvada exporta o mapa denso cena→página da sua pose —
+        homografia não descreve a dobra: página→cena vira remap e
+        cena→canvas segue a âncora detectada. Sem âncora (ideal_page)
+        ou sem mapa, o caminho é a homografia de sempre.
+        """
+        if scene_map is not None and (
+            canvas_space == "scene" or corners is not None
+        ):
+            scene = cv2.remap(
+                mask,
+                scene_map[0],
+                scene_map[1],
+                cv2.INTER_NEAREST,
+                borderMode=cv2.BORDER_CONSTANT,
+            )
+            if canvas_space == "scene":
+                return scene
+            return cv2.warpPerspective(
+                scene, matrix, (width, height), flags=cv2.INTER_NEAREST
+            )
+        return cv2.warpPerspective(
+            mask, page_matrix, (width, height), flags=cv2.INTER_NEAREST
+        )
+
     page_matrix = None
     alignment = "scene"
     if canvas_space == "scene":
         if prediction.shape != truth.shape:
             raise ValueError("canvas da cena e ink_full têm grades diferentes")
         if bundle is not None:
-            page_matrix = bundle["page_to_scene"]
+            page_matrix = bundle[page_to_scene_key]
     elif canvas_space == "page":
         if corners is not None:
             corners = np.asarray(corners, np.float32)
@@ -362,7 +420,7 @@ def evaluate_canvas(
             destination = np.float32([[0, 0], [width, 0], [width, height], [0, height]])
             matrix = perspective_matrix(corners, destination)
             if bundle is not None:
-                page_matrix = matrix @ bundle["page_to_scene"]
+                page_matrix = matrix @ bundle[page_to_scene_key]
             else:
                 truth = cv2.warpPerspective(
                     truth, matrix, (width, height), flags=cv2.INTER_NEAREST
@@ -375,12 +433,7 @@ def evaluate_canvas(
         else:
             raise ValueError("GT NPY em espaço de página exige --corners; use o bundle")
         if page_matrix is not None:
-            truth = cv2.warpPerspective(
-                bundle["page_ink_full"],
-                page_matrix,
-                (width, height),
-                flags=cv2.INTER_NEAREST,
-            )
+            truth = project(page_truth)
     else:
         raise ValueError("canvas_space precisa ser page ou scene")
 
@@ -393,9 +446,11 @@ def evaluate_canvas(
             mask = np.zeros(shape, np.uint8)
             geo = points[offsets[index] : offsets[index + 1]].astype(np.int32)
             cv2.polylines(mask, [geo], False, 255, int(thickness))
-            yield cv2.warpPerspective(
-                mask, page_matrix, (width, height), flags=cv2.INTER_NEAREST
-            )
+            # Apenas a parte do traço que sobrevive ao estado final
+            # conta: apagado pela borracha não é predição esperada.
+            if page_truth is not None:
+                mask = mask & page_truth
+            yield project(mask)
 
     report = compare_masks(prediction, truth, strokes(), stroke_recall=stroke_recall)
     report.update(
