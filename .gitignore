@@ -18,3 +18,6 @@ template/paper_template.png
 # self-learning: nunca versionar.
 *.drawcap
 selflearn_round_out/
+
+# Estado local de agentes
+.antigravitycli/
