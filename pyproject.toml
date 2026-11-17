@@ -16,8 +16,10 @@ filterwarnings = [
 target-version = "py311"
 line-length = 88
 # Notebooks trazem código duplicado de células (imports repetidos) e
-# não são o alvo do linter de biblioteca.
-extend-exclude = [".venv", "notebooks"]
+# não são o alvo do linter de biblioteca. docs/archive/ é material
+# histórico preservado verbatim — probes e análises datadas; lintar
+# reescreveria o registro.
+extend-exclude = [".venv", "notebooks", "docs/archive"]
 
 [tool.ruff.format]
 # Fontes vendada/gerada: preservar os patches ancorados e a reprodução byte a byte.
