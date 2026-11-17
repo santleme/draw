@@ -21,24 +21,24 @@ rem  adaptador "vEthernet (WSL)": a rede virtual host-only entre
 rem  Windows e WSL. Maquinas da rede local NAO alcancam esse
 rem  endereco — so o WSL conecta, sem precisar de regra de firewall.
 rem
+rem  O adaptador so existe com a VM do WSL rodando em modo NAT;
+rem  "wsl.exe -e true" abaixo acorda a VM para ele aparecer. Sem
+rem  adaptador (WSL em networkingMode=mirrored), o loopback do
+rem  Windows e alcancado pelo WSL — 127.0.0.1 segue seguro, pois a
+rem  LAN nao alcanca o loopback.
+rem
 rem  NAO use 0.0.0.0: serviria o video da webcam SEM SENHA para
 rem  qualquer maquina que alcancasse o PC. Se outro bind for mesmo
 rem  necessario, defina LISTEN explicitamente ciente da exposicao.
 rem ===============================================================
 
 if not defined LISTEN (
+    wsl.exe -e true >nul 2>&1
     for /f "usebackq delims=" %%i in (`powershell -NoProfile -Command "(Get-NetIPAddress -InterfaceAlias 'vEthernet (WSL*' -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress"`) do set "LISTEN=%%i"
 )
 
-if not defined LISTEN (
-    echo [ERRO] adaptador "vEthernet (WSL)" nao encontrado.
-    echo        Esta ponte existe para servir o video ao WSL; sem o
-    echo        adaptador host-only do WSL nao ha bind seguro automatico.
-    echo        Para expor na rede de proposito, defina LISTEN no .bat
-    echo        ciente de que o video fica SEM SENHA na interface.
-    pause
-    exit /b 1
-)
+rem Sem adaptador vEthernet: VM nao subiu ou modo mirrored — loopback.
+if not defined LISTEN set "LISTEN=127.0.0.1"
 
 if not exist "%FFMPEG%" (
     echo [ERRO] ffmpeg.exe nao foi encontrado nesta pasta:
@@ -58,6 +58,11 @@ echo Draw: servindo a camera "%CAM%" em http://%LISTEN%:8080/video
 if "%LISTEN%"=="0.0.0.0" (
     echo [AVISO] 0.0.0.0 expoe o video SEM SENHA na rede local.
     echo         Volte para o padrao ^(adaptador WSL^) ou aceite o risco.
+)
+if "%LISTEN%"=="127.0.0.1" (
+    echo [INFO] Sem adaptador vEthernet: escutando so no loopback.
+    echo        WSL em modo mirrored conecta em 127.0.0.1; em modo NAT,
+    echo        abra um terminal WSL antes de rodar esta ponte.
 )
 echo No WSL, conecte o Draw com o IP do Windows ^(nameserver em /etc/resolv.conf^):
 echo   python3 main.py --source http://IP-DO-WINDOWS:8080/video
