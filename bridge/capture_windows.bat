@@ -58,14 +58,17 @@ echo Draw: servindo a camera "%CAM%" em http://%LISTEN%:8080/video
 if "%LISTEN%"=="0.0.0.0" (
     echo [AVISO] 0.0.0.0 expoe o video SEM SENHA na rede local.
     echo         Volte para o padrao ^(adaptador WSL^) ou aceite o risco.
-)
-if "%LISTEN%"=="127.0.0.1" (
+    echo No WSL, conecte o Draw com o IP do Windows ^(nameserver em /etc/resolv.conf^):
+    echo   python3 main.py --source http://IP-DO-WINDOWS:8080/video
+) else if "%LISTEN%"=="127.0.0.1" (
     echo [INFO] Sem adaptador vEthernet: escutando so no loopback.
-    echo        WSL em modo mirrored conecta em 127.0.0.1; em modo NAT,
-    echo        abra um terminal WSL antes de rodar esta ponte.
+    echo        No WSL ^(modo mirrored^), conecte o Draw com:
+    echo          python3 main.py --source http://127.0.0.1:8080/video
+    echo        Em modo NAT, abra um terminal WSL antes de rodar esta ponte.
+) else (
+    echo No WSL, conecte o Draw com o IP do adaptador acima:
+    echo   python3 main.py --source http://%LISTEN%:8080/video
 )
-echo No WSL, conecte o Draw com o IP do Windows ^(nameserver em /etc/resolv.conf^):
-echo   python3 main.py --source http://IP-DO-WINDOWS:8080/video
 echo Feche esta janela para parar a ponte.
 echo.
 
