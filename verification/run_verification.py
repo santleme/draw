@@ -59,8 +59,12 @@ NESTED_QUAD = np.array(
     [(460, 180), (1120, 250), (1050, 1080), (380, 1000)], dtype=np.float32
 )
 SHEET_CORNERS = np.array(
-    [(0, 0), (config.PAPER_W, 0), (config.PAPER_W, config.PAPER_H),
-     (0, config.PAPER_H)],
+    [
+        (0, 0),
+        (config.PAPER_W, 0),
+        (config.PAPER_W, config.PAPER_H),
+        (0, config.PAPER_H),
+    ],
     dtype=np.float32,
 )
 
@@ -94,7 +98,8 @@ def build_marker_scene(quad):
     scene = np.full((SCENE_H, SCENE_W, 3), 60, dtype=np.uint8)
     placed = cv2.warpPerspective(sheet, matrix, (SCENE_W, SCENE_H))
     mask = cv2.warpPerspective(
-        np.full(sheet.shape[:2], 255, dtype=np.uint8), matrix,
+        np.full(sheet.shape[:2], 255, dtype=np.uint8),
+        matrix,
         (SCENE_W, SCENE_H),
     )
     scene[mask > 0] = placed[mask > 0]
@@ -102,21 +107,18 @@ def build_marker_scene(quad):
 
 
 def build_markerless_scene(quad, nested=False):
-    sheet = np.full(
-        (config.PAPER_H, config.PAPER_W, 3), 248, dtype=np.uint8
-    )
+    sheet = np.full((config.PAPER_H, config.PAPER_W, 3), 248, dtype=np.uint8)
     for x, y in PROBES:
         cv2.circle(sheet, (x, y), PROBE_RADIUS, (0, 0, 0), thickness=-1)
     matrix = cv2.getPerspectiveTransform(SHEET_CORNERS, quad)
     scene = np.full((SCENE_H, SCENE_W, 3), 60, dtype=np.uint8)
     if nested:
-        cv2.ellipse(
-            scene, (800, 600), (770, 545), 0, 0, 360, (150, 150, 150), -1
-        )
+        cv2.ellipse(scene, (800, 600), (770, 545), 0, 0, 360, (150, 150, 150), -1)
         cv2.rectangle(scene, (1100, 0), (1560, 640), (60, 60, 60), -1)
     placed = cv2.warpPerspective(sheet, matrix, (SCENE_W, SCENE_H))
     mask = cv2.warpPerspective(
-        np.full(sheet.shape[:2], 255, dtype=np.uint8), matrix,
+        np.full(sheet.shape[:2], 255, dtype=np.uint8),
+        matrix,
         (SCENE_W, SCENE_H),
     )
     scene[mask > 0] = placed[mask > 0]
@@ -133,9 +135,7 @@ def check_marker_scene(name, quad):
         return _check_warped(name, warped, f"marcadores: {markers}", True)
     original = dict(config.MARKER_CENTERS)
     try:
-        config.MARKER_CENTERS.update(
-            {i: original[(i + 1) % 4] for i in original}
-        )
+        config.MARKER_CENTERS.update({i: original[(i + 1) % 4] for i in original})
         warped, markers = paper.warp_paper(scene)
         return _check_warped(name, warped, f"marcadores: {markers}", True)
     finally:
@@ -165,9 +165,9 @@ def _check_warped(name, warped, detail, clear_markers):
     recovered = ink.extract_ink(warped, clear_markers=clear_markers)
     failures = []
     max_error = 0.0
-    expected_area = np.pi * PROBE_RADIUS ** 2
+    expected_area = np.pi * PROBE_RADIUS**2
     for x, y in PROBES:
-        window = recovered[y - WINDOW:y + WINDOW, x - WINDOW:x + WINDOW]
+        window = recovered[y - WINDOW : y + WINDOW, x - WINDOW : x + WINDOW]
         ys, xs = np.nonzero(window > 0)
         fraction = len(xs) / expected_area
         if fraction < MIN_RECOVERED_FRACTION:
@@ -175,8 +175,7 @@ def _check_warped(name, warped, detail, clear_markers):
                 f"{name}: sonda ({x},{y}) recuperou {fraction:.0%} da tinta"
             )
             continue
-        error = float(np.hypot(xs.mean() + x - WINDOW - x,
-                               ys.mean() + y - WINDOW - y))
+        error = float(np.hypot(xs.mean() + x - WINDOW - x, ys.mean() + y - WINDOW - y))
         max_error = max(max_error, error)
         if error > MAX_CENTROID_ERROR_PX:
             failures.append(
@@ -188,8 +187,11 @@ def _check_warped(name, warped, detail, clear_markers):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--sabotage", action="store_true",
-                        help="gira destinos da homografia para falhar")
+    parser.add_argument(
+        "--sabotage",
+        action="store_true",
+        help="gira destinos da homografia para falhar",
+    )
     args = parser.parse_args()
 
     global SABOTAGE
@@ -206,32 +208,32 @@ def main():
         failures, max_error = check_marker_scene(name, quad)
         worst = max(worst, max_error)
         status = "ok" if not failures else "FALHOU"
-        print(f"  cena {name:<20} {status} (9 sondas, "
-              f"erro max {max_error:.2f}px)")
+        print(f"  cena {name:<20} {status} (9 sondas, erro max {max_error:.2f}px)")
         all_failures.extend(failures)
 
     for name, quad, nested in markerless_placements():
         total_scenes += 1
-        failures, max_error = check_markerless_scene(
-            name, quad, nested=nested
-        )
+        failures, max_error = check_markerless_scene(name, quad, nested=nested)
         worst = max(worst, max_error)
         status = "ok" if not failures else "FALHOU"
-        print(f"  cena {name:<20} {status} (9 sondas, "
-              f"erro max {max_error:.2f}px)")
+        print(f"  cena {name:<20} {status} (9 sondas, erro max {max_error:.2f}px)")
         all_failures.extend(failures)
 
     total = total_scenes * len(PROBES)
     if all_failures:
-        print(f"\nVERIFICACAO FALHOU: {len(all_failures)} de {total} "
-              f"sondas fora da propriedade")
+        print(
+            f"\nVERIFICACAO FALHOU: {len(all_failures)} de {total} "
+            f"sondas fora da propriedade"
+        )
         for failure in all_failures[:12]:
             print(f"  - {failure}")
         return 1
-    print(f"\nVERIFICACAO OK: {total} sondas dentro da propriedade "
-          f"(erro de centroide <= {MAX_CENTROID_ERROR_PX:.0f}px, "
-          f"tinta recuperada >= {MIN_RECOVERED_FRACTION:.0%}; "
-          f"pior erro observado {worst:.2f}px)")
+    print(
+        f"\nVERIFICACAO OK: {total} sondas dentro da propriedade "
+        f"(erro de centroide <= {MAX_CENTROID_ERROR_PX:.0f}px, "
+        f"tinta recuperada >= {MIN_RECOVERED_FRACTION:.0%}; "
+        f"pior erro observado {worst:.2f}px)"
+    )
     return 0
 
 

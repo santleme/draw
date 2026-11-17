@@ -65,10 +65,17 @@ def _load_image(path):
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("root", help="Raiz local do FreiHAND (ex.: /tmp/freihand)")
-    ap.add_argument("--sample", type=int, default=20,
-                    help="Quantas imagens por diretório inspecionar (padrão 20)")
-    ap.add_argument("--strict", action="store_true",
-                    help="Falha se qualquer amostra inspecionada fugir de 224x224")
+    ap.add_argument(
+        "--sample",
+        type=int,
+        default=20,
+        help="Quantas imagens por diretório inspecionar (padrão 20)",
+    )
+    ap.add_argument(
+        "--strict",
+        action="store_true",
+        help="Falha se qualquer amostra inspecionada fugir de 224x224",
+    )
     args = ap.parse_args()
     root = Path(args.root)
     ok = True
@@ -88,15 +95,23 @@ def main() -> int:
                 ok = False
 
     # Pares treino: rgb <-> mask com o mesmo nome.
-    train_rgb = {p.name for p in (root / "training/rgb").glob("*.jpg")} \
-        if (root / "training/rgb").is_dir() else set()
-    train_mask = {p.name for p in (root / "training/mask").glob("*.jpg")} \
-        if (root / "training/mask").is_dir() else set()
+    train_rgb = (
+        {p.name for p in (root / "training/rgb").glob("*.jpg")}
+        if (root / "training/rgb").is_dir()
+        else set()
+    )
+    train_mask = (
+        {p.name for p in (root / "training/mask").glob("*.jpg")}
+        if (root / "training/mask").is_dir()
+        else set()
+    )
     if train_rgb or train_mask:
         missing_mask = sorted(train_rgb - train_mask)[:10]
         missing_rgb = sorted(train_mask - train_rgb)[:10]
-        print(f"treino: {len(train_rgb)} rgb, {len(train_mask)} masks, "
-              f"pares: {len(train_rgb & train_mask)}")
+        print(
+            f"treino: {len(train_rgb)} rgb, {len(train_mask)} masks, "
+            f"pares: {len(train_rgb & train_mask)}"
+        )
         if missing_mask:
             print(f"  AVISO: rgb sem máscara (primeiros): {missing_mask}")
         if missing_rgb:
@@ -108,10 +123,15 @@ def main() -> int:
     # mão base (32560 únicas x 4 variantes de fundo) em splits
     # diferentes do gerador sintético; isso se controla na origem
     # (fonte/mão), não pelo nome do arquivo.
-    eval_rgb = {p.name for p in (root / "evaluation/rgb").glob("*.jpg")} \
-        if (root / "evaluation/rgb").is_dir() else set()
-    print(f"nomes em comum treino x avaliação (esperado, índices "
-          f"recomeçam por split): {len((train_rgb | train_mask) & eval_rgb)}")
+    eval_rgb = (
+        {p.name for p in (root / "evaluation/rgb").glob("*.jpg")}
+        if (root / "evaluation/rgb").is_dir()
+        else set()
+    )
+    print(
+        f"nomes em comum treino x avaliação (esperado, índices "
+        f"recomeçam por split): {len((train_rgb | train_mask) & eval_rgb)}"
+    )
 
     # Inspeção de conteúdo em amostra.
     for d in EXPECTED_DIRS:
@@ -121,8 +141,7 @@ def main() -> int:
         for f in files:
             info = _load_image(f)
             if info is None:
-                print(f"  {d}: sem cv2/Pillow, pulando inspeção de pixels "
-                      f"({f.name})")
+                print(f"  {d}: sem cv2/Pillow, pulando inspeção de pixels ({f.name})")
                 break
             w, h, ch, px = info
             shapes[(w, h, ch)] += 1
@@ -132,13 +151,22 @@ def main() -> int:
                 px = np.asarray(px)
                 coverages.append(float((px > 127).mean() * 100))
         if shapes:
-            print(f"  {d} amostra ({len(files)}): formas {dict(shapes)}"
-                  + (f", cobertura mão após limiar 127: "
-                     f"min {min(coverages):.2f}% / média "
-                     f"{sum(coverages) / len(coverages):.2f}% / "
-                     f"max {max(coverages):.2f}%" if coverages else ""))
-            if args.strict and set(shapes) != {(224, 224, 3)} and \
-                    set(shapes) != {(224, 224, 1)}:
+            print(
+                f"  {d} amostra ({len(files)}): formas {dict(shapes)}"
+                + (
+                    f", cobertura mão após limiar 127: "
+                    f"min {min(coverages):.2f}% / média "
+                    f"{sum(coverages) / len(coverages):.2f}% / "
+                    f"max {max(coverages):.2f}%"
+                    if coverages
+                    else ""
+                )
+            )
+            if (
+                args.strict
+                and set(shapes) != {(224, 224, 3)}
+                and set(shapes) != {(224, 224, 1)}
+            ):
                 print(f"  ERRO: forma fora de 224x224 em {d}: {dict(shapes)}")
                 ok = False
 
