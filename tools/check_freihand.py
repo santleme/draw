@@ -33,31 +33,43 @@ from pathlib import Path
 EXPECTED_DIRS = ["evaluation/rgb", "training/rgb", "training/mask"]
 
 
-def _load_image(path):
-    """Retorna (largura, altura, canais, pixels) ou None.
+def _shape_of(im):
+    h, w = im.shape[:2]
+    ch = 1 if im.ndim == 2 else im.shape[2]
+    return w, h, ch, im[:, :, 0].ravel() if im.ndim == 3 else im.ravel()
 
-    pixels é uma lista plana de valores do primeiro canal quando
-    disponível; sem cv2/Pillow, retorna None para pixels.
+
+def _decoder():
+    """Retorna a função de carga de imagem ou None se não houver decoder.
+
+    A função retornada devolve (largura, altura, canais, pixels) — pixels
+    é uma lista plana de valores do primeiro canal — ou None quando o
+    arquivo é ilegível/corrompido. "Sem decoder" e "arquivo ruim" são
+    casos distintos: o primeiro apenas pula a inspeção de pixels, o
+    segundo é um dado defeituoso do dataset.
     """
     try:
         import cv2
 
-        im = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
-        if im is None:
-            return None
-        h, w = im.shape[:2]
-        ch = 1 if im.ndim == 2 else im.shape[2]
-        return w, h, ch, im[:, :, 0].ravel() if im.ndim == 3 else im.ravel()
+        def load_cv2(path):
+            im = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+            return None if im is None else _shape_of(im)
+
+        return load_cv2
     except ImportError:
         pass
     try:
         from PIL import Image
         import numpy as np
 
-        im = np.asarray(Image.open(path))
-        h, w = im.shape[:2]
-        ch = 1 if im.ndim == 2 else im.shape[2]
-        return w, h, ch, im[:, :, 0].ravel() if im.ndim == 3 else im.ravel()
+        def load_pil(path):
+            try:
+                im = np.asarray(Image.open(path))
+            except Exception:  # noqa: BLE001 - decoder diverso por versão
+                return None
+            return _shape_of(im)
+
+        return load_pil
     except ImportError:
         return None
 
@@ -113,9 +125,11 @@ def main() -> int:
             f"pares: {len(train_rgb & train_mask)}"
         )
         if missing_mask:
-            print(f"  AVISO: rgb sem máscara (primeiros): {missing_mask}")
+            print(f"  ERRO: rgb sem máscara (primeiros): {missing_mask}")
+            ok = False
         if missing_rgb:
-            print(f"  AVISO: máscara sem rgb (primeiros): {missing_rgb}")
+            print(f"  ERRO: máscara sem rgb (primeiros): {missing_rgb}")
+            ok = False
 
     # Índices se repetem entre splits (00000000.jpg existe em treino e
     # em avaliação) — isso é ESPERADO e NÃO é prova de mesma mão: os
@@ -134,15 +148,21 @@ def main() -> int:
     )
 
     # Inspeção de conteúdo em amostra.
+    load = _decoder()
+    if load is None:
+        print("sem cv2/Pillow: inspeção de pixels pulada (só contagens)")
     for d in EXPECTED_DIRS:
+        if load is None:
+            break
         files = sorted((root / d).glob("*.jpg"))[: args.sample]
         shapes = Counter()
         coverages = []
         for f in files:
-            info = _load_image(f)
+            info = load(f)
             if info is None:
-                print(f"  {d}: sem cv2/Pillow, pulando inspeção de pixels ({f.name})")
-                break
+                print(f"  ERRO: arquivo ilegível/corrompido em {d}: {f.name}")
+                ok = False
+                continue
             w, h, ch, px = info
             shapes[(w, h, ch)] += 1
             if "mask" in d and px is not None:

@@ -19,7 +19,9 @@ Escopo verificado (e so isso):
   quadrilateros com jitter deterministico de ate 70 px (sem rotacoes de
   90/180/270 graus, pois folha lisa sem marcador nao define orientacao
   intrinseca alem da geometria da cena);
-- 9 sondas (discos de tinta de raio 10) numa grade 3x3 da area util;
+- 9 sondas (discos de tinta de raio 10) na area util: 8 numa grade
+  quase-3x3 e 1 fora da simetria, para que um desenho espelhado ou
+  girado em 180 graus nao troque discos identicos de posicao e passe;
 - por sonda: centroide recuperado a no maximo 5 px do centro desenhado
   e pelo menos 40% da tinta da sonda recuperada na janela de 30 px.
 
@@ -45,7 +47,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from draw import config, ink, paper  # noqa: E402
 from template.generate_template import build_template  # noqa: E402
 
-PROBES = [(x, y) for y in (350, 600, 850) for x in (300, 425, 550)]
+# 8 sondas numa grade 3x3 menos a última posição + 1 sonda fora da
+# simetria: a grade simétrica pura deixava um desenho espelhado ou
+# girado em 180 graus passar (cada disco trocava de lugar com outro
+# disco idêntico). (545, 830) não tem par em nenhuma das três
+# simetrias — um flip quebra a sonda e a cena falha.
+PROBES = [(x, y) for y in (350, 600) for x in (300, 425, 550)] + [
+    (300, 850),
+    (425, 850),
+    (545, 830),
+]
 PROBE_RADIUS = 10
 WINDOW = 30
 MAX_CENTROID_ERROR_PX = 5.0
