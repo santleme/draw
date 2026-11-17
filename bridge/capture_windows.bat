@@ -1,8 +1,8 @@
 @echo off
 rem ============================================================
 rem  Draw - ponte de captura no Windows (rota reserva)
-rem  Le a webcam pelo DirectShow e serve o video como MJPEG em
-rem  http://0.0.0.0:8080/video para o Draw rodando no WSL.
+rem  Le a webcam pelo DirectShow e serve o video como MJPEG no
+rem  adaptador host-only do WSL ^(porta 8080^) para o Draw no WSL.
 rem
 rem  Para conferir o nome exato da camera neste PC, rode:
 rem    ffmpeg.exe -list_devices true -f dshow -i dummy
@@ -15,19 +15,30 @@ rem ============================================================================
 
 set "FFMPEG=%~dp0ffmpeg.exe"
 
-rem ============================================================
-rem  ATENCAO - EXPOSICAO DE REDE
-rem  LISTEN=0.0.0.0 serve o video da webcam SEM SENHA para qualquer
-rem  maquina que alcance este PC pela rede. Para restringir:
-rem   1) Troque LISTEN pelo IP do adaptador "vEthernet (WSL)"
-rem      ^(rode ipconfig e veja a secao WSL^) — assim so o WSL conecta;
-rem   2) E/ou libere a porta so para a sub-rede do WSL ^(admin^):
-rem      netsh advfirewall firewall add rule name="Draw MJPEG WSL" ^
-rem        dir=in action=allow protocol=TCP localport=8080 ^
-rem        remoteip=172.16.0.0/12
-rem      ^(ajuste a sub-rede para a do SEU adaptador WSL^)
-rem ============================================================
-set "LISTEN=0.0.0.0"
+rem ===== ONDE ESCUTAR ==============================================
+rem  LISTEN e o IP onde o ffmpeg escuta. O padrao resolve o IP do
+rem  adaptador "vEthernet (WSL)": a rede virtual host-only entre
+rem  Windows e WSL. Maquinas da rede local NAO alcancam esse
+rem  endereco — so o WSL conecta, sem precisar de regra de firewall.
+rem
+rem  NAO use 0.0.0.0: serviria o video da webcam SEM SENHA para
+rem  qualquer maquina que alcancasse o PC. Se outro bind for mesmo
+rem  necessario, defina LISTEN explicitamente ciente da exposicao.
+rem ===============================================================
+
+if not defined LISTEN (
+    for /f "usebackq delims=" %%i in (`powershell -NoProfile -Command "(Get-NetIPAddress -InterfaceAlias 'vEthernet (WSL*' -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress"`) do set "LISTEN=%%i"
+)
+
+if not defined LISTEN (
+    echo [ERRO] adaptador "vEthernet (WSL)" nao encontrado.
+    echo        Esta ponte existe para servir o video ao WSL; sem o
+    echo        adaptador host-only do WSL nao ha bind seguro automatico.
+    echo        Para expor na rede de proposito, defina LISTEN no .bat
+    echo        ciente de que o video fica SEM SENHA na interface.
+    pause
+    exit /b 1
+)
 
 if not exist "%FFMPEG%" (
     echo [ERRO] ffmpeg.exe nao foi encontrado nesta pasta:
@@ -46,7 +57,7 @@ if not exist "%FFMPEG%" (
 echo Draw: servindo a camera "%CAM%" em http://%LISTEN%:8080/video
 if "%LISTEN%"=="0.0.0.0" (
     echo [AVISO] 0.0.0.0 expoe o video SEM SENHA na rede local.
-    echo         Edite LISTEN no .bat ou crie a regra de firewall do topo.
+    echo         Volte para o padrao ^(adaptador WSL^) ou aceite o risco.
 )
 echo No WSL, conecte o Draw com o IP do Windows ^(nameserver em /etc/resolv.conf^):
 echo   python3 main.py --source http://IP-DO-WINDOWS:8080/video

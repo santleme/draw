@@ -36,10 +36,10 @@ Python with OpenCV has no code-level formal verifier, so this checks the real co
 - Synthetic camera scenes of 1600x1200 px
 - 12 marker-mode sheet placements (`--markers`): the selftest base pose, that pose with the sheet rotated in plane by 90, 180 and 270 degrees, and 8 convex quads with deterministic jitter up to 70 px (seed 20261028)
 - 10 markerless sheet placements (default mode): the base pose, nested pose over a light desk mat, and the same 8 convex quads with deterministic jitter up to 70 px (seed 20261028)
-- 9 ink probes (discs of radius 10) on a 3x3 grid in the usable area (198 probes total across the 22 scenes)
+- 9 ink probes (discs of radius 10) in the usable area: 8 on a near-3x3 grid plus 1 off-symmetry at (545,830), so a mirrored or 180-degree-flipped drawing cannot swap identical discs between valid positions and pass (198 probes total across the 22 scenes)
 - Per probe: recovered centroid within 5 px of the drawn center, and at least 40 percent of the probe ink recovered in a 30 px window
 
-Not covered: real lighting, blur, partial corner/marker occlusion, a real webcam, curved or folded paper, and anything outside the probe grid. A pass covers this scope, not the whole system. Last full run (2026-10-30): all 198 probes passed, worst centroid error 3.05 px (2.43 px in markerless mode). Under `--sabotage`, 176 of 198 probes failed.
+Not covered: real lighting, blur, partial corner/marker occlusion, a real webcam, curved or folded paper, and anything outside the probe grid. A pass covers this scope, not the whole system. Last full run (2026-11-17, asymmetric probe): all 198 probes passed, worst centroid error 3.05 px. Under `--sabotage`, 176 of 198 probes failed.
 
 ## Reading a failure
 
