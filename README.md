@@ -19,10 +19,14 @@
   (`lab/` — capture/scenario evaluation, falsifier, replay, parity),
   the bridge receiver, the website, CI, and the reviewed model manifest.
   Start there.
+- **draw-training** — the data/training side extracted from this repo
+  with git history preserved: `draw/selflearn/`, `training/`, dataset
+  and labeling tools, the Kaggle runner. It delivers approved `.onnx`
+  files + hashes to draw-core's model manifest.
 - **draw (this repo)** — the original codebase, kept for reference:
-  experiment history, desk notes, the simulator and training corpora,
-  archived model candidates under `models/lab/`, and the docs that
-  record *why* the pipeline looks the way it does
+  experiment history, desk notes, archived model candidates under
+  `models/lab/`, and the docs that record *why* the pipeline looks
+  the way it does
   ([VISION.md](VISION.md), [docs/FALHAS.md](docs/FALHAS.md),
   [docs/ESTADO_ATUAL.md](docs/ESTADO_ATUAL.md),
   [docs/SIMULATOR.md](docs/SIMULATOR.md)).
