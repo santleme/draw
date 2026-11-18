@@ -1,8 +1,0 @@
-numpy>=1.26
-opencv-contrib-python>=4.8
-onnxruntime>=1.17
-# Opcional: mascara de mao do canvas acumulativo (draw/hand.py).
-# Sem o mediapipe o app roda igual, so sem a mascara; ele fica fora
-# da instalacao padrao por ser pesado e nao ser requisito de nada.
-# Para ligar: pip install mediapipe (e baixe o hand_landmarker.task)
-# mediapipe>=0.10

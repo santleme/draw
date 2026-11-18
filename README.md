@@ -1,41 +1,36 @@
-<p align="center">
-  <img src="docs/icon.svg" width="160" alt="Draw">
-</p>
+# Draw (legacy — archived)
 
-<h1 align="center">Draw (legacy)</h1>
+A digitizing tablet without a digitizing tablet.
 
-<p align="center">
-  A digitizing tablet without a digitizing tablet.
-</p>
+> **This repository is archived.** Active development moved to
+> **[santleme/draw-core](https://github.com/santleme/draw-core)** —
+> a clean, tested rebuild of the same capture pipeline (sheet
+> detection, page rectification, ink extraction) plus the lab
+> tooling, the website, and the reviewed model manifest.
+>
+> Training, datasets and the self-learning cycle live in
+> **[santleme/draw-training](https://github.com/santleme/draw-training)**.
+> The Windows→WSL2 camera transport lives in
+> **[santleme/hvcam](https://github.com/santleme/hvcam)**.
 
-> **This repository is the legacy implementation.** Active development
-> moved to **[santleme/draw-core](https://github.com/santleme/draw-core)**,
-> a clean rebuild of the same capture pipeline — sheet detection, page
-> rectification, ink extraction — as a tested monorepo.
+## The old code
 
-## What lives where
+Everything that was here — the full runtime, lab, docs, training
+scripts and experiment history — is preserved at the
+[`legacy-final`](https://github.com/santleme/draw/releases/tag/legacy-final)
+tag:
 
-- **draw-core** — the maintained runtime (`src/draw`), the lab tooling
-  (`lab/` — capture/scenario evaluation, falsifier, replay, parity),
-  the bridge receiver, the website, CI, and the reviewed model manifest.
-  Start there.
-- **draw-training** — the data/training side extracted from this repo
-  with git history preserved: `draw/selflearn/`, `training/`, dataset
-  and labeling tools, the Kaggle runner. It delivers approved `.onnx`
-  files + hashes to draw-core's model manifest.
-- **draw (this repo)** — the original codebase, kept for reference:
-  experiment history, desk notes, archived model candidates under
-  `models/lab/`, and the docs that record *why* the pipeline looks
-  the way it does
-  ([VISION.md](VISION.md), [docs/FALHAS.md](docs/FALHAS.md),
-  [docs/ESTADO_ATUAL.md](docs/ESTADO_ATUAL.md),
-  [docs/SIMULATOR.md](docs/SIMULATOR.md)).
+```bash
+git clone --branch legacy-final https://github.com/santleme/draw.git
+```
 
-Production model binaries are not committed anywhere: hashes and
-provenance live in `draw-core/assets/manifest.json`, and the approved
-`.onnx` / `.task` files ship in the
-[draw-core releases](https://github.com/santleme/draw-core/releases).
+Design rationale and failure notes worth keeping are in
+`VISION.md`, `docs/FALHAS.md`, `docs/ESTADO_ATUAL.md` and
+`docs/SIMULATOR.md` on that tag.
 
-The previous project README remains in git history (`git show` any
-commit before this notice) for the full quick-start and architecture
-description.
+## Models
+
+Production `.onnx` binaries were never committed here; they are
+distributed via GitHub Release with hashes recorded in
+`models/MANIFEST.json` (on the tag) and now delivered through
+`santleme/draw-core`'s `assets/manifest.json`.
